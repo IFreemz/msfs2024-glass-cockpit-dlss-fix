@@ -88,7 +88,7 @@ problems in plain words, e.g. DLSS not selected, a non-NVIDIA GPU, or a sim upda
 ## Known limitations
 
 - NVIDIA DLSS Super Resolution only (no FSR/TAA, no AMD/Intel GPUs).
-- Not yet tested with DLSS Frame Generation or VR.
+- Works with DLSS Frame Generation (tested up to 6x Multi Frame Generation). Not yet tested in VR.
 - A thin band at each screen's edge (about one render pixel) still comes from DLSS.
 - Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) would be covered by it.
 - Sim updates that change the cockpit display shader stop the fix (the sim then just looks like stock DLSS) until
