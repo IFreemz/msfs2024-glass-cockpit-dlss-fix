@@ -104,19 +104,7 @@ problems in plain words, e.g. DLSS not selected, a non-NVIDIA GPU, or a sim upda
 
 ## Building from source
 
-Visual Studio 2022 with the C++ x64 tools and the Windows 10/11 SDK (`dxc`):
-
-```powershell
-git clone --recursive https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix
-cd msfs2024-glass-cockpit-dlss-fix
-powershell -ExecutionPolicy Bypass -File scripts\build.ps1                 # -> build\glass-cockpit-dlss-fix.addon64
-powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Test -ReShadeDll <path to ReShade64.dll>
-powershell -ExecutionPolicy Bypass -File scripts\test.ps1                  # offline GPU test, no sim needed
-```
-
-The offline test runs the add-on inside a fake `FlightSimulator2024.exe` with a real ReShade, stand-in display
-shaders and a fake DLSS that leaves worst-case ghosts. It checks the result pixel by pixel against an unjittered
-reference.
+The full source is in this repository. See [BUILDING.md](BUILDING.md) to build the add-on yourself.
 
 ## License
 
