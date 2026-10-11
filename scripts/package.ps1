@@ -4,8 +4,8 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build.ps1')
 if ($LASTEXITCODE) { throw 'Build failed' }
-$source = Get-Content -LiteralPath (Join-Path $root 'src\glass_cockpit_dlss_fix.cpp') -Raw
-if ($source -notmatch "overlay_version = `"$([regex]::Escape($Version))`"") { throw "src version does not match $Version" }
+$source = Get-Content -LiteralPath (Join-Path $root 'src\version.h') -Raw
+if ($source -notmatch "GLASS_VERSION_STRING `"$([regex]::Escape($Version))`"") { throw "src\version.h does not match $Version" }
 $stage = Join-Path $root "dist\glass-cockpit-dlss-fix-$Version"
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $root 'build\glass-cockpit-dlss-fix.addon64') -Destination $stage -Force

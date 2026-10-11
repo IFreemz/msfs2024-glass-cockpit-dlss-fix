@@ -49,8 +49,9 @@ It works at any resolution and any DLSS mode, and costs one extra draw per scree
    - Microsoft Store / Xbox app: `...\Microsoft Flight Simulator 2024\Content\`
 4. Start the sim with DLSS selected and load a flight.
 
-To check that it's working, press **Ctrl+Shift+F11** in the cockpit: every screen it fixes turns green-tinted.
-Press it again to turn the tint off.
+To check that it's working, open the ReShade menu (**Home** key) and go to the **Glass Cockpit DLSS Fix** tab: it
+says "Working: fixing N screens" and shows a checklist. Or press **Ctrl+Shift+F11** in the cockpit: every screen it
+fixes turns green-tinted. Press it again to turn the tint off.
 
 **Uninstall:** delete `glass-cockpit-dlss-fix.addon64` (and the `.ini`/`.log` files next to it).
 
@@ -64,7 +65,12 @@ Press it again to turn the tint off.
 
 ## Troubleshooting
 
-The add-on writes `glass-cockpit-dlss-fix.log` next to itself, and keeps the previous session as
+Open the ReShade menu (**Home**) and the **Glass Cockpit DLSS Fix** tab first. It shows what works and what doesn't
+(NVIDIA GPU, DLSS running, cockpit shader found, screens recorded, fix drawn) and explains any problem in plain
+words. It has the on/off, tint and jitter settings, an **Open log folder** button and a **Copy report** button for
+bug reports.
+
+The add-on also writes `glass-cockpit-dlss-fix.log` next to itself, and keeps the previous session as
 `glass-cockpit-dlss-fix.old.log`. **Please attach both to any bug report.**
 
 The log lists your GPU, driver, ReShade version, the DLSS files the sim loaded and other ReShade add-ons, followed by

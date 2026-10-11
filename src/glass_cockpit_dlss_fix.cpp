@@ -41,6 +41,8 @@
 #include <vector>
 #include "pipeline_clone.hpp"
 #include "overlay_shaders.h"
+#include "status.hpp"
+#include "version.h"
 
 namespace api = reshade::api;
 using Microsoft::WRL::ComPtr;
@@ -77,7 +79,20 @@ void log(const char* format, ...) {
     fputc('\n', logfile); fflush(logfile);
 }
 
-constexpr const char* overlay_version = "0.5.0";
+constexpr const char* overlay_version = GLASS_VERSION_STRING;
+
+// Shown in the ReShade status panel.
+std::mutex info_mutex;
+std::string gpu_name, gpu_driver, dlss_version;
+std::atomic<bool> gpu_known{false}, gpu_nvidia{false};
+std::atomic<unsigned> last_render_w{0}, last_render_h{0}, last_out_w{0}, last_out_h{0};
+std::atomic<uint64_t> last_composite_present{0};
+std::atomic<const char*> problem{nullptr};
+std::string utf8(const wchar_t* text) {
+    char buffer[512]{};
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, buffer, sizeof(buffer) - 1, nullptr, nullptr);
+    return buffer;
+}
 
 // Logs the first few occurrences of each skip reason.
 void note(std::atomic<uint64_t>& counter, const char* reason) {
@@ -118,7 +133,9 @@ void scan_modules() {
             name.ends_with(L".addon64") || name.ends_with(L".addon") || name.starts_with(L"reshade") || name == L"d3d12core.dll" ||
             name == L"dxgi.dll" || name == L"version.dll" || name == L"nvapi64.dll";
         if (!relevant || !seen.insert(name).second) continue;
-        log("module %ls version=%s path=%ls", name.c_str(), file_version(path).c_str(), path);
+        const auto version = file_version(path);
+        log("module %ls version=%s path=%ls", name.c_str(), version.c_str(), path);
+        if (name == L"nvngx_dlss.dll") { std::lock_guard lock(info_mutex); dlss_version = version; }
     }
 }
 
@@ -391,6 +408,15 @@ void on_init_device(api::device* device) {
             adapter_desc.DeviceId, uint64_t(adapter_desc.DedicatedVideoMemory >> 20),
             known ? HIWORD(driver.HighPart) : 0, known ? LOWORD(driver.HighPart) : 0, known ? HIWORD(driver.LowPart) : 0, known ? LOWORD(driver.LowPart) : 0);
         if (adapter_desc.VendorId != 0x10de) log("WARNING not an NVIDIA GPU: DLSS (and this fix) needs an NVIDIA RTX card");
+        {
+            std::lock_guard lock(info_mutex);
+            gpu_name = utf8(adapter_desc.Description);
+            char text[64]{};
+            if (known) snprintf(text, sizeof(text), "%u.%u.%u.%u", HIWORD(driver.HighPart), LOWORD(driver.HighPart), HIWORD(driver.LowPart), LOWORD(driver.LowPart));
+            gpu_driver = text;
+        }
+        gpu_nvidia = adapter_desc.VendorId == 0x10de;
+        gpu_known = true;
     }
     if (software || size > 32 || (descriptor_size && descriptor_size != size)) {
         log("device_ignored native=%p software=%d descriptor_size=%u", native, software, size);
@@ -780,6 +806,8 @@ void composite(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Parameter* p
     transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, map_resting);
     uav_barrier(native);
     // The caller of NGX evaluate restores its own heaps, root signature and pipeline afterwards (NGX contract).
+    last_render_w = render_w; last_render_h = render_h; last_out_w = out_w; last_out_h = out_h;
+    last_composite_present = present_count.load(std::memory_order_relaxed);
     if (stats.composites++ == 0) log("milestone first overlay frame drawn render=%ux%u output=%ux%u (fix is active)", render_w, render_h, out_w, out_h);
 } catch (...) { ++stats.composite_skipped; }
 
@@ -834,12 +862,9 @@ void save_settings() {
 void on_present(api::effect_runtime* runtime) {
     ++present_count;
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
-    if (chord && runtime->is_key_pressed(VK_F9)) {
-        if (!enabled) ++generation;
-        enabled = !enabled; save_settings(); log("hotkey overlay=%d", enabled.load());
-    }
-    if (chord && runtime->is_key_pressed(VK_F10)) { jitter_positive = !jitter_positive; save_settings(); log("hotkey jitter_positive=%d", jitter_positive.load()); }
-    if (chord && runtime->is_key_pressed(VK_F11)) { tint = !tint; log("hotkey tint=%d", tint.load()); }
+    if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
+    if (chord && runtime->is_key_pressed(VK_F10)) glass::set_jitter_positive(!jitter_positive);
+    if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
     static uint64_t next = 0;
     const auto now = GetTickCount64();
     if (now < next) return;
@@ -851,15 +876,32 @@ void on_present(api::effect_runtime* runtime) {
         if (removed != S_OK) LOG_ONCE("ERROR graphics device removed, reason=0x%08lx (0x887a0005 = hung/TDR, 0x887a0006 = driver error, 0x887a0001 = invalid call, 0x887a0020 = driver internal)", static_cast<unsigned long>(removed));
     }
     const auto minutes = (now - init_tick) / 60000.0;
-    if (!ngx_hooked && minutes > 2) LOG_ONCE("WARNING DLSS runtime (_nvngx.dll) not loaded after 2 minutes: is DLSS selected in the sim's graphics settings?");
-    if (!stats.display_pipelines && minutes > 5) LOG_ONCE("WARNING no cockpit display shader seen after 5 minutes: not in a glass cockpit yet, or a sim update changed the shader (fix needs an update)");
+    const char* found = nullptr;
+    if (gpu_known && !gpu_nvidia) found = "This GPU is not an NVIDIA card. DLSS, and this fix, need an NVIDIA RTX GPU.";
+    if (!ngx_hooked && minutes > 2) {
+        LOG_ONCE("WARNING DLSS runtime (_nvngx.dll) not loaded after 2 minutes: is DLSS selected in the sim's graphics settings?");
+        if (!found) found = "DLSS is not loaded. Select DLSS Super Resolution in the sim's graphics settings.";
+    }
+    if (!stats.display_pipelines && minutes > 5) {
+        LOG_ONCE("WARNING no cockpit display shader seen after 5 minutes: not in a glass cockpit yet, or a sim update changed the shader (fix needs an update)");
+        if (!found) found = "No cockpit display shader seen yet. Load a flight with a glass cockpit. If you are in one, a sim update may have changed the shader and the fix needs an update.";
+    }
     static uint64_t display_since = 0;
     if (stats.display_draws && !display_since) display_since = now;
-    if (display_since && now - display_since > 20000) {
-        if (!stats.evaluations) LOG_ONCE("WARNING cockpit screens are drawn but DLSS is never called: select DLSS (not TAA/FSR/DLAA-off) in the sim's graphics settings");
-        else if (!stats.replays) LOG_ONCE("WARNING cockpit screens are drawn but none could be recorded: see skip reasons above");
-        else if (!stats.composites && enabled) LOG_ONCE("WARNING screens recorded and DLSS running, but no overlay frame yet: see skip reasons above");
+    if (display_since && now - display_since > 20000 && !found) {
+        if (!stats.evaluations) {
+            LOG_ONCE("WARNING cockpit screens are drawn but DLSS is never called: select DLSS (not TAA/FSR/DLAA-off) in the sim's graphics settings");
+            found = "Cockpit screens are drawn but DLSS is never called. Select DLSS (not TAA or FSR) in the sim's graphics settings.";
+        } else if (!stats.replays) {
+            LOG_ONCE("WARNING cockpit screens are drawn but none could be recorded: see skip reasons above");
+            found = "Cockpit screens are drawn but could not be recorded. Please report this with your log files.";
+        } else if (!stats.composites && enabled) {
+            LOG_ONCE("WARNING screens recorded and DLSS running, but no overlay frame yet: see skip reasons above");
+            found = "DLSS is running and screens are recorded, but the fix could not be drawn yet. Please report this with your log files.";
+        }
     }
+    if (stats.composites) found = nullptr;
+    problem = found;
     // Stats only when something changed, to keep the log small.
     static std::array<uint64_t, 6> last{};
     const std::array<uint64_t, 6> current{stats.replays.load(), stats.composites.load(), stats.composite_skipped.load(), stats.unknown_texture.load(),
@@ -873,7 +915,38 @@ void on_present(api::effect_runtime* runtime) {
 }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Glass Cockpit DLSS Fix";
+namespace glass {
+Status status() {
+    Status s;
+    {
+        std::lock_guard lock(info_mutex);
+        s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version;
+    }
+    s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked; s.shader_found = stats.display_pipelines > 0;
+    s.enabled = enabled; s.tint = tint; s.jitter_positive = jitter_positive;
+    s.dlss_calls = stats.evaluations; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
+    s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
+    const auto now = present_count.load(std::memory_order_relaxed);
+    s.active = s.enabled && s.overlay_frames && now <= last_composite_present + 30;
+    for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() && now <= slot_last_used[i] + 30) ++s.screens;
+    s.render_w = last_render_w; s.render_h = last_render_h; s.out_w = last_out_w; s.out_h = last_out_h;
+    s.problem = problem;
+    s.log_path = (addon_directory / L"glass-cockpit-dlss-fix.log").wstring();
+    return s;
+}
+void set_enabled(bool on) {
+    if (on == enabled) return;
+    if (on) ++generation;
+    enabled = on; save_settings(); log("setting overlay=%d", int(on));
+}
+void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
+void set_jitter_positive(bool on) { jitter_positive = on; save_settings(); log("setting jitter_positive=%d", int(on)); }
+}
+
+extern "C" __declspec(dllexport) const char* NAME = GLASS_NAME;
+extern "C" __declspec(dllexport) const char* AUTHOR = GLASS_AUTHOR;
+extern "C" __declspec(dllexport) const char* WEBSITE = GLASS_WEBSITE;
+extern "C" __declspec(dllexport) const char* ISSUES = GLASS_ISSUES;
 extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghosting from MSFS 2024 glass cockpit displays. Ctrl+Shift+F9 on/off, Ctrl+Shift+F10 flip jitter direction, Ctrl+Shift+F11 green tint.";
 
 #define OVERLAY_EVENTS(X) \
@@ -928,11 +1001,13 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
 #define REGISTER(event, callback) reshade::register_event<reshade::addon_event::event>(callback);
     OVERLAY_EVENTS(REGISTER)
 #undef REGISTER
+    log("status panel %s", glass::init_status_panel(reshade_module) ? "added to the ReShade overlay" : "unavailable (this ReShade build has a different ImGui version); the fix itself still works");
     return true;
 }
 extern "C" __declspec(dllexport) void GlassFixJitterPositive(bool positive) { jitter_positive = positive; }
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE) {
     enabled = false;
+    glass::uninit_status_panel();
 #define UNREGISTER(event, callback) reshade::unregister_event<reshade::addon_event::event>(callback);
     OVERLAY_EVENTS(UNREGISTER)
 #undef UNREGISTER

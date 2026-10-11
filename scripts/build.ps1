@@ -12,12 +12,14 @@ $compiler = Join-Path $tools.FullName 'bin\Hostx64\x64\cl.exe'
 $sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
 $sdk = Get-ChildItem -LiteralPath (Join-Path $sdkRoot 'Include') -Directory | Sort-Object Name -Descending | Select-Object -First 1
 $dxc = Join-Path $sdkRoot "bin\$($sdk.Name)\x64\dxc.exe"
+$rc = Join-Path $sdkRoot "bin\$($sdk.Name)\x64\rc.exe"
 $env:INCLUDE = @((Join-Path $tools.FullName 'include'), (Join-Path $sdk.FullName 'ucrt'), (Join-Path $sdk.FullName 'shared'), (Join-Path $sdk.FullName 'um'), (Join-Path $sdk.FullName 'winrt')) -join ';'
 $env:LIB = @((Join-Path $tools.FullName 'lib\x64'), (Join-Path $sdkRoot "Lib\$($sdk.Name)\ucrt\x64"), (Join-Path $sdkRoot "Lib\$($sdk.Name)\um\x64")) -join ';'
 $env:PATH = (Split-Path $compiler) + ';' + $env:PATH
 
 $minhook = Join-Path $root 'third_party\minhook'
 $reshadeInclude = Join-Path $root 'third_party\reshade\include'
+$imgui = Join-Path $root 'third_party\imgui'
 if (-not (Test-Path (Join-Path $reshadeInclude 'reshade.hpp'))) { throw 'Submodules missing: run "git submodule update --init"' }
 $build = Join-Path $root 'build'
 New-Item -ItemType Directory -Path $build -Force | Out-Null
@@ -38,7 +40,10 @@ try {
         $headers += "cs_$pass.h"
     }
     Set-Content -LiteralPath 'overlay_shaders.h' -Value (@('#pragma once') + ($headers | ForEach-Object { "#include `"$_`"" }))
-    & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /LD /I $build /I $reshadeInclude /I (Join-Path $minhook 'include') (Join-Path $root 'src\glass_cockpit_dlss_fix.cpp') (Join-Path $root 'src\vtable_slots.cpp') buffer.obj hook.obj trampoline.obj hde64.obj /link d3d12.lib dxgi.lib version.lib /OUT:glass-cockpit-dlss-fix.addon64
+    # Version resource: ReShade's add-on list shows its name, author and version.
+    & $rc /nologo /I (Join-Path $root 'src') /I (Join-Path $sdk.FullName 'um') /I (Join-Path $sdk.FullName 'shared') /fo version.res (Join-Path $root 'src\version.rc')
+    if ($LASTEXITCODE) { throw 'Version resource failed' }
+    & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /LD /I $build /I $reshadeInclude /I $imgui /I (Join-Path $minhook 'include') (Join-Path $root 'src\glass_cockpit_dlss_fix.cpp') (Join-Path $root 'src\status_panel.cpp') (Join-Path $root 'src\vtable_slots.cpp') buffer.obj hook.obj trampoline.obj hde64.obj version.res /link d3d12.lib dxgi.lib version.lib user32.lib shell32.lib /OUT:glass-cockpit-dlss-fix.addon64
     if ($LASTEXITCODE) { throw 'Add-on compilation failed' }
 
     if ($Test) {
