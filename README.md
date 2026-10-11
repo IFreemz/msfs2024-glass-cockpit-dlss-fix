@@ -4,6 +4,10 @@ A ReShade add-on that removes **DLSS ghosting and smearing from glass cockpit di
 Simulator 2024: speed and altitude tapes, moving maps, ECAM pages and so on stay sharp and readable in DLSS
 Quality, Balanced and Performance.
 
+![Fenix A320 PFD in DLSS Performance: stock DLSS smears the altitude readout, the fix keeps it sharp](docs/comparison.jpg)
+
+**[Watch the 16 s before/after video](../../releases/download/v0.5.0/glass-cockpit-dlss-fix-on-vs-off.mp4)** (Fenix A320, DLSS Performance, climbing at about 5000 ft/min).
+
 It works with every aircraft that uses the simulator's standard cockpit display shader. That has been tested on the
 Fenix A320 family, the iniBuilds A330 and the default DA62, and should cover most glass cockpits.
 
