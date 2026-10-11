@@ -32,7 +32,8 @@ The same idea that DLSS mods for other games use for HUDs: **draw the screen con
    glare and shadows on the glass are taken from the DLSS image itself, limited to what this frame actually shows,
    so they stay sharp while trails of old screen content are removed.
 
-It works at any resolution and any DLSS mode, and costs one extra draw per screen plus a few small GPU passes.
+It works at any resolution and any DLSS mode, and costs one extra draw per screen plus a few small GPU passes:
+no measurable FPS difference with the fix on or off in testing.
 
 ## Requirements
 
