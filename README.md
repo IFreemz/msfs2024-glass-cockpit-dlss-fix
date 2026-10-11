@@ -37,7 +37,8 @@ no measurable FPS difference with the fix on or off in testing.
 
 ## Requirements
 
-- Microsoft Flight Simulator 2024 (Steam or Microsoft Store/Xbox app), DirectX 12
+- Microsoft Flight Simulator 2024, DirectX 12. Tested on the Microsoft Store / Xbox app (Game Pass) version. The Steam
+  version runs the same game and should work the same way: reports welcome.
 - NVIDIA RTX GPU with **DLSS Super Resolution** selected in the sim's graphics settings
 - [ReShade](https://reshade.me) 6.7 or newer **with full add-on support** (the "with full add-on support" download)
 
