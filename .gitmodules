@@ -1,0 +1,8 @@
+[submodule "third_party/minhook"]
+	path = third_party/minhook
+	url = https://github.com/TsudaKageyu/minhook.git
+	shallow = true
+[submodule "third_party/reshade"]
+	path = third_party/reshade
+	url = https://github.com/crosire/reshade.git
+	shallow = true
