@@ -6,7 +6,7 @@ Quality, Balanced and Performance.
 
 ![Fenix A320 PFD in DLSS Performance: 8 s of stock DLSS smearing the altitude readout, then 8 s with the fix](docs/comparison.webp)
 
-*Fenix A320, DLSS Performance, climbing at about 6,700 ft/min.*
+*Fenix A320 at 4K, DLSS Performance (1080p internal, upscaled to 4K), climbing at about 6,700 ft/min.*
 
 It works with every aircraft that uses the simulator's standard cockpit display shader. That has been tested on the
 Fenix A320 family, the iniBuilds A330 and the default DA62, and should cover most glass cockpits.
