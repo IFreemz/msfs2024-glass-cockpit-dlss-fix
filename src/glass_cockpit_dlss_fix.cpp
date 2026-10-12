@@ -357,9 +357,10 @@ std::shared_mutex tracked_mutex;
 std::unordered_map<uintptr_t, Texture> tracked;
 std::unordered_set<uintptr_t> tracked_views; // addresses where the game created the view (the rest are copies)
 std::atomic<uintptr_t> tracked_low{UINTPTR_MAX}, tracked_high{0};
+size_t tracked_capacity = 65536; // [debug] tracking_capacity: smaller to test the table-full path quickly
 
 void track_insert(uintptr_t address, const Texture& texture, bool view = false) { // tracked_mutex held exclusively
-    if (tracked.size() >= 65536) {
+    if (tracked.size() >= tracked_capacity) {
         // The sim copies the screen descriptors to new places every frame, so copies pile up faster than they are
         // overwritten. Forget the copies (the next frame's copies are tracked again) and keep the views.
         const auto before = tracked.size();
@@ -367,7 +368,7 @@ void track_insert(uintptr_t address, const Texture& texture, bool view = false) 
         static std::atomic<int> logged{0};
         if (logged++ < 3) log("descriptor tracking: table full, %llu copied entries cleared (%llu views kept)", uint64_t(before - tracked.size()),
             uint64_t(tracked.size()));
-        if (tracked.size() >= 65536) return;
+        if (tracked.size() >= tracked_capacity) return;
     }
     tracked[address] = texture;
     if (view) tracked_views.insert(address);
@@ -1438,6 +1439,10 @@ void load_settings() {
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
         log("setting descriptor_tracking=1 (screens identified by descriptor tracking only, as on AMD/Intel)");
+    }
+    if (const UINT capacity = GetPrivateProfileIntW(L"debug", L"tracking_capacity", 0, settings_path().c_str())) {
+        tracked_capacity = std::clamp<size_t>(capacity, 1024, 65536);
+        log("setting tracking_capacity=%llu (debug)", uint64_t(tracked_capacity));
     }
 }
 void save_settings() {
