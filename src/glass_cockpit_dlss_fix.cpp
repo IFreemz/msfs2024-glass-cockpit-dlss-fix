@@ -51,6 +51,8 @@ using Microsoft::WRL::ComPtr;
 
 size_t graphics_pipeline_slot();
 size_t pipeline_stream_slot();
+size_t copy_descriptors_slot();
+size_t copy_descriptors_simple_slot();
 
 namespace {
 // MSFS 2024 cockpit display shader pair (replaced by the stand-in shaders' hashes in the offline test host).
@@ -319,6 +321,68 @@ std::atomic<uint64_t> present_count{0};
 std::mutex slots_mutex;
 UINT descriptor_size = 0;
 
+// Descriptor tracking (all GPUs but NVIDIA). AMD's descriptors contain their own address, so a copied descriptor's
+// bytes never equal the original's. Instead the views' addresses are followed through the game's descriptor copies:
+// address -> texture, carried from source to destination on every copy and dropped when overwritten.
+std::atomic<bool> track_descriptors{false};
+bool force_tracking = false; // offline test: identify textures by tracking only
+std::shared_mutex tracked_mutex;
+std::unordered_map<uintptr_t, Texture> tracked;
+std::atomic<uintptr_t> tracked_low{UINTPTR_MAX}, tracked_high{0};
+
+void track_insert(uintptr_t address, const Texture& texture) { // tracked_mutex held exclusively
+    if (tracked.size() >= 65536) return;
+    tracked[address] = texture;
+    for (auto low = tracked_low.load(); address < low && !tracked_low.compare_exchange_weak(low, address);) {}
+    for (auto high = tracked_high.load(); address > high && !tracked_high.compare_exchange_weak(high, address);) {}
+}
+void track_copy(uintptr_t dest, uintptr_t source, UINT count) {
+    const SIZE_T step = descriptor_size, span = SIZE_T(count) * step;
+    const auto low = tracked_low.load(std::memory_order_relaxed), high = tracked_high.load(std::memory_order_relaxed);
+    const bool source_near = source <= high && source + span > low, dest_near = dest <= high && dest + span > low;
+    if (!source_near && !dest_near) return;
+    std::vector<std::pair<uintptr_t, Texture>> carried;
+    std::vector<uintptr_t> dropped;
+    {
+        std::shared_lock lock(tracked_mutex);
+        if (tracked.empty()) return;
+        for (UINT i = 0; i < count; ++i) {
+            const auto from = source + i * step, to = dest + i * step;
+            if (source_near) if (const auto found = tracked.find(from); found != tracked.end()) { carried.emplace_back(to, found->second); continue; }
+            if (dest_near && tracked.contains(to)) dropped.push_back(to);
+        }
+    }
+    if (carried.empty() && dropped.empty()) return;
+    std::unique_lock lock(tracked_mutex);
+    for (const auto address : dropped) tracked.erase(address);
+    for (const auto& [address, texture] : carried) track_insert(address, texture);
+}
+using CopySimple = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
+using Copy = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*,
+    const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE);
+CopySimple original_copy_simple = nullptr;
+Copy original_copy = nullptr;
+void STDMETHODCALLTYPE copy_simple_hook(ID3D12Device* device, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE dest, D3D12_CPU_DESCRIPTOR_HANDLE source,
+    D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    original_copy_simple(device, count, dest, source, type);
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device == main_device) track_copy(dest.ptr, source.ptr, count);
+}
+void STDMETHODCALLTYPE copy_hook(ID3D12Device* device, UINT dest_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts, const UINT* dest_sizes,
+    UINT source_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* source_starts, const UINT* source_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    original_copy(device, dest_ranges, dest_starts, dest_sizes, source_ranges, source_starts, source_sizes, type);
+    if (type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || device != main_device || !dest_starts || !source_starts) return;
+    // Both sides are lists of ranges with the same total length; walk them together.
+    UINT d = 0, s = 0, d_done = 0, s_done = 0;
+    while (d < dest_ranges && s < source_ranges) {
+        const UINT d_size = dest_sizes ? dest_sizes[d] : 1, s_size = source_sizes ? source_sizes[s] : 1;
+        const UINT n = std::min(d_size - std::min(d_done, d_size), s_size - std::min(s_done, s_size));
+        if (n) track_copy(dest_starts[d].ptr + SIZE_T(d_done) * descriptor_size, source_starts[s].ptr + SIZE_T(s_done) * descriptor_size, n);
+        d_done += n; s_done += n;
+        if (d_done >= d_size) { ++d; d_done = 0; }
+        if (s_done >= s_size) { ++s; s_done = 0; }
+    }
+}
+
 bool read_bytes(const void* source, void* destination, size_t size) {
     __try { std::memcpy(destination, source, size); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -474,6 +538,12 @@ void on_init_device(api::device* device) {
     ComPtr<ID3D12Device2> device2;
     if (SUCCEEDED(state->native->QueryInterface(IID_PPV_ARGS(&device2))))
         hooked &= hook((*reinterpret_cast<void***>(device2.Get()))[pipeline_stream_slot()], reinterpret_cast<void*>(&stream_hook), original_stream);
+    track_descriptors = !gpu_nvidia || force_tracking;
+    if (track_descriptors) {
+        const bool tracking = hook(table[copy_descriptors_slot()], reinterpret_cast<void*>(&copy_hook), original_copy) &&
+            hook(table[copy_descriptors_simple_slot()], reinterpret_cast<void*>(&copy_simple_hook), original_copy_simple);
+        log("descriptor tracking hooks=%d (screen textures are followed through descriptor copies)", tracking);
+    }
     log("device native=%p pso_hooks=%d descriptor_size=%u", state->native, hooked, descriptor_size);
     install_ngx();
     install_ffx();
@@ -527,7 +597,15 @@ void on_init_layout(api::device* device, uint32_t count, const api::pipeline_lay
     }
 }
 
-void on_init_view(api::device* device, api::resource resource, api::resource_usage usage, const api::resource_view_desc& desc, api::resource_view) {
+void on_init_view(api::device* device, api::resource resource, api::resource_usage usage, const api::resource_view_desc& desc, api::resource_view view) {
+    if (track_descriptors.load(std::memory_order_relaxed) && view.handle) { // a new view replaces whatever was tracked there
+        const auto address = uintptr_t(view.handle);
+        if (address >= tracked_low.load(std::memory_order_relaxed) && address <= tracked_high.load(std::memory_order_relaxed)) {
+            bool present;
+            { std::shared_lock lock(tracked_mutex); present = tracked.contains(address); }
+            if (present) { std::unique_lock lock(tracked_mutex); tracked.erase(address); }
+        }
+    }
     // A default view (null D3D12 view desc) arrives with type/format "unknown".
     if (usage != api::resource_usage::shader_resource || !resource.handle ||
         (desc.type != api::resource_view_type::unknown && desc.type != api::resource_view_type::texture_2d &&
@@ -557,6 +635,10 @@ void on_init_view(api::device* device, api::resource resource, api::resource_usa
         srv.Texture2D.MostDetailedMip = first;
         srv.Texture2D.MipLevels = count == UINT32_MAX ? UINT(-1) : count;
     }
+    if (track_descriptors.load(std::memory_order_relaxed) && view.handle) {
+        std::unique_lock lock(tracked_mutex);
+        track_insert(uintptr_t(view.handle), {native, format});
+    }
     const auto slot = state->scratch->GetCPUDescriptorHandleForHeapStart();
     std::unique_lock lock(textures_mutex);
     state->native->CreateShaderResourceView(native, default_view ? nullptr : &srv, slot);
@@ -575,6 +657,10 @@ void on_destroy_resource(api::device*, api::resource resource) {
     std::unique_lock lock(textures_mutex);
     known_textures.erase(native);
     std::erase_if(signatures, [&](const auto& p) { return p.second.resource == native; });
+    if (track_descriptors.load(std::memory_order_relaxed)) {
+        std::unique_lock tracked_lock(tracked_mutex);
+        std::erase_if(tracked, [&](const auto& p) { return p.second.resource == native; });
+    }
     for (auto& slot : slot_resources) { auto expected = native; slot.compare_exchange_strong(expected, nullptr); }
 }
 
@@ -648,14 +734,25 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
         note(stats.unknown_texture, "descriptor_unreadable"); return;
     }
     Texture texture;
-    {
+    bool recognised = false;
+    if (!force_tracking) {
         std::shared_lock lock(textures_mutex);
-        const auto found = signatures.find(s);
-        if (found == signatures.end()) {
-            if (stats.unknown_texture < 3) log("unrecognised_descriptor heap=%p offset=%u bytes=%s known=%llu", native_heap, offset, hex(s).c_str(), uint64_t(signatures.size()));
-            note(stats.unknown_texture, "texture_not_recognised"); return;
+        if (const auto found = signatures.find(s); found != signatures.end()) { texture = found->second; recognised = true; }
+    }
+    if (!recognised && track_descriptors.load(std::memory_order_relaxed)) {
+        const auto address = uintptr_t(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size);
+        std::shared_lock lock(tracked_mutex);
+        if (const auto found = tracked.find(address); found != tracked.end()) { texture = found->second; recognised = true; }
+        if (recognised) LOG_ONCE("milestone screen texture found through descriptor tracking");
+    }
+    if (!recognised) {
+        if (stats.unknown_texture < 3) {
+            size_t tracked_count;
+            { std::shared_lock lock(tracked_mutex); tracked_count = tracked.size(); }
+            log("unrecognised_descriptor heap=%p offset=%u bytes=%s known=%llu tracked=%llu", native_heap, offset, hex(s).c_str(),
+                uint64_t(signatures.size()), uint64_t(tracked_count));
         }
-        texture = found->second;
+        note(stats.unknown_texture, "texture_not_recognised"); return;
     }
     const int slot = slot_of(texture.resource, texture.format);
     if (slot < 0) { note(stats.unsupported_draw, "slots_full"); return; }
@@ -1279,6 +1376,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     const auto fixture_directory = std::filesystem::path(executable).parent_path();
     std::error_code error;
     const bool fixture = std::filesystem::exists(fixture_directory / L"fixture_ps.cso", error);
+    force_tracking = fixture && wcsstr(GetCommandLineW(), L"--track");
     if (fixture) {
         auto hash_file = [](const std::filesystem::path& path) {
             std::ifstream file(path, std::ios::binary);

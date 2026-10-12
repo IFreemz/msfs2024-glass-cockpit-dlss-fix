@@ -10,4 +10,9 @@ try {
     if ($LASTEXITCODE) { throw "Offline FSR test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --vr
     if ($LASTEXITCODE) { throw "Offline VR test failed ($LASTEXITCODE)" }
+    # Screen textures identified by descriptor tracking only (how AMD/Intel GPUs run).
+    & .\FlightSimulator2024.exe --track
+    if ($LASTEXITCODE) { throw "Offline descriptor tracking test failed ($LASTEXITCODE)" }
+    & .\FlightSimulator2024.exe --fsr --vr --track
+    if ($LASTEXITCODE) { throw "Offline FSR VR descriptor tracking test failed ($LASTEXITCODE)" }
 } finally { Pop-Location }
