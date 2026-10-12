@@ -9,45 +9,28 @@ FSR**, in every quality mode, on a monitor and in VR.
 *Fenix A320 at 4K, DLSS Performance (1080p internal, upscaled to 4K), climbing at about 6,700 ft/min.
 [Watch in full quality on YouTube](https://www.youtube.com/watch?v=Hcz8hwFndoc).*
 
-It works with every aircraft that uses the simulator's standard cockpit display shader. Tested on the Fenix A320
-family, iniBuilds A220, A330, A340, A350 and A380 and the default DA62, and by community testers on the PMDG 737 and 777
-and the default Cessna Longitude. It should cover most glass cockpits.
+It works with every aircraft that uses the simulator's cockpit display shaders, so it should cover most glass
+cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headsets and GPUs.
 
 > Unofficial community mod. Not affiliated with Microsoft, Asobo, NVIDIA, AMD or any aircraft developer.
 > **Beta:** please report problems (see [Troubleshooting](#troubleshooting)).
 
-## Why the screens smear
+## Contents
 
-DLSS and FSR build each frame from the history of previous frames, guided by motion vectors. A cockpit screen does
-not move, but its *content* does, so the upscaler keeps blending old numbers into new ones. The game's own hint for
-this (the animated-texture mask) isn't enough, and no DLSS preset (J, K, M) fixes it.
-
-## How the fix works
-
-The same idea that DLSS mods for other games use for HUDs: **draw the screen content after the upscaler**.
-
-1. When the sim draws a cockpit screen, the add-on draws the same mesh once more into a small private map that
-   records which part of which screen image lands on each pixel.
-2. Right after DLSS or FSR, it samples the sim's own clean screen image at full output resolution (with the frame's
-   camera jitter removed) and writes it over the upscaled result, so the moving content never goes through the
-   upscaler's history.
-3. Brightness is matched to the sim every frame, so night lighting and the brightness knobs still work. Dirt, sun
-   glare and shadows on the glass are taken from the upscaled image itself, limited to what this frame actually
-   shows, so they stay sharp while trails of old screen content are removed.
-
-In VR the sim draws every view (both eyes, plus the sharp centre views with foveated rendering) in one go and then
-upscales them one by one; the add-on records each view separately and learns from the sim which upscale belongs to
-which view.
-
-It works at any resolution and in any quality mode, and costs one extra draw per screen plus a few small GPU passes:
-no measurable FPS difference with the fix on or off in testing.
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Settings](#settings)
+- [Compatibility](#compatibility)
+- [Troubleshooting](#troubleshooting)
+- [How the fix works](#how-the-fix-works)
+- [Known limitations](#known-limitations)
+- [Building from source](#building-from-source)
+- [License](#license)
 
 ## Requirements
 
-- Microsoft Flight Simulator 2024, DirectX 12. Tested on the Microsoft Store / Xbox app (Game Pass) version. The Steam
-  version runs the same game and should work the same way: reports welcome.
-- **DLSS Super Resolution** (NVIDIA RTX) or **FSR** selected in the sim's graphics settings. FSR also runs on AMD and
-  Intel GPUs; confirmed working on an AMD RX 6800 XT (0.7.1 or newer), Intel reports welcome.
+- Microsoft Flight Simulator 2024, DirectX 12 (Steam or Microsoft Store / Xbox app).
+- **DLSS Super Resolution** (NVIDIA RTX) or **FSR** (any GPU) selected in the sim's graphics settings.
 - [ReShade](https://reshade.me) 6.7 or newer **with full add-on support** (the "with full add-on support" download)
 
 ## Installation
@@ -63,7 +46,8 @@ To check that it's working, open the ReShade menu (**Home** key) and go to the *
 says "Working: fixing N screens" and shows a checklist. Or press **Ctrl+Shift+F11** in the cockpit: every screen it
 fixes turns green-tinted. Press it again to turn the tint off.
 
-**Uninstall:** delete `glass-cockpit-dlss-fix.addon64` (and the `.ini`/`.log` files next to it).
+**Update:** replace the `.addon64` file with the new one. **Uninstall:** delete `glass-cockpit-dlss-fix.addon64`
+(and the `.ini`/`.log` files next to it).
 
 ## Settings
 
@@ -75,6 +59,59 @@ All settings are in the add-on's tab in the ReShade menu (**Home**) and are reme
 | Line smoothing (0-50 %, default 35 %) | Smooths stair steps on thin slanted lines in the screens, like the upscaler did. 0 = sharpest, 50 = softest. Ctrl+click to type a value |
 | Green tint (Ctrl+Shift+F11) | Tints every screen the fix covers (for checking, not remembered) |
 | Flip jitter direction (Ctrl+Shift+F10) | Only needed if the screen text shimmers when the camera is still |
+
+ReShade presets and effects keep working as usual on top of the fix.
+
+## Compatibility
+
+### Aircraft
+
+| Aircraft | Status |
+|---|---|
+| Fenix A320 family | Tested |
+| iniBuilds A220 | Tested |
+| iniBuilds A330 | Tested |
+| iniBuilds A340 | Tested (0.7.2 or newer; in VR 0.7.3 or newer) |
+| iniBuilds A350 | Tested |
+| iniBuilds A380 | Tested |
+| PMDG 737 | Tested by the community (also in VR) |
+| PMDG 777 | Tested by the community (also in VR) |
+| Default DA62 | Tested |
+| Default Cessna Longitude | Tested by the community (in VR) |
+
+Other glass cockpits should work too. If some screens of an aircraft don't turn green with Ctrl+Shift+F11, please
+report it (see [Troubleshooting](#troubleshooting)).
+
+### VR
+
+| Headset | Status |
+|---|---|
+| Meta Quest 3 through Virtual Desktop | Tested with DLSS and FSR, foveated rendering on and off |
+| Pimax Crystal Light | Tested by the community (DLSS) |
+
+Other headsets and runtimes should work the same; reports welcome.
+
+### GPUs and upscalers
+
+| Setup | Status |
+|---|---|
+| NVIDIA RTX, DLSS Super Resolution | Tested, including DLSS Frame Generation up to 6x Multi Frame Generation |
+| NVIDIA, FSR | Tested |
+| AMD, FSR | Tested by the community on an RX 6800 XT (0.7.1 or newer) |
+| Intel, FSR | Untested, reports welcome |
+
+### Game versions
+
+Tested on the Microsoft Store / Xbox app (Game Pass) version and by the community on Steam.
+
+### Other mods
+
+- **ReShade presets and effects:** work as usual.
+- **DLSS 5 / Neural Rendering add-ons:** tested alongside the RenoDX DLSS 5 add-on.
+- **OptiShade:** the OptiShade developer is building this fix into OptiShade.
+- **OptiScaler:** works when OptiScaler's upscaler is set to DLSS (reported by the community). With OptiScaler's own
+  FSR or XeSS selected it does not apply. If another mod also needs to be `dxgi.dll`, load ReShade through an ASI
+  loader or through OptiScaler's `LoadReshade` option instead.
 
 ## Troubleshooting
 
@@ -102,24 +139,40 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 
 | Problem | Try |
 |---|---|
+| No "Glass Cockpit DLSS Fix" tab in the ReShade menu | The add-on isn't loaded. If the ReShade menu has no **Add-ons** tab, reinstall ReShade with the *full add-on support* download. Check that the file is next to the ReShade DLL. |
 | Nothing changes, no green tint | Check that ReShade is the *full add-on support* build, the file is next to the ReShade DLL and DLSS or FSR is selected. Then read the tab and the log. |
-| Some screens of an aircraft stay normal | Send both logs and the aircraft name |
+| Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
 | Screen lines look jagged / too soft | Adjust Line smoothing |
 | Screen text shimmers when the camera is still | Press Ctrl+Shift+F10 once |
 | Crash at startup | Remove the add-on, start once, put it back, then send both logs |
 
-## Other upscaling mods
+## How the fix works
 
-- **OptiScaler:** should work when OptiScaler's upscaler is set to DLSS, since the fix runs right after DLSS
-  (untested, reports welcome). With OptiScaler's own FSR or XeSS selected it does not apply.
-- **OptiShade:** untested. It ships its own modified ReShade, which needs full add-on support for this fix to load.
+DLSS and FSR build each frame from the history of previous frames, guided by motion vectors. A cockpit screen does
+not move, but its *content* does, so the upscaler keeps blending old numbers into new ones. The game's own hint for
+this (the animated-texture mask) isn't enough, and no DLSS preset (J, K, M) fixes it.
+
+The fix uses the same idea that DLSS mods for other games use for HUDs: **draw the screen content after the
+upscaler**.
+
+1. When the sim draws a cockpit screen, the add-on draws the same mesh once more into a small private map that
+   records which part of which screen image lands on each pixel.
+2. Right after DLSS or FSR, it samples the sim's own clean screen image at full output resolution (with the frame's
+   camera jitter removed) and writes it over the upscaled result, so the moving content never goes through the
+   upscaler's history.
+3. Brightness is matched to the sim every frame, so night lighting and the brightness knobs still work. Dirt, sun
+   glare and shadows on the glass are taken from the upscaled image itself, limited to what this frame actually
+   shows, so they stay sharp while trails of old screen content are removed.
+
+In VR the sim draws every view (both eyes, plus the sharp centre views with foveated rendering) in one go and then
+upscales them one by one; the add-on records each view separately and learns from the sim which upscale belongs to
+which view.
+
+It works at any resolution and in any quality mode, and costs one extra draw per screen plus a few small GPU passes:
+no measurable FPS difference with the fix on or off in testing.
 
 ## Known limitations
 
-- DLSS Super Resolution and FSR only (not TAA). Works with DLSS Frame Generation (tested up to 6x Multi Frame
-  Generation).
-- VR: tested with DLSS on a Quest 3 through Virtual Desktop, with and without foveated rendering, and by a community
-  tester on a Pimax Crystal Light. FSR in VR and other headsets are untested, reports welcome.
 - A thin band at each screen's edge (about one render pixel) still comes from the upscaler.
 - Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) would be covered by it.
 - Sim updates that change the cockpit display shader stop the fix (the sim then just looks like stock DLSS/FSR)
