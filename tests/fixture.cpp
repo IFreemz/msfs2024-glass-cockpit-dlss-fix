@@ -202,15 +202,51 @@ static std::array<uint8_t, 4> pattern(UINT x, UINT y) {
     return {0, 0, 0, 255};
 }
 
+// --hotpatch: another mod (the RTX 40 MFG unlock) redirects DLSS evaluate before ReShade loads: a two-byte jump back
+// over the export's first bytes to a jump placed just before it, which leads (through a nearby jump to absolute) to
+// that mod's handler, which calls the real work itself. The fix can't hook such a function directly.
+static NgxEvaluate fake_body = nullptr;
+static unsigned mfg_handler_calls = 0;
+static NVSDK_NGX_Result mfg_handler(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters,
+    PFN_NVSDK_NGX_ProgressCallback progress) {
+    ++mfg_handler_calls;
+    return fake_body(list, handle, parameters, progress);
+}
+static void redirect_evaluate_like_mfg_unlock() {
+    const auto ngx = GetModuleHandleW(L"_nvngx.dll");
+    auto* export_address = reinterpret_cast<uint8_t*>(GetProcAddress(ngx, "NVSDK_NGX_D3D12_EvaluateFeature"));
+    fake_body = reinterpret_cast<NgxEvaluate>(GetProcAddress(ngx, "FakeEvaluateBody"));
+    require(export_address && fake_body, "fake NGX exports missing");
+    for (int i = 1; i <= 5; ++i) require(export_address[-i] == 0xcc || export_address[-i] == 0x90, "no padding before the fake evaluate");
+    // A page within 2 GB of the export for the absolute jump to the handler.
+    uint8_t* page = nullptr;
+    for (uintptr_t at = (reinterpret_cast<uintptr_t>(export_address) & ~uintptr_t(0xffff)) - 0x10000; !page && at > 0x10000; at -= 0x10000)
+        page = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(at), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    require(page != nullptr, "no page near the fake NGX");
+    const auto handler = reinterpret_cast<uint64_t>(&mfg_handler);
+    page[0] = 0xff; page[1] = 0x25; std::memset(page + 2, 0, 4); std::memcpy(page + 6, &handler, 8);
+    DWORD old = 0;
+    require(VirtualProtect(export_address - 5, 16, PAGE_EXECUTE_READWRITE, &old), "VirtualProtect failed");
+    const int32_t rel = int32_t(page - export_address);
+    export_address[-5] = 0xe9; std::memcpy(export_address - 4, &rel, 4);
+    // The rest of the old first instruction (mov [rsp+8], rbx) stays, as in the real DLSS runtime with that mod.
+    const uint8_t patched[5]{0xeb, 0xf9, 0x5c, 0x24, 0x08};
+    std::memcpy(export_address, patched, sizeof(patched));
+    VirtualProtect(export_address - 5, 16, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), export_address - 5, 16);
+    std::printf("DLSS evaluate redirected like the RTX 40 MFG unlock\n");
+}
+
 int main(int argc, char** argv) {
     try {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
-        bool fsr = false, vr = false, screen_t0 = false, reload = false;
+        bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
-            reload |= !std::strcmp(argv[i], "--reload");
+            reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch");
         }
+        if (hotpatch) redirect_evaluate_like_mfg_unlock();
         if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
         const UINT views = vr ? 2 : 1;
         if (vr) std::printf("display: VR (instanced stereo, %u eyes)\n", views);
@@ -638,6 +674,10 @@ int main(int argc, char** argv) {
             all_passed &= pass;
             previous_ref = ref;
           }
+        }
+        if (hotpatch) {
+            std::printf("redirected DLSS: the other mod's handler ran %u times\n", mfg_handler_calls);
+            all_passed = all_passed && mfg_handler_calls > 0;
         }
         std::printf(all_passed ? "ALL PASSED\n" : "FAILED\n");
         return all_passed ? 0 : 1;

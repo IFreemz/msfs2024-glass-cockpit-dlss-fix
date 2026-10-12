@@ -22,4 +22,7 @@ try {
     if ($LASTEXITCODE) { throw "Offline descriptor tracking test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --fsr --vr --track
     if ($LASTEXITCODE) { throw "Offline FSR VR descriptor tracking test failed ($LASTEXITCODE)" }
+    # Another mod (the RTX 40 MFG unlock) has redirected DLSS evaluate in a way that can't be hooked directly.
+    & .\FlightSimulator2024.exe --hotpatch
+    if ($LASTEXITCODE) { throw "Offline redirected DLSS test failed ($LASTEXITCODE)" }
 } finally { Pop-Location }

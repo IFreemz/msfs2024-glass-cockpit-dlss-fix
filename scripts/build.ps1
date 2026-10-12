@@ -86,7 +86,7 @@ try {
             & $dxc -T ps_6_6 -HV 2021 -E main -D VR=1 -D "REFERENCE=$reference" -WX -O3 -Fo (Join-Path $testHost "$($prefix)_ps.cso") (Join-Path $root 'tests\fixture_ps.hlsl')
             if ($LASTEXITCODE) { throw 'VR test pixel shader failed' }
         }
-        & $compiler /nologo /W4 /WX /MD /O2 /LD (Join-Path $root 'tests\fake_nvngx.cpp') /link /OPT:NOICF /DEF:"$root\tests\fake_nvngx.def" /OUT:"$testHost\_nvngx.dll"
+        & $compiler /nologo /W4 /WX /MD /O2 /LD /hotpatch (Join-Path $root 'tests\fake_nvngx.cpp') /link /OPT:NOICF /FUNCTIONPADMIN:16 /DEF:"$root\tests\fake_nvngx.def" /OUT:"$testHost\_nvngx.dll"
         if ($LASTEXITCODE) { throw 'Fake NGX compilation failed' }
         & $compiler /nologo /W4 /WX /MD /O2 /LD (Join-Path $root 'tests\fake_ffx.cpp') /link /OUT:"$testHost\amd_fidelityfx_dx12.dll"
         if ($LASTEXITCODE) { throw 'Fake FidelityFX compilation failed' }

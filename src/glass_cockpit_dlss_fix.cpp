@@ -1457,6 +1457,41 @@ std::string describe_code(const void* address) {
     return text;
 }
 
+// Where a function that another mod has redirected really starts: follows jumps written over its first bytes (e.g. a
+// two-byte jump back to a jump placed just before it, as the RTX 40 MFG unlock does), up to a few hops.
+void* follow_jumps(void* address) {
+    for (int hop = 0; hop < 8 && address; ++hop) {
+        uint8_t code[14]{};
+        if (!read_bytes(address, code, sizeof(code))) break;
+        auto* at = static_cast<uint8_t*>(address);
+        if (code[0] == 0xeb) address = at + 2 + int8_t(code[1]);                                     // jmp rel8
+        else if (code[0] == 0xe9) { int32_t rel; memcpy(&rel, code + 1, 4); address = at + 5 + rel; }  // jmp rel32
+        else if (code[0] == 0xff && code[1] == 0x25) {                                                 // jmp [rip + disp32]
+            int32_t rel; memcpy(&rel, code + 2, 4);
+            void* target = nullptr;
+            if (!read_bytes(at + 6 + rel, &target, sizeof(target))) break;
+            address = target;
+        } else break;
+    }
+    return address;
+}
+
+// Hook a DLSS entry point; if another mod has redirected it so that it can't be hooked directly, hook the code it
+// leads to instead (that mod's handler, which then calls DLSS itself): the fix then runs after both.
+template <class T> bool hook_ngx(void* target, void* detour, T& original, const char* name) {
+    if (hook(target, detour, original)) return true;
+    const MH_STATUS status = last_hook_status;
+    void* real = follow_jumps(target);
+    if (real == target) return false;
+    const std::string where = describe_code(real);
+    if (hook(real, detour, original)) {
+        log("DLSS %s is redirected by another mod (%s): fix attached at its destination (%s)", name, MH_StatusToString(status), where.c_str());
+        return true;
+    }
+    last_hook_status = status;
+    return false;
+}
+
 bool ngx_hooked = false, ngx_hook_failed = false; // failed: DLSS is loaded but its evaluate could not be hooked
 void install_ngx() {
     if (ngx_hooked) return;
@@ -1469,9 +1504,9 @@ void install_ngx() {
     auto evaluate_c = GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature_C");
     HMODULE pinned = nullptr;
     if (evaluate) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(evaluate), &pinned);
-    const bool a = evaluate && hook(reinterpret_cast<void*>(evaluate), reinterpret_cast<void*>(&evaluate_hook), original_evaluate);
+    const bool a = evaluate && hook_ngx(reinterpret_cast<void*>(evaluate), reinterpret_cast<void*>(&evaluate_hook), original_evaluate, "evaluate");
     const MH_STATUS status_a = evaluate ? last_hook_status : MH_ERROR_FUNCTION_NOT_FOUND;
-    const bool b = evaluate_c && hook(reinterpret_cast<void*>(evaluate_c), reinterpret_cast<void*>(&evaluate_c_hook), original_evaluate_c);
+    const bool b = evaluate_c && hook_ngx(reinterpret_cast<void*>(evaluate_c), reinterpret_cast<void*>(&evaluate_c_hook), original_evaluate_c, "evaluate_c");
     const MH_STATUS status_b = evaluate_c ? last_hook_status : MH_ERROR_FUNCTION_NOT_FOUND;
     wchar_t path[MAX_PATH]{};
     GetModuleFileNameW(module, path, MAX_PATH);
