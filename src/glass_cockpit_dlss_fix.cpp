@@ -1511,11 +1511,27 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghostin
     X(draw, on_draw) X(draw_indexed, on_draw_indexed) X(reshade_present, on_present) X(init_pipeline, on_init_pipeline) \
     X(copy_texture_region, on_copy_region)
 
+// ReShade unloads its add-ons when the last device goes away and loads them again for the next one (e.g. when another
+// mod such as OptiScaler creates and releases a device at startup). The module stays pinned (its hooks must stay
+// valid), so a reload calls AddonInit again on the same, already initialised module.
+bool initialised = false;
+bool enabled_before_unload = true;
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_module) {
     wchar_t executable[MAX_PATH]{};
     GetModuleFileNameW(nullptr, executable, MAX_PATH);
     if (_wcsicmp(std::filesystem::path(executable).filename().c_str(), L"FlightSimulator2024.exe") != 0) return false;
-    if (MH_Initialize() != MH_OK || !reshade::register_addon(addon, reshade_module)) return false;
+    const auto minhook = MH_Initialize();
+    if ((minhook != MH_OK && minhook != MH_ERROR_ALREADY_INITIALIZED) || !reshade::register_addon(addon, reshade_module)) return false;
+    if (initialised) { // reload: keep the log, settings, worker and hooks; only re-register with ReShade
+        enabled = enabled_before_unload;
+        log("add-on reloaded by ReShade (another device was created and released before; normal with some other mods)");
+#define REGISTER(event, callback) reshade::register_event<reshade::addon_event::event>(callback);
+        OVERLAY_EVENTS(REGISTER)
+#undef REGISTER
+        glass::init_status_panel(reshade_module);
+        return true;
+    }
+    initialised = true;
     HMODULE pinned = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&AddonInit), &pinned);
     wchar_t module[MAX_PATH]{};
@@ -1566,7 +1582,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
 extern "C" __declspec(dllexport) void GlassFixJitterPositive(bool positive) { jitter_positive = positive; }
 extern "C" __declspec(dllexport) void GlassFixLineSmoothing(int percent) { smoothing_percent = percent; }
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE) {
-    enabled = false;
+    enabled_before_unload = enabled.exchange(false);
+    log("add-on unloaded by ReShade");
     glass::uninit_status_panel();
 #define UNREGISTER(event, callback) reshade::unregister_event<reshade::addon_event::event>(callback);
     OVERLAY_EVENTS(UNREGISTER)

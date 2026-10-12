@@ -12,6 +12,9 @@ try {
     if ($LASTEXITCODE) { throw "Offline VR test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --screen-t0
     if ($LASTEXITCODE) { throw "Offline screen-in-t0 variant test failed ($LASTEXITCODE)" }
+    # ReShade unloads and reloads the add-on when another device comes and goes first (OptiScaler does this).
+    & .\FlightSimulator2024.exe --reload
+    if ($LASTEXITCODE) { throw "Offline add-on reload test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --vr --screen-t0
     if ($LASTEXITCODE) { throw "Offline VR screen-in-t0 variant test failed ($LASTEXITCODE)" }
     # Screen textures identified by descriptor tracking only (how AMD/Intel GPUs run).

@@ -206,8 +206,11 @@ int main(int argc, char** argv) {
     try {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
-        bool fsr = false, vr = false, screen_t0 = false;
-        for (int i = 1; i < argc; ++i) { fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0"); }
+        bool fsr = false, vr = false, screen_t0 = false, reload = false;
+        for (int i = 1; i < argc; ++i) {
+            fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
+            reload |= !std::strcmp(argv[i], "--reload");
+        }
         if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
         const UINT views = vr ? 2 : 1;
         if (vr) std::printf("display: VR (instanced stereo, %u eyes)\n", views);
@@ -227,6 +230,11 @@ int main(int argc, char** argv) {
 
         ComPtr<IDXGIFactory6> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
         ComPtr<IDXGIAdapter1> adapter; check(factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)));
+        if (reload) { // like OptiScaler at startup: a device created and released first makes ReShade unload and reload add-ons
+            ComPtr<ID3D12Device> early; check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&early)));
+            early.Reset();
+            std::printf("early device created and released\n");
+        }
         ComPtr<ID3D12Device> device; check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)));
         const auto addon = GetModuleHandleW(L"glass-cockpit-dlss-fix.addon64");
         require(addon != nullptr, "overlay add-on not loaded by ReShade");
