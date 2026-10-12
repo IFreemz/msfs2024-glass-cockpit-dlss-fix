@@ -47,7 +47,7 @@ no measurable FPS difference with the fix on or off in testing.
 - Microsoft Flight Simulator 2024, DirectX 12. Tested on the Microsoft Store / Xbox app (Game Pass) version. The Steam
   version runs the same game and should work the same way: reports welcome.
 - **DLSS Super Resolution** (NVIDIA RTX) or **FSR** selected in the sim's graphics settings. FSR also runs on AMD and
-  Intel GPUs; the fix has been tested with FSR on an NVIDIA card, AMD/Intel reports welcome.
+  Intel GPUs; confirmed working on an AMD RX 6800 XT (0.7.1 or newer), Intel reports welcome.
 - [ReShade](https://reshade.me) 6.7 or newer **with full add-on support** (the "with full add-on support" download)
 
 ## Installation
