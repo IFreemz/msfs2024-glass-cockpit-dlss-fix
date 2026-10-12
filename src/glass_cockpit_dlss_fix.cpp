@@ -318,12 +318,13 @@ HRESULT STDMETHODCALLTYPE stream_hook(ID3D12Device2* device, const D3D12_PIPELIN
     }
     return hr;
 }
+MH_STATUS last_hook_status = MH_OK; // why the last hook() failed (diagnostics)
 template <class T> bool hook(void* target, void* detour, T& original) {
     if (original) return true;
     void* trampoline = nullptr;
-    if (MH_CreateHook(target, detour, &trampoline) != MH_OK) return false;
+    if ((last_hook_status = MH_CreateHook(target, detour, &trampoline)) != MH_OK) return false;
     original = reinterpret_cast<T>(trampoline);
-    return MH_EnableHook(target) == MH_OK;
+    return (last_hook_status = MH_EnableHook(target)) == MH_OK;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1383,22 +1384,48 @@ void install_ffx() {
     { std::lock_guard lock(info_mutex); fsr_version = file_version(path); }
 }
 
-bool ngx_hooked = false;
+// Which module a code address belongs to, and its first bytes (diagnostics for a failed hook).
+std::string describe_code(const void* address) {
+    if (!address) return "missing export";
+    HMODULE owner = nullptr;
+    wchar_t path[MAX_PATH]{};
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(address), &owner))
+        GetModuleFileNameW(owner, path, MAX_PATH);
+    uint8_t bytes[16]{};
+    char text[160]{};
+    const bool readable = read_bytes(address, bytes, sizeof(bytes));
+    snprintf(text, sizeof(text), "in %s, bytes ", owner ? utf8(std::filesystem::path(path).filename().c_str()).c_str() : "no module");
+    for (size_t i = 0; i < sizeof(bytes) && readable; ++i) snprintf(text + strlen(text), sizeof(text) - strlen(text), "%02x", bytes[i]);
+    return text;
+}
+
+bool ngx_hooked = false, ngx_hook_failed = false; // failed: DLSS is loaded but its evaluate could not be hooked
 void install_ngx() {
     if (ngx_hooked) return;
     HMODULE module = GetModuleHandleW(L"_nvngx.dll");
     if (!module) return;
+    // Another mod may be patching the same function at the same moment: retry a few times (called every 10 s).
+    static int attempts = 0;
+    ++attempts;
     auto evaluate = GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature");
     auto evaluate_c = GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature_C");
     HMODULE pinned = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(evaluate), &pinned);
+    if (evaluate) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(evaluate), &pinned);
     const bool a = evaluate && hook(reinterpret_cast<void*>(evaluate), reinterpret_cast<void*>(&evaluate_hook), original_evaluate);
+    const MH_STATUS status_a = evaluate ? last_hook_status : MH_ERROR_FUNCTION_NOT_FOUND;
     const bool b = evaluate_c && hook(reinterpret_cast<void*>(evaluate_c), reinterpret_cast<void*>(&evaluate_c_hook), original_evaluate_c);
-    ngx_hooked = true;
+    const MH_STATUS status_b = evaluate_c ? last_hook_status : MH_ERROR_FUNCTION_NOT_FOUND;
     wchar_t path[MAX_PATH]{};
     GetModuleFileNameW(module, path, MAX_PATH);
+    if (!a && !b) {
+        log("DLSS hook attempt %d failed: evaluate %s (%s), evaluate_c %s (%s)", attempts, MH_StatusToString(status_a),
+            describe_code(reinterpret_cast<void*>(evaluate)).c_str(), MH_StatusToString(status_b), describe_code(reinterpret_cast<void*>(evaluate_c)).c_str());
+        if (attempts < 6) return;
+        ngx_hook_failed = true;
+    }
+    ngx_hooked = true;
     log("milestone DLSS runtime found: _nvngx.dll %s path=%ls hooks evaluate=%d evaluate_c=%d", file_version(path).c_str(), path, a, b);
-    if (!a && !b) log("ERROR could not hook DLSS evaluate - overlay cannot run");
+    if (!a && !b) log("ERROR could not hook DLSS evaluate - the fix cannot run with DLSS. Another mod that hooks DLSS (e.g. a DLSS 5 add-on) may be blocking it: try without it, and send the log");
 }
 
 // Settings live in an .ini next to the add-on (not in ReShade.ini).
@@ -1450,6 +1477,8 @@ void on_present(api::effect_runtime* runtime) {
         LOG_ONCE("WARNING no cockpit display shader seen after 5 minutes: not in a glass cockpit yet, or a sim update changed the shader (fix needs an update)");
         if (!found) found = "No cockpit display shader seen yet. Load a flight with a glass cockpit. If you are in one, a sim update may have changed the shader and the fix needs an update.";
     }
+    if (ngx_hook_failed && !stats.fsr_dispatches && !found)
+        found = "DLSS is loaded, but the add-on could not attach to it. Another mod that hooks DLSS (e.g. a DLSS 5 add-on) may be blocking it: try without it, and send your log.";
     static uint64_t display_since = 0;
     if (stats.display_draws && !display_since) display_since = now;
     if (display_since && now - display_since > 20000 && !found) {
