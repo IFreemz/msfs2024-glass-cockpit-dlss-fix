@@ -69,6 +69,7 @@ ReShade presets and effects keep working as usual on top of the fix.
 | Aircraft | Status |
 |---|---|
 | Fenix A320 family | Tested |
+| iFly 737 MAX 8 | Tested (0.7.5 or newer; the EFB tablet is left to DLSS/FSR, see [Known limitations](#known-limitations)) |
 | iniBuilds A220 | Tested |
 | iniBuilds A330 | Tested |
 | iniBuilds A340 | Tested (0.7.2 or newer; in VR 0.7.3 or newer) |
@@ -109,6 +110,8 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
 - **ReShade presets and effects:** work as usual.
 - **DLSS 5 / Neural Rendering add-ons:** tested alongside the RenoDX DLSS 5 add-on.
 - **OptiShade:** the OptiShade developer is building this fix into OptiShade.
+- **RTX 40 Multi Frame Generation unlock** (`VERSION.dll` mod): 0.7.5 or newer attaches to DLSS with it installed.
+  Older versions log "could not hook DLSS evaluate" with it. Reports welcome.
 - **OptiScaler:** works when OptiScaler's upscaler is set to DLSS, including OptiScaler's DLSS 5 Neural Rendering. If
   ReShade says "There were errors loading some add-ons", update to 0.7.4 or newer. If another mod also needs to be
   `dxgi.dll`, load ReShade through an ASI loader or through OptiScaler's `LoadReshade` option instead.
@@ -173,6 +176,8 @@ no measurable FPS difference with the fix on or off in testing.
 
 ## Known limitations
 
+- A screen whose picture the add-on can't redraw (e.g. the iFly 737 MAX EFB tablet) is left to DLSS/FSR, so it looks
+  like stock.
 - A thin band at each screen's edge (about one render pixel) still comes from the upscaler.
 - Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) would be covered by it.
 - Sim updates that change the cockpit display shader stop the fix (the sim then just looks like stock DLSS/FSR)
