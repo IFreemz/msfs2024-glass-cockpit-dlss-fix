@@ -10,8 +10,8 @@ FSR**, in every quality mode, on a monitor and in VR.
 [Watch in full quality on YouTube](https://www.youtube.com/watch?v=Hcz8hwFndoc).*
 
 It works with every aircraft that uses the simulator's standard cockpit display shader. Tested on the Fenix A320
-family, iniBuilds A220, A330, A350 and A380 and the default DA62 (and the PMDG 777 by community testers), and it
-should cover most glass cockpits.
+family, iniBuilds A220, A330, A350 and A380 and the default DA62, and by community testers on the PMDG 737 and 777
+and the default Cessna Longitude. It should cover most glass cockpits.
 
 > Unofficial community mod. Not affiliated with Microsoft, Asobo, NVIDIA, AMD or any aircraft developer.
 > **Beta:** please report problems (see [Troubleshooting](#troubleshooting)).
@@ -118,8 +118,8 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 
 - DLSS Super Resolution and FSR only (not TAA). Works with DLSS Frame Generation (tested up to 6x Multi Frame
   Generation).
-- VR: tested with DLSS on a Quest 3 through Virtual Desktop, with and without foveated rendering. FSR in VR and other
-  headsets/runtimes are untested, reports welcome.
+- VR: tested with DLSS on a Quest 3 through Virtual Desktop, with and without foveated rendering, and by a community
+  tester on a Pimax Crystal Light. FSR in VR and other headsets are untested, reports welcome.
 - A thin band at each screen's edge (about one render pixel) still comes from the upscaler.
 - Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) would be covered by it.
 - Sim updates that change the cockpit display shader stop the fix (the sim then just looks like stock DLSS/FSR)
