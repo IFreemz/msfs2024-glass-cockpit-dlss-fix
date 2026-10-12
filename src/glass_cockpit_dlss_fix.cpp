@@ -232,6 +232,21 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     if (!desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode) return;
     const auto ps = shader_hash(desc.PS.pShaderBytecode, desc.PS.BytecodeLength), vs = shader_hash(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
     if (views.ViewInstanceCount > 1) return; // view-instanced pipelines: not how MSFS draws its displays
+    if (vs == display_vs && ps != display_ps) { // diagnostics: other pixel shaders used with the screen vertex shader
+        static std::mutex dumped_mutex;
+        static std::set<uint64_t> dumped;
+        bool first;
+        { std::lock_guard lock(dumped_mutex); first = dumped.size() < 16 && dumped.insert(ps).second; }
+        if (first) {
+            std::error_code error;
+            const auto directory = addon_directory / L"glass-cockpit-shader-dumps";
+            std::filesystem::create_directories(directory, error);
+            char name[64]{};
+            snprintf(name, sizeof(name), "ps_%016llx.dxil", ps);
+            std::ofstream(directory / name, std::ios::binary).write(static_cast<const char*>(desc.PS.pShaderBytecode), std::streamsize(desc.PS.BytecodeLength));
+            log("screen_vs_variant ps=%016llx pso=%p rts=%u (pixel shader saved for inspection)", ps, pso, desc.NumRenderTargets);
+        }
+    }
     const bool vr = ps == vr_display_ps && vs == vr_display_vs;
     if (!vr && (ps != display_ps || vs != display_vs)) return;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC probe{};
@@ -884,7 +899,7 @@ void probe_screen_draw(api::command_list* list, const ListState& state, uint32_t
 // (GPU-written RGBA8 with mip maps, like every cockpit screen texture), to find screens drawn with another shader.
 std::atomic<uint64_t> screen_probe_until{0};
 void screen_probe(api::command_list* list, const ListState& state, uint32_t count, uint32_t instances) noexcept try {
-    if (!state.device || !state.layout) return;
+    if (!state.device || !state.layout || state.target_count != 7) return; // only the 3D scene pass (like the screens)
     std::vector<DeviceState::SrvRange> ranges;
     {
         std::shared_lock lock(state.device->layouts_mutex);
