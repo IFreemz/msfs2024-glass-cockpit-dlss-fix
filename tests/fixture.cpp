@@ -206,8 +206,10 @@ int main(int argc, char** argv) {
     try {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
-        bool fsr = false, vr = false;
-        for (int i = 1; i < argc; ++i) { fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); }
+        bool fsr = false, vr = false, screen_t0 = false;
+        for (int i = 1; i < argc; ++i) { fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0"); }
+        require(!(vr && screen_t0), "--screen-t0 is a flat-screen test");
+        if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
         const UINT views = vr ? 2 : 1;
         if (vr) std::printf("display: VR (instanced stereo, %u eyes)\n", views);
         FfxDispatch ffx_dispatch = nullptr;
@@ -220,7 +222,8 @@ int main(int argc, char** argv) {
         }
         if (!LoadLibraryW((here / L"ReShade64.asi").c_str())) { std::printf("LoadLibrary(ReShade64.asi) failed, error %lu\n", GetLastError()); return 2; }
         const auto vs = load(here / (vr ? "fixture_vr_vs.cso" : "fixture_vs.cso"));
-        const auto ps = load(here / (vr ? "fixture_vr_ps.cso" : "fixture_ps.cso")), reference_ps = load(here / (vr ? "reference_vr_ps.cso" : "reference_ps.cso"));
+        const auto ps = load(here / (vr ? "fixture_vr_ps.cso" : screen_t0 ? "fixture_t0_ps.cso" : "fixture_ps.cso")),
+            reference_ps = load(here / (vr ? "reference_vr_ps.cso" : screen_t0 ? "reference_t0_ps.cso" : "reference_ps.cso"));
         const auto reference_vs = vr ? load(here / "reference_vr_vs_eye0.cso") : vs, reference_vs_eye1 = vr ? load(here / "reference_vr_vs_eye1.cso") : vs;
 
         ComPtr<IDXGIFactory6> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
@@ -257,7 +260,7 @@ int main(int argc, char** argv) {
         for (UINT i = 0; i < 5; ++i) {
             params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             params[i].ShaderVisibility = i < 3 ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
-            params[i].Descriptor.ShaderRegister = i < 3 ? i : i == 3 ? 1 : 3;
+            params[i].Descriptor.ShaderRegister = i < 3 ? i : i == 3 ? 1 : screen_t0 ? 4 : 3; // variant: material in b4
         }
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
         params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -382,8 +385,9 @@ int main(int argc, char** argv) {
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gpu_heap)));
         auto cpu0 = cpu_heap->GetCPUDescriptorHandleForHeapStart(), gpu0 = gpu_heap->GetCPUDescriptorHandleForHeapStart();
         auto cpu1 = cpu0; cpu1.ptr += inc;
-        device->CreateShaderResourceView(alpha.Get(), nullptr, cpu0);
-        device->CreateShaderResourceView(display.Get(), nullptr, cpu1);
+        // Variant: the screen sits in t0 (first descriptor of the table).
+        device->CreateShaderResourceView(screen_t0 ? display.Get() : alpha.Get(), nullptr, cpu0);
+        device->CreateShaderResourceView(screen_t0 ? alpha.Get() : display.Get(), nullptr, cpu1);
         // Views the sim creates that the add-on must leave alone: a depth-stencil texture read as depth (plane 0)
         // and as stencil (plane 1), plus a plain sampled RGBA8 texture and an HDR UAV texture.
         D3D12_CLEAR_VALUE stencil_clear{DXGI_FORMAT_D24_UNORM_S8_UINT}; stencil_clear.DepthStencil.Depth = 1;

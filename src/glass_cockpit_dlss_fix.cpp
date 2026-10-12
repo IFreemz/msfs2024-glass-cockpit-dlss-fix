@@ -57,6 +57,8 @@ size_t copy_descriptors_simple_slot();
 namespace {
 // MSFS 2024 cockpit display shader pair (replaced by the stand-in shaders' hashes in the offline test host).
 uint64_t display_vs = 0xf102f1e3f5d9f66fULL, display_ps = 0x37e87c938bc76310ULL;
+// Display shader variant with the screen texture in t0 and the material constants in b4 (iniBuilds A340 main screens).
+uint64_t display_ps_t0 = 0xd3646ba0fd9007e9ULL;
 // The same display drawn in VR: instanced stereo, one instance per view into a layered render target.
 uint64_t vr_display_vs = 0x715948137700a5d6ULL, vr_display_ps = 0x9ba9df5bca0ad4b9ULL;
 
@@ -160,6 +162,7 @@ struct DisplayPipeline {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12Device> device;
     bool vr = false;
+    bool screen_t0 = false; // screen texture in t0 (display_ps_t0)
     std::array<std::atomic<ID3D12PipelineState*>, slot_count> variants{};
     std::array<std::atomic<bool>, slot_count> requested{};
 };
@@ -193,8 +196,16 @@ const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shader
     SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
 #undef SLOT
 }};
+const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shaders_t0{{
+#define SLOT(n) {map_ps_t0_##n, sizeof(map_ps_t0_##n)},
+    SLOT(0) SLOT(1) SLOT(2) SLOT(3) SLOT(4) SLOT(5) SLOT(6) SLOT(7)
+    SLOT(8) SLOT(9) SLOT(10) SLOT(11) SLOT(12) SLOT(13) SLOT(14) SLOT(15)
+    SLOT(16) SLOT(17) SLOT(18) SLOT(19) SLOT(20) SLOT(21) SLOT(22) SLOT(23)
+    SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
+#undef SLOT
+}};
 const std::pair<const unsigned char*, size_t>& map_shader(const DisplayPipeline& pipeline, unsigned slot) {
-    return pipeline.vr ? map_shaders_vr[slot] : map_shaders[slot];
+    return pipeline.vr ? map_shaders_vr[slot] : pipeline.screen_t0 ? map_shaders_t0[slot] : map_shaders[slot];
 }
 
 // Variant PSOs are compiled on a worker thread; draws are skipped (not stalled) until theirs is ready.
@@ -232,25 +243,11 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     if (!desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode) return;
     const auto ps = shader_hash(desc.PS.pShaderBytecode, desc.PS.BytecodeLength), vs = shader_hash(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
     if (views.ViewInstanceCount > 1) return; // view-instanced pipelines: not how MSFS draws its displays
-    if (vs == display_vs && ps != display_ps) { // diagnostics: other pixel shaders used with the screen vertex shader
-        static std::mutex dumped_mutex;
-        static std::set<uint64_t> dumped;
-        bool first;
-        { std::lock_guard lock(dumped_mutex); first = dumped.size() < 16 && dumped.insert(ps).second; }
-        if (first) {
-            std::error_code error;
-            const auto directory = addon_directory / L"glass-cockpit-shader-dumps";
-            std::filesystem::create_directories(directory, error);
-            char name[64]{};
-            snprintf(name, sizeof(name), "ps_%016llx.dxil", ps);
-            std::ofstream(directory / name, std::ios::binary).write(static_cast<const char*>(desc.PS.pShaderBytecode), std::streamsize(desc.PS.BytecodeLength));
-            log("screen_vs_variant ps=%016llx pso=%p rts=%u (pixel shader saved for inspection)", ps, pso, desc.NumRenderTargets);
-        }
-    }
     const bool vr = ps == vr_display_ps && vs == vr_display_vs;
-    if (!vr && (ps != display_ps || vs != display_vs)) return;
+    const bool screen_t0 = ps == display_ps_t0 && vs == display_vs;
+    if (!vr && !screen_t0 && (ps != display_ps || vs != display_vs)) return;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC probe{};
-    const auto& shader = vr ? map_shaders_vr[0] : map_shaders[0];
+    const auto& shader = vr ? map_shaders_vr[0] : screen_t0 ? map_shaders_t0[0] : map_shaders[0];
     if (!glass::clone_pipeline(desc, {shader.first, shader.second}, probe)) {
         log("pipeline_unsupported pso=%p", pso); return;
     }
@@ -268,13 +265,16 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     copy->root = desc.pRootSignature;
     copy->device = device;
     copy->vr = vr;
+    copy->screen_t0 = screen_t0;
     std::lock_guard lock(pipelines_mutex);
     for (size_t i = 0; i < max_pipelines; ++i) if (!pipeline_keys[i].load()) {
         pipeline_values[i] = copy;
         pipeline_keys[i].store(reinterpret_cast<uint64_t>(pso), std::memory_order_release);
         if (stats.display_pipelines++ == 0) log("milestone cockpit display shader found (glass cockpit screens can be recognised)");
-        log("display_pipeline pso=%p root=%p targets=%u depth_format=%u vr=%d", pso, desc.pRootSignature, desc.NumRenderTargets, unsigned(desc.DSVFormat), vr);
+        log("display_pipeline pso=%p root=%p targets=%u depth_format=%u vr=%d screen_t0=%d", pso, desc.pRootSignature, desc.NumRenderTargets,
+            unsigned(desc.DSVFormat), vr, screen_t0);
         if (vr) LOG_ONCE("milestone VR cockpit display shader found");
+        if (screen_t0) LOG_ONCE("milestone cockpit display shader variant found (screen texture in t0, e.g. iniBuilds A340)");
         return;
     }
     log("display_pipeline_overflow");
@@ -452,7 +452,7 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     std::mutex maps_mutex;
     std::vector<std::unique_ptr<Map>> maps;
     std::shared_mutex layouts_mutex;
-    std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> display_bindings; // layout -> root index, table offset of t1
+    std::unordered_map<uint64_t, std::array<std::pair<uint32_t, uint32_t>, 2>> display_bindings; // layout -> root index, table offset of t0 and t1
     struct SrvRange { uint32_t param, offset, reg, space, count; };
     std::unordered_map<uint64_t, std::vector<SrvRange>> srv_ranges; // layout -> pixel shader texture ranges (screen probe)
     std::mutex composite_mutex;
@@ -616,6 +616,9 @@ void on_init_layout(api::device* device, uint32_t count, const api::pipeline_lay
         }
         if (!found.empty()) { std::unique_lock lock(state->layouts_mutex); state->srv_ranges[layout.handle] = std::move(found); }
     }
+    // Where t0 and t1 (pixel shader, space 0) sit: the display shader reads its screen from t1, the variant from t0.
+    std::array<std::pair<uint32_t, uint32_t>, 2> bindings{};
+    std::array<bool, 2> found{};
     for (uint32_t i = 0; i < count && i < 64; ++i) {
         const api::descriptor_range* ranges = nullptr; uint32_t range_count = 0;
         if (params[i].type == api::pipeline_layout_param_type::descriptor_table || params[i].type == api::pipeline_layout_param_type::push_descriptors_with_ranges) {
@@ -625,12 +628,17 @@ void on_init_layout(api::device* device, uint32_t count, const api::pipeline_lay
         } else continue;
         for (uint32_t j = 0; j < range_count; ++j) {
             const auto& r = ranges[j];
-            if (r.type != api::descriptor_type::texture_shader_resource_view || r.dx_register_space || r.dx_register_index > 1 ||
-                uint64_t(r.dx_register_index) + r.count <= 1 || (r.visibility & api::shader_stage::pixel) == api::shader_stage{}) continue;
-            std::unique_lock lock(state->layouts_mutex);
-            state->display_bindings[layout.handle] = {i, r.binding + 1 - r.dx_register_index};
-            return;
+            if (r.type != api::descriptor_type::texture_shader_resource_view || r.dx_register_space || (r.visibility & api::shader_stage::pixel) == api::shader_stage{}) continue;
+            for (uint32_t reg = 0; reg < 2; ++reg)
+                if (!found[reg] && r.dx_register_index <= reg && uint64_t(r.dx_register_index) + r.count > reg) {
+                    bindings[reg] = {i, r.binding + reg - r.dx_register_index};
+                    found[reg] = true;
+                }
         }
+    }
+    if (found[1]) { // every cockpit display layout has t1; t0 is checked when used
+        std::unique_lock lock(state->layouts_mutex);
+        state->display_bindings[layout.handle] = found[0] ? bindings : std::array<std::pair<uint32_t, uint32_t>, 2>{{{UINT32_MAX, 0}, bindings[1]}};
     }
 }
 
@@ -767,8 +775,9 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
         std::shared_lock lock(device.layouts_mutex);
         const auto found = device.display_bindings.find(state.layout);
         if (found == device.display_bindings.end() || state.layout != reinterpret_cast<uint64_t>(state.display->root.Get())) { note(stats.unsupported_draw, "root_layout"); return; }
-        binding = found->second;
+        binding = found->second[state.display->screen_t0 ? 0 : 1];
     }
+    if (binding.first >= state.tables.size()) { note(stats.unsupported_draw, "root_layout"); return; }
     const auto table = state.tables[binding.first];
     if (!table) { note(stats.unsupported_draw, "t1_table_unbound"); return; }
     api::descriptor_heap heap{}; uint32_t offset = 0;
@@ -851,7 +860,7 @@ void probe_screen_draw(api::command_list* list, const ListState& state, uint32_t
         std::shared_lock lock(state.device->layouts_mutex);
         const auto found = state.device->display_bindings.find(state.layout);
         if (found == state.device->display_bindings.end()) return;
-        binding = found->second;
+        binding = found->second[1];
     }
     const auto table = state.tables[binding.first];
     if (!table) return;
@@ -1515,6 +1524,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
         display_ps = hash_file(fixture_directory / L"fixture_ps.cso");
         display_vs = hash_file(fixture_directory / L"fixture_vs.cso");
         vr_display_ps = hash_file(fixture_directory / L"fixture_vr_ps.cso");
+        display_ps_t0 = hash_file(fixture_directory / L"fixture_t0_ps.cso");
         vr_display_vs = hash_file(fixture_directory / L"fixture_vr_vs.cso");
     }
     // Keep the previous session's log: after a crash people usually relaunch before sending it.

@@ -27,7 +27,7 @@ Push-Location $build
 try {
     & $compiler /nologo /c /TC /W3 /MD /O2 (Join-Path $minhook 'src\buffer.c') (Join-Path $minhook 'src\hook.c') (Join-Path $minhook 'src\trampoline.c') (Join-Path $minhook 'src\hde\hde64.c')
     if ($LASTEXITCODE) { throw 'MinHook compilation failed' }
-    # Shaders -> one generated header (32 display-slot variants of the map shader + 5 compute passes).
+    # Shaders -> one generated header (32 display-slot variants of the map shader, flat/VR/screen-t0, + 5 compute passes).
     $headers = @()
     foreach ($slot in 0..31) {
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -WX -O3 -Fh "map_ps_$slot.h" -Vn "map_ps_$slot" (Join-Path $root 'src\display_map.hlsl')
@@ -36,6 +36,9 @@ try {
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D VR=1 -WX -O3 -Fh "map_ps_vr_$slot.h" -Vn "map_ps_vr_$slot" (Join-Path $root 'src\display_map.hlsl')
         if ($LASTEXITCODE) { throw "VR map shader $slot failed" }
         $headers += "map_ps_vr_$slot.h"
+        & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D SCREEN_T0=1 -WX -O3 -Fh "map_ps_t0_$slot.h" -Vn "map_ps_t0_$slot" (Join-Path $root 'src\display_map.hlsl')
+        if ($LASTEXITCODE) { throw "Screen-t0 map shader $slot failed" }
+        $headers += "map_ps_t0_$slot.h"
     }
     foreach ($pass in 'zero', 'fit', 'solve', 'composite', 'clear') {
         & $dxc -T cs_6_6 -HV 2021 -E $pass -WX -O3 -Fh "cs_$pass.h" -Vn "cs_$pass" (Join-Path $root 'src\overlay.hlsl')
@@ -65,6 +68,12 @@ try {
         foreach ($eye in 0, 1) {
             & $dxc -T vs_6_6 -HV 2021 -E main -D VR=1 -D REFERENCE=1 -D "REFERENCE_EYE=$eye" -WX -O3 -Fo (Join-Path $testHost "reference_vr_vs_eye$eye.cso") (Join-Path $root 'tests\fixture_vs.hlsl')
             if ($LASTEXITCODE) { throw 'VR reference vertex shader failed' }
+        }
+        # Display shader variant with the screen in t0 (A340), and its reference.
+        foreach ($reference in 0, 1) {
+            $prefix = if ($reference) { 'reference_t0' } else { 'fixture_t0' }
+            & $dxc -T ps_6_6 -HV 2021 -E main -D SCREEN_T0=1 -D "REFERENCE=$reference" -WX -O3 -Fo (Join-Path $testHost "$($prefix)_ps.cso") (Join-Path $root 'tests\fixture_ps.hlsl')
+            if ($LASTEXITCODE) { throw 'Screen-t0 test pixel shader failed' }
         }
         foreach ($reference in 0, 1) {
             $prefix = if ($reference) { 'reference_vr' } else { 'fixture_vr' }

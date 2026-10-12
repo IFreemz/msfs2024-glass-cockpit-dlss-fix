@@ -3,12 +3,18 @@
 // The glass layer is fixed to the screen (does not scroll): sun glare spot, fine dirt and a hard shadow edge.
 // REFERENCE=1 builds the unjittered output-resolution reference (different bytecode, so the add-on ignores it).
 // VR=1 takes the VR vertex shader's interpolants (stand-in for the VR display shader).
+// SCREEN_T0=1: stand-in for the variant with the screen in t0, material in b4 and a texture-free alpha test.
 #include "../src/cockpit_vertex.hlsli"
 
 cbuffer RenderState : register(b1) { float4 render_state; };
+#if SCREEN_T0
+cbuffer Material : register(b4) { float4 material[17]; };
+Texture2D<float4> display_texture : register(t0);
+#else
 cbuffer Material : register(b3) { float4 material[17]; };
 Texture2D<float4> base_texture : register(t0);
 Texture2D<float4> display_texture : register(t1);
+#endif
 SamplerState base_sampler : register(s1);
 
 float3 srgb_to_linear(float3 c) { return select(c <= 0.04045, c / 12.92, pow(c * 0.947867 + 0.0521327, 2.4)); }
@@ -20,7 +26,11 @@ float4 main(CockpitVertexVR input) : SV_Target0
 float4 main(CockpitVertex input) : SV_Target0
 #endif
 {
+#if SCREEN_T0
+    float alpha = material[1].w;
+#else
     float alpha = base_texture.Sample(base_sampler, input.uv.xy).a * material[1].w;
+#endif
     if (alpha <= render_state.x) discard;
     float2 glass_uv = input.uv.xy;
     // Same 4-tap SampleBias(-1) pattern as the game's display shader (offsets in screen-space derivatives).
