@@ -7,3 +7,4 @@ size_t graphics_pipeline_slot() { return offsetof(ID3D12DeviceVtbl, CreateGraphi
 size_t pipeline_stream_slot() { return offsetof(ID3D12Device2Vtbl, CreatePipelineState) / sizeof(void*); }
 size_t copy_descriptors_slot() { return offsetof(ID3D12DeviceVtbl, CopyDescriptors) / sizeof(void*); }
 size_t copy_descriptors_simple_slot() { return offsetof(ID3D12DeviceVtbl, CopyDescriptorsSimple) / sizeof(void*); }
+size_t create_descriptor_heap_slot() { return offsetof(ID3D12DeviceVtbl, CreateDescriptorHeap) / sizeof(void*); }

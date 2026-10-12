@@ -39,6 +39,8 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
+#include <memory>
 #include <set>
 #include <vector>
 #include "pipeline_clone.hpp"
@@ -53,6 +55,7 @@ size_t graphics_pipeline_slot();
 size_t pipeline_stream_slot();
 size_t copy_descriptors_slot();
 size_t copy_descriptors_simple_slot();
+size_t create_descriptor_heap_slot();
 
 namespace {
 // MSFS 2024 cockpit display shader pair (replaced by the stand-in shaders' hashes in the offline test host).
@@ -349,64 +352,113 @@ std::mutex slots_mutex;
 UINT descriptor_size = 0;
 
 // Descriptor tracking (all GPUs but NVIDIA). AMD's descriptors contain their own address, so a copied descriptor's
-// bytes never equal the original's. Instead the views' addresses are followed through the game's descriptor copies:
-// address -> texture, carried from source to destination on every copy and dropped when overwritten.
+// bytes never equal the original's. Instead the views' addresses are followed through the game's descriptor copies.
+// The sim copies descriptors millions of times per second, so this must cost next to nothing per copy: every
+// CBV/SRV/UAV heap gets a mirror array with one texture id per descriptor (0 = not a screen texture candidate), and a
+// copy just copies those ids. No locks on the copy path: heaps are looked up in an immutable snapshot, and the game
+// never writes the same descriptors from two threads at once (D3D12 rule), so neither do the mirrors.
 std::atomic<bool> track_descriptors{false};
 bool force_tracking = false; // offline test: identify textures by tracking only
-std::shared_mutex tracked_mutex;
-std::unordered_map<uintptr_t, Texture> tracked;
-std::unordered_set<uintptr_t> tracked_views; // addresses where the game created the view (the rest are copies)
-std::unordered_map<uintptr_t, uint64_t> tracked_copy_frames; // copy -> present count when it was made
-extern std::atomic<uint64_t> present_count;
-std::atomic<uintptr_t> tracked_low{UINTPTR_MAX}, tracked_high{0};
-size_t tracked_capacity = 65536; // [debug] tracking_capacity: smaller to test the table-full path quickly
+struct MirrorHeap { uintptr_t start = 0, end = 0; std::unique_ptr<std::atomic<uint32_t>[]> ids; };
+struct HeapSnapshot { std::vector<MirrorHeap*> heaps; }; // sorted by start, never changed once published
+std::mutex heaps_mutex;                                   // creating heaps (rare)
+std::vector<std::unique_ptr<MirrorHeap>> heap_storage;   // kept until the device goes: a copy may still be reading one
+std::vector<std::unique_ptr<HeapSnapshot>> snapshot_storage;
+std::atomic<const HeapSnapshot*> heap_snapshot{nullptr};
+// Texture ids: index into a fixed table (resource, format); a destroyed texture's entry is cleared, never reused.
+constexpr uint32_t max_texture_ids = 65536;
+struct TextureId { std::atomic<ID3D12Resource*> resource{nullptr}; std::atomic<DXGI_FORMAT> format{DXGI_FORMAT_UNKNOWN}; };
+std::unique_ptr<TextureId[]> texture_ids;
+std::atomic<uint32_t> texture_id_count{1}; // id 0 = none
+std::mutex texture_ids_mutex;
+std::map<std::pair<ID3D12Resource*, DXGI_FORMAT>, uint32_t> texture_id_of;
 
-void track_insert(uintptr_t address, const Texture& texture, bool view = false) { // tracked_mutex held exclusively
-    if (tracked.size() >= tracked_capacity) {
-        // The sim copies the screen descriptors to new places every frame, so copies pile up faster than they are
-        // overwritten. Forget the older copies and keep the views and the last few frames' copies (still about to be
-        // drawn with); if that is not enough, forget all copies.
-        const auto before = tracked.size();
-        const uint64_t now = present_count.load(std::memory_order_relaxed);
-        auto old_copy = [&](uintptr_t a, uint64_t age) {
-            if (tracked_views.contains(a)) return false;
-            const auto f = tracked_copy_frames.find(a);
-            return f == tracked_copy_frames.end() || f->second + age <= now;
-        };
-        std::erase_if(tracked, [&](const auto& p) { return old_copy(p.first, 8); });
-        if (tracked.size() >= tracked_capacity) std::erase_if(tracked, [&](const auto& p) { return old_copy(p.first, 0); });
-        std::erase_if(tracked_copy_frames, [](const auto& p) { return !tracked.contains(p.first); });
-        static std::atomic<int> logged{0};
-        if (logged++ < 3) log("descriptor tracking: table full, %llu older copies cleared (%llu views and recent copies kept)",
-            uint64_t(before - tracked.size()), uint64_t(tracked.size()));
-        if (tracked.size() >= tracked_capacity) return;
+MirrorHeap* mirror_of(uintptr_t address, size_t span = 1) {
+    const auto snapshot = heap_snapshot.load(std::memory_order_acquire);
+    if (!snapshot) return nullptr;
+    thread_local const HeapSnapshot* cached_snapshot = nullptr;
+    thread_local MirrorHeap* cached = nullptr;
+    if (cached_snapshot == snapshot && cached && address >= cached->start && address + span <= cached->end) return cached;
+    const auto& heaps = snapshot->heaps;
+    auto it = std::upper_bound(heaps.begin(), heaps.end(), address, [](uintptr_t a, const MirrorHeap* h) { return a < h->start; });
+    if (it == heaps.begin()) return nullptr;
+    MirrorHeap* heap = *--it;
+    if (address + span > heap->end) return nullptr;
+    cached_snapshot = snapshot; cached = heap;
+    return heap;
+}
+void register_heap(uintptr_t start, UINT count) {
+    if (!count || !descriptor_size) return;
+    auto heap = std::make_unique<MirrorHeap>();
+    heap->start = start; heap->end = start + SIZE_T(count) * descriptor_size;
+    heap->ids = std::make_unique<std::atomic<uint32_t>[]>(count); // value-initialised: all 0
+    std::lock_guard lock(heaps_mutex);
+    auto snapshot = std::make_unique<HeapSnapshot>();
+    if (const auto current = heap_snapshot.load()) // a heap at the same addresses replaces released ones there
+        for (auto h : current->heaps) if (h->end <= heap->start || h->start >= heap->end) snapshot->heaps.push_back(h);
+    snapshot->heaps.push_back(heap.get());
+    std::sort(snapshot->heaps.begin(), snapshot->heaps.end(), [](const MirrorHeap* a, const MirrorHeap* b) { return a->start < b->start; });
+    heap_storage.push_back(std::move(heap));
+    heap_snapshot.store(snapshot.get(), std::memory_order_release);
+    snapshot_storage.push_back(std::move(snapshot));
+    const size_t heaps = heap_storage.size();
+    if ((heaps & (heaps - 1)) == 0) log("descriptor tracking: %llu heaps mirrored (latest %u descriptors)", uint64_t(heaps), count);
+}
+uint32_t texture_id(ID3D12Resource* resource, DXGI_FORMAT format) {
+    std::lock_guard lock(texture_ids_mutex);
+    if (const auto found = texture_id_of.find({resource, format}); found != texture_id_of.end()) return found->second;
+    const uint32_t id = texture_id_count.load();
+    if (id >= max_texture_ids) {
+        LOG_ONCE("descriptor tracking: texture table full, new screen textures are not tracked");
+        return 0;
     }
-    tracked[address] = texture;
-    if (view) tracked_views.insert(address);
-    else tracked_copy_frames[address] = present_count.load(std::memory_order_relaxed);
-    for (auto low = tracked_low.load(); address < low && !tracked_low.compare_exchange_weak(low, address);) {}
-    for (auto high = tracked_high.load(); address > high && !tracked_high.compare_exchange_weak(high, address);) {}
+    texture_ids[id].format = format;
+    texture_ids[id].resource = resource;
+    texture_id_count = id + 1;
+    texture_id_of[{resource, format}] = id;
+    return id;
+}
+void forget_texture_ids(ID3D12Resource* resource) {
+    std::lock_guard lock(texture_ids_mutex);
+    for (auto it = texture_id_of.lower_bound({resource, DXGI_FORMAT_UNKNOWN}); it != texture_id_of.end() && it->first.first == resource;) {
+        texture_ids[it->second].resource = nullptr;
+        it = texture_id_of.erase(it);
+    }
+}
+void set_tracked(uintptr_t address, uint32_t id) {
+    if (auto heap = mirror_of(address)) heap->ids[(address - heap->start) / descriptor_size].store(id, std::memory_order_relaxed);
+}
+bool tracked_texture(uintptr_t address, ID3D12Resource*& resource, DXGI_FORMAT& format) {
+    const auto heap = mirror_of(address);
+    if (!heap) return false;
+    const uint32_t id = heap->ids[(address - heap->start) / descriptor_size].load(std::memory_order_relaxed);
+    if (!id || id >= texture_id_count.load(std::memory_order_acquire)) return false;
+    format = texture_ids[id].format.load(std::memory_order_relaxed);
+    resource = texture_ids[id].resource.load(std::memory_order_relaxed);
+    return resource != nullptr;
 }
 void track_copy(uintptr_t dest, uintptr_t source, UINT count) {
-    const SIZE_T step = descriptor_size, span = SIZE_T(count) * step;
-    const auto low = tracked_low.load(std::memory_order_relaxed), high = tracked_high.load(std::memory_order_relaxed);
-    const bool source_near = source <= high && source + span > low, dest_near = dest <= high && dest + span > low;
-    if (!source_near && !dest_near) return;
-    std::vector<std::pair<uintptr_t, Texture>> carried;
-    std::vector<uintptr_t> dropped;
-    {
-        std::shared_lock lock(tracked_mutex);
-        if (tracked.empty()) return;
-        for (UINT i = 0; i < count; ++i) {
-            const auto from = source + i * step, to = dest + i * step;
-            if (source_near) if (const auto found = tracked.find(from); found != tracked.end()) { carried.emplace_back(to, found->second); continue; }
-            if (dest_near && tracked.contains(to)) dropped.push_back(to);
-        }
+    const SIZE_T span = SIZE_T(count) * descriptor_size;
+    const auto to = mirror_of(dest, span);
+    if (!to) return;
+    auto* out = &to->ids[(dest - to->start) / descriptor_size];
+    const auto from = mirror_of(source, span);
+    if (!from) { for (UINT i = 0; i < count; ++i) out[i].store(0, std::memory_order_relaxed); return; } // unknown source: no screen
+    const auto* in = &from->ids[(source - from->start) / descriptor_size];
+    if (out == in) return;
+    if (out < in || out >= in + count) for (UINT i = 0; i < count; ++i) out[i].store(in[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    else for (UINT i = count; i-- > 0;) out[i].store(in[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+using CreateHeap = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*, REFIID, void**);
+CreateHeap original_create_heap = nullptr;
+HRESULT STDMETHODCALLTYPE create_heap_hook(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** heap) {
+    const HRESULT hr = original_create_heap(device, desc, riid, heap);
+    if (SUCCEEDED(hr) && heap && *heap && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device == main_device) {
+        ComPtr<ID3D12DescriptorHeap> created;
+        if (SUCCEEDED(static_cast<IUnknown*>(*heap)->QueryInterface(IID_PPV_ARGS(&created))))
+            register_heap(created->GetCPUDescriptorHandleForHeapStart().ptr, desc->NumDescriptors);
     }
-    if (carried.empty() && dropped.empty()) return;
-    std::unique_lock lock(tracked_mutex);
-    for (const auto address : dropped) tracked.erase(address);
-    for (const auto& [address, texture] : carried) track_insert(address, texture);
+    return hr;
 }
 using CopySimple = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
 using Copy = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*,
@@ -601,7 +653,9 @@ void on_init_device(api::device* device) {
         hooked &= hook((*reinterpret_cast<void***>(device2.Get()))[pipeline_stream_slot()], reinterpret_cast<void*>(&stream_hook), original_stream);
     track_descriptors = !gpu_nvidia || force_tracking;
     if (track_descriptors) {
-        const bool tracking = hook(table[copy_descriptors_slot()], reinterpret_cast<void*>(&copy_hook), original_copy) &&
+        if (!texture_ids) texture_ids = std::make_unique<TextureId[]>(max_texture_ids);
+        const bool tracking = hook(table[create_descriptor_heap_slot()], reinterpret_cast<void*>(&create_heap_hook), original_create_heap) &&
+            hook(table[copy_descriptors_slot()], reinterpret_cast<void*>(&copy_hook), original_copy) &&
             hook(table[copy_descriptors_simple_slot()], reinterpret_cast<void*>(&copy_simple_hook), original_copy_simple);
         log("descriptor tracking hooks=%d (screen textures are followed through descriptor copies)", tracking);
     }
@@ -681,14 +735,7 @@ void on_init_layout(api::device* device, uint32_t count, const api::pipeline_lay
 }
 
 void on_init_view(api::device* device, api::resource resource, api::resource_usage usage, const api::resource_view_desc& desc, api::resource_view view) {
-    if (track_descriptors.load(std::memory_order_relaxed) && view.handle) { // a new view replaces whatever was tracked there
-        const auto address = uintptr_t(view.handle);
-        if (address >= tracked_low.load(std::memory_order_relaxed) && address <= tracked_high.load(std::memory_order_relaxed)) {
-            bool present;
-            { std::shared_lock lock(tracked_mutex); present = tracked.contains(address); }
-            if (present) { std::unique_lock lock(tracked_mutex); tracked.erase(address); tracked_views.erase(address); }
-        }
-    }
+    if (track_descriptors.load(std::memory_order_relaxed) && view.handle) set_tracked(uintptr_t(view.handle), 0); // a new view replaces what was there
     // A default view (null D3D12 view desc) arrives with type/format "unknown".
     if (usage != api::resource_usage::shader_resource || !resource.handle ||
         (desc.type != api::resource_view_type::unknown && desc.type != api::resource_view_type::texture_2d &&
@@ -727,10 +774,7 @@ void on_init_view(api::device* device, api::resource resource, api::resource_usa
         srv.Texture2D.MostDetailedMip = first;
         srv.Texture2D.MipLevels = count == UINT32_MAX ? UINT(-1) : count;
     }
-    if (track_descriptors.load(std::memory_order_relaxed) && view.handle) {
-        std::unique_lock lock(tracked_mutex);
-        track_insert(uintptr_t(view.handle), {native, format}, true);
-    }
+    if (track_descriptors.load(std::memory_order_relaxed) && view.handle) set_tracked(uintptr_t(view.handle), texture_id(native, format));
     const auto slot = state->scratch->GetCPUDescriptorHandleForHeapStart();
     std::unique_lock lock(textures_mutex);
     state->native->CreateShaderResourceView(native, default_view ? nullptr : &srv, slot);
@@ -749,11 +793,7 @@ void on_destroy_resource(api::device*, api::resource resource) {
     std::unique_lock lock(textures_mutex);
     known_textures.erase(native);
     std::erase_if(signatures, [&](const auto& p) { return p.second.resource == native; });
-    if (track_descriptors.load(std::memory_order_relaxed)) {
-        std::unique_lock tracked_lock(tracked_mutex);
-        std::erase_if(tracked, [&](const auto& p) { return p.second.resource == native; });
-        std::erase_if(tracked_views, [](uintptr_t address) { return !tracked.contains(address); });
-    }
+    if (track_descriptors.load(std::memory_order_relaxed)) forget_texture_ids(native);
     for (auto& slot : slot_resources) { auto expected = native; slot.compare_exchange_strong(expected, nullptr); }
 }
 
@@ -835,8 +875,7 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
     }
     if (!recognised && track_descriptors.load(std::memory_order_relaxed)) {
         const auto address = uintptr_t(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size);
-        std::shared_lock lock(tracked_mutex);
-        if (const auto found = tracked.find(address); found != tracked.end()) { texture = found->second; recognised = true; }
+        recognised = tracked_texture(address, texture.resource, texture.format);
         if (recognised) LOG_ONCE("milestone screen texture found through descriptor tracking");
     }
     if (!recognised) {
@@ -846,7 +885,7 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
         { std::lock_guard lock(logged_mutex); first = logged.size() < 24 && logged.insert(s).second; }
         if (first) {
             size_t tracked_count;
-            { std::shared_lock lock(tracked_mutex); tracked_count = tracked.size(); }
+            tracked_count = texture_id_count.load() - 1;
             ViewInfo info{};
             bool described = false;
             { std::lock_guard lock(diag_mutex); if (const auto d = diag_views.find(s); d != diag_views.end()) { info = d->second; described = true; } }
@@ -973,8 +1012,8 @@ void screen_probe(api::command_list* list, const ListState& state, uint32_t coun
                 if (const auto found = signatures.find(sig); found != signatures.end()) resource = found->second.resource;
             }
             if (!resource && track_descriptors.load(std::memory_order_relaxed)) {
-                std::shared_lock lock(tracked_mutex);
-                if (const auto found = tracked.find(address); found != tracked.end()) resource = found->second.resource;
+                DXGI_FORMAT format;
+                if (!tracked_texture(address, resource, format)) resource = nullptr;
             }
             if (!resource) continue;
             const auto desc = resource->GetDesc();
@@ -1531,10 +1570,6 @@ void load_settings() {
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
         log("setting descriptor_tracking=1 (screens identified by descriptor tracking only, as on AMD/Intel)");
-    }
-    if (const UINT capacity = GetPrivateProfileIntW(L"debug", L"tracking_capacity", 0, settings_path().c_str())) {
-        tracked_capacity = std::clamp<size_t>(capacity, 1024, 65536);
-        log("setting tracking_capacity=%llu (debug)", uint64_t(tracked_capacity));
     }
 }
 void save_settings() {

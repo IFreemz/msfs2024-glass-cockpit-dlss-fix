@@ -26,6 +26,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -241,10 +242,10 @@ int main(int argc, char** argv) {
     try {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
-        bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false;
+        bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
-            reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch");
+            reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
         }
         if (hotpatch) redirect_evaluate_like_mfg_unlock();
         if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
@@ -450,6 +451,40 @@ int main(int argc, char** argv) {
         auto gpu_slot = gpu0; gpu_slot.ptr += 4 * inc; // table at slot 4
         device->CopyDescriptorsSimple(2, gpu_slot, cpu0, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto table = gpu_heap->GetGPUDescriptorHandleForHeapStart(); table.ptr += 4 * inc;
+        if (bench) {
+            // The sim makes millions of descriptor copies per second from several threads; with descriptor tracking
+            // (--track) each goes through the add-on. Time them: 4 threads, 1M single-descriptor copies each, from a
+            // CPU heap with screen views into a big shader-visible heap.
+            constexpr UINT threads = 4, calls = 1000000, sources = 4096, targets = 262144;
+            ComPtr<ID3D12DescriptorHeap> bench_cpu, bench_gpu;
+            D3D12_DESCRIPTOR_HEAP_DESC bd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, sources, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            check(device->CreateDescriptorHeap(&bd, IID_PPV_ARGS(&bench_cpu)));
+            bd.NumDescriptors = targets; bd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            check(device->CreateDescriptorHeap(&bd, IID_PPV_ARGS(&bench_gpu)));
+            const auto src0 = bench_cpu->GetCPUDescriptorHandleForHeapStart(), dst0 = bench_gpu->GetCPUDescriptorHandleForHeapStart();
+            for (UINT i = 0; i < sources; ++i) {
+                auto at = src0; at.ptr += SIZE_T(i) * inc;
+                device->CreateShaderResourceView(i % 64 == 0 ? display.Get() : sampled.Get(), nullptr, at); // some screen views
+            }
+            LARGE_INTEGER frequency, begin, end;
+            QueryPerformanceFrequency(&frequency);
+            QueryPerformanceCounter(&begin);
+            std::vector<std::thread> workers;
+            for (UINT t = 0; t < threads; ++t)
+                workers.emplace_back([&, t] {
+                    for (UINT i = 0; i < calls; ++i) {
+                        auto from = src0; from.ptr += SIZE_T((i * 7 + t) % sources) * inc;
+                        auto to = dst0; to.ptr += SIZE_T((t * (targets / threads)) + i % (targets / threads)) * inc;
+                        device->CopyDescriptorsSimple(1, to, from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    }
+                });
+            for (auto& w : workers) w.join();
+            QueryPerformanceCounter(&end);
+            const double seconds = double(end.QuadPart - begin.QuadPart) / frequency.QuadPart;
+            std::printf("bench: %u threads x %u descriptor copies: %.1f ms, %.1f ns per copy (wall clock / all copies)\n", threads, calls,
+                seconds * 1000, seconds * 1e9 / (double(threads) * calls));
+            return 0;
+        }
 
         // Targets.
         D3D12_CLEAR_VALUE black{DXGI_FORMAT_R11G11B10_FLOAT, {}};
