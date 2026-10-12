@@ -354,11 +354,22 @@ std::atomic<bool> track_descriptors{false};
 bool force_tracking = false; // offline test: identify textures by tracking only
 std::shared_mutex tracked_mutex;
 std::unordered_map<uintptr_t, Texture> tracked;
+std::unordered_set<uintptr_t> tracked_views; // addresses where the game created the view (the rest are copies)
 std::atomic<uintptr_t> tracked_low{UINTPTR_MAX}, tracked_high{0};
 
-void track_insert(uintptr_t address, const Texture& texture) { // tracked_mutex held exclusively
-    if (tracked.size() >= 65536) return;
+void track_insert(uintptr_t address, const Texture& texture, bool view = false) { // tracked_mutex held exclusively
+    if (tracked.size() >= 65536) {
+        // The sim copies the screen descriptors to new places every frame, so copies pile up faster than they are
+        // overwritten. Forget the copies (the next frame's copies are tracked again) and keep the views.
+        const auto before = tracked.size();
+        std::erase_if(tracked, [](const auto& p) { return !tracked_views.contains(p.first); });
+        static std::atomic<int> logged{0};
+        if (logged++ < 3) log("descriptor tracking: table full, %llu copied entries cleared (%llu views kept)", uint64_t(before - tracked.size()),
+            uint64_t(tracked.size()));
+        if (tracked.size() >= 65536) return;
+    }
     tracked[address] = texture;
+    if (view) tracked_views.insert(address);
     for (auto low = tracked_low.load(); address < low && !tracked_low.compare_exchange_weak(low, address);) {}
     for (auto high = tracked_high.load(); address > high && !tracked_high.compare_exchange_weak(high, address);) {}
 }
@@ -659,7 +670,7 @@ void on_init_view(api::device* device, api::resource resource, api::resource_usa
         if (address >= tracked_low.load(std::memory_order_relaxed) && address <= tracked_high.load(std::memory_order_relaxed)) {
             bool present;
             { std::shared_lock lock(tracked_mutex); present = tracked.contains(address); }
-            if (present) { std::unique_lock lock(tracked_mutex); tracked.erase(address); }
+            if (present) { std::unique_lock lock(tracked_mutex); tracked.erase(address); tracked_views.erase(address); }
         }
     }
     // A default view (null D3D12 view desc) arrives with type/format "unknown".
@@ -702,7 +713,7 @@ void on_init_view(api::device* device, api::resource resource, api::resource_usa
     }
     if (track_descriptors.load(std::memory_order_relaxed) && view.handle) {
         std::unique_lock lock(tracked_mutex);
-        track_insert(uintptr_t(view.handle), {native, format});
+        track_insert(uintptr_t(view.handle), {native, format}, true);
     }
     const auto slot = state->scratch->GetCPUDescriptorHandleForHeapStart();
     std::unique_lock lock(textures_mutex);
@@ -725,6 +736,7 @@ void on_destroy_resource(api::device*, api::resource resource) {
     if (track_descriptors.load(std::memory_order_relaxed)) {
         std::unique_lock tracked_lock(tracked_mutex);
         std::erase_if(tracked, [&](const auto& p) { return p.second.resource == native; });
+        std::erase_if(tracked_views, [](uintptr_t address) { return !tracked.contains(address); });
     }
     for (auto& slot : slot_resources) { auto expected = native; slot.compare_exchange_strong(expected, nullptr); }
 }
