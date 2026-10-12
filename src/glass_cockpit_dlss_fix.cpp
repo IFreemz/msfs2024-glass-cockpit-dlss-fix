@@ -58,7 +58,7 @@ namespace {
 // MSFS 2024 cockpit display shader pair (replaced by the stand-in shaders' hashes in the offline test host).
 uint64_t display_vs = 0xf102f1e3f5d9f66fULL, display_ps = 0x37e87c938bc76310ULL;
 // Display shader variant with the screen texture in t0 and the material constants in b4 (iniBuilds A340 main screens).
-uint64_t display_ps_t0 = 0xd3646ba0fd9007e9ULL;
+uint64_t display_ps_t0 = 0xd3646ba0fd9007e9ULL, vr_display_ps_t0 = 0xf24aebba0272f765ULL; // flat and VR
 // The same display drawn in VR: instanced stereo, one instance per view into a layered render target.
 uint64_t vr_display_vs = 0x715948137700a5d6ULL, vr_display_ps = 0x9ba9df5bca0ad4b9ULL;
 
@@ -204,8 +204,19 @@ const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shader
     SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
 #undef SLOT
 }};
+const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shaders_vr_t0{{
+#define SLOT(n) {map_ps_vr_t0_##n, sizeof(map_ps_vr_t0_##n)},
+    SLOT(0) SLOT(1) SLOT(2) SLOT(3) SLOT(4) SLOT(5) SLOT(6) SLOT(7)
+    SLOT(8) SLOT(9) SLOT(10) SLOT(11) SLOT(12) SLOT(13) SLOT(14) SLOT(15)
+    SLOT(16) SLOT(17) SLOT(18) SLOT(19) SLOT(20) SLOT(21) SLOT(22) SLOT(23)
+    SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
+#undef SLOT
+}};
+const std::pair<const unsigned char*, size_t>& map_shader(bool vr, bool screen_t0, unsigned slot) {
+    return vr ? (screen_t0 ? map_shaders_vr_t0[slot] : map_shaders_vr[slot]) : screen_t0 ? map_shaders_t0[slot] : map_shaders[slot];
+}
 const std::pair<const unsigned char*, size_t>& map_shader(const DisplayPipeline& pipeline, unsigned slot) {
-    return pipeline.vr ? map_shaders_vr[slot] : pipeline.screen_t0 ? map_shaders_t0[slot] : map_shaders[slot];
+    return map_shader(pipeline.vr, pipeline.screen_t0, slot);
 }
 
 // Variant PSOs are compiled on a worker thread; draws are skipped (not stalled) until theirs is ready.
@@ -243,11 +254,11 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     if (!desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode) return;
     const auto ps = shader_hash(desc.PS.pShaderBytecode, desc.PS.BytecodeLength), vs = shader_hash(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
     if (views.ViewInstanceCount > 1) return; // view-instanced pipelines: not how MSFS draws its displays
-    const bool vr = ps == vr_display_ps && vs == vr_display_vs;
-    const bool screen_t0 = ps == display_ps_t0 && vs == display_vs;
+    const bool vr = vs == vr_display_vs && (ps == vr_display_ps || ps == vr_display_ps_t0);
+    const bool screen_t0 = (ps == display_ps_t0 && vs == display_vs) || (ps == vr_display_ps_t0 && vs == vr_display_vs);
     if (!vr && !screen_t0 && (ps != display_ps || vs != display_vs)) return;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC probe{};
-    const auto& shader = vr ? map_shaders_vr[0] : screen_t0 ? map_shaders_t0[0] : map_shaders[0];
+    const auto& shader = map_shader(vr, screen_t0, 0);
     if (!glass::clone_pipeline(desc, {shader.first, shader.second}, probe)) {
         log("pipeline_unsupported pso=%p", pso); return;
     }
@@ -1525,6 +1536,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
         display_vs = hash_file(fixture_directory / L"fixture_vs.cso");
         vr_display_ps = hash_file(fixture_directory / L"fixture_vr_ps.cso");
         display_ps_t0 = hash_file(fixture_directory / L"fixture_t0_ps.cso");
+        vr_display_ps_t0 = hash_file(fixture_directory / L"fixture_vr_t0_ps.cso");
         vr_display_vs = hash_file(fixture_directory / L"fixture_vr_vs.cso");
     }
     // Keep the previous session's log: after a crash people usually relaunch before sending it.

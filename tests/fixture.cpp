@@ -208,7 +208,6 @@ int main(int argc, char** argv) {
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
         bool fsr = false, vr = false, screen_t0 = false;
         for (int i = 1; i < argc; ++i) { fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0"); }
-        require(!(vr && screen_t0), "--screen-t0 is a flat-screen test");
         if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
         const UINT views = vr ? 2 : 1;
         if (vr) std::printf("display: VR (instanced stereo, %u eyes)\n", views);
@@ -222,8 +221,8 @@ int main(int argc, char** argv) {
         }
         if (!LoadLibraryW((here / L"ReShade64.asi").c_str())) { std::printf("LoadLibrary(ReShade64.asi) failed, error %lu\n", GetLastError()); return 2; }
         const auto vs = load(here / (vr ? "fixture_vr_vs.cso" : "fixture_vs.cso"));
-        const auto ps = load(here / (vr ? "fixture_vr_ps.cso" : screen_t0 ? "fixture_t0_ps.cso" : "fixture_ps.cso")),
-            reference_ps = load(here / (vr ? "reference_vr_ps.cso" : screen_t0 ? "reference_t0_ps.cso" : "reference_ps.cso"));
+        const std::string kind = std::string(vr ? "_vr" : "") + (screen_t0 ? "_t0" : "");
+        const auto ps = load(here / ("fixture" + kind + "_ps.cso")), reference_ps = load(here / ("reference" + kind + "_ps.cso"));
         const auto reference_vs = vr ? load(here / "reference_vr_vs_eye0.cso") : vs, reference_vs_eye1 = vr ? load(here / "reference_vr_vs_eye1.cso") : vs;
 
         ComPtr<IDXGIFactory6> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));

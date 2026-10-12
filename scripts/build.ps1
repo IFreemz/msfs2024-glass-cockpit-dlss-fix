@@ -39,6 +39,9 @@ try {
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D SCREEN_T0=1 -WX -O3 -Fh "map_ps_t0_$slot.h" -Vn "map_ps_t0_$slot" (Join-Path $root 'src\display_map.hlsl')
         if ($LASTEXITCODE) { throw "Screen-t0 map shader $slot failed" }
         $headers += "map_ps_t0_$slot.h"
+        & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D VR=1 -D SCREEN_T0=1 -WX -O3 -Fh "map_ps_vr_t0_$slot.h" -Vn "map_ps_vr_t0_$slot" (Join-Path $root 'src\display_map.hlsl')
+        if ($LASTEXITCODE) { throw "VR screen-t0 map shader $slot failed" }
+        $headers += "map_ps_vr_t0_$slot.h"
     }
     foreach ($pass in 'zero', 'fit', 'solve', 'composite', 'clear') {
         & $dxc -T cs_6_6 -HV 2021 -E $pass -WX -O3 -Fh "cs_$pass.h" -Vn "cs_$pass" (Join-Path $root 'src\overlay.hlsl')
@@ -74,6 +77,9 @@ try {
             $prefix = if ($reference) { 'reference_t0' } else { 'fixture_t0' }
             & $dxc -T ps_6_6 -HV 2021 -E main -D SCREEN_T0=1 -D "REFERENCE=$reference" -WX -O3 -Fo (Join-Path $testHost "$($prefix)_ps.cso") (Join-Path $root 'tests\fixture_ps.hlsl')
             if ($LASTEXITCODE) { throw 'Screen-t0 test pixel shader failed' }
+            $prefix = if ($reference) { 'reference_vr_t0' } else { 'fixture_vr_t0' }
+            & $dxc -T ps_6_6 -HV 2021 -E main -D VR=1 -D SCREEN_T0=1 -D "REFERENCE=$reference" -WX -O3 -Fo (Join-Path $testHost "$($prefix)_ps.cso") (Join-Path $root 'tests\fixture_ps.hlsl')
+            if ($LASTEXITCODE) { throw 'VR screen-t0 test pixel shader failed' }
         }
         foreach ($reference in 0, 1) {
             $prefix = if ($reference) { 'reference_vr' } else { 'fixture_vr' }
