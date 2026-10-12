@@ -33,6 +33,9 @@ try {
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -WX -O3 -Fh "map_ps_$slot.h" -Vn "map_ps_$slot" (Join-Path $root 'src\display_map.hlsl')
         if ($LASTEXITCODE) { throw "Map shader $slot failed" }
         $headers += "map_ps_$slot.h"
+        & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D VR=1 -WX -O3 -Fh "map_ps_vr_$slot.h" -Vn "map_ps_vr_$slot" (Join-Path $root 'src\display_map.hlsl')
+        if ($LASTEXITCODE) { throw "VR map shader $slot failed" }
+        $headers += "map_ps_vr_$slot.h"
     }
     foreach ($pass in 'zero', 'fit', 'solve', 'composite', 'clear') {
         & $dxc -T cs_6_6 -HV 2021 -E $pass -WX -O3 -Fh "cs_$pass.h" -Vn "cs_$pass" (Join-Path $root 'src\overlay.hlsl')
@@ -56,6 +59,18 @@ try {
         if ($LASTEXITCODE) { throw 'Test pixel shader failed' }
         & $dxc -T ps_6_6 -HV 2021 -E main -D REFERENCE=1 -WX -O3 -Fo (Join-Path $testHost 'reference_ps.cso') (Join-Path $root 'tests\fixture_ps.hlsl')
         if ($LASTEXITCODE) { throw 'Reference shader failed' }
+        # VR stand-ins (instanced stereo into layered targets) and the per-eye references.
+        & $dxc -T vs_6_6 -HV 2021 -E main -D VR=1 -D REFERENCE=0 -WX -O3 -Fo (Join-Path $testHost 'fixture_vr_vs.cso') (Join-Path $root 'tests\fixture_vs.hlsl')
+        if ($LASTEXITCODE) { throw 'VR test vertex shader failed' }
+        foreach ($eye in 0, 1) {
+            & $dxc -T vs_6_6 -HV 2021 -E main -D VR=1 -D REFERENCE=1 -D "REFERENCE_EYE=$eye" -WX -O3 -Fo (Join-Path $testHost "reference_vr_vs_eye$eye.cso") (Join-Path $root 'tests\fixture_vs.hlsl')
+            if ($LASTEXITCODE) { throw 'VR reference vertex shader failed' }
+        }
+        foreach ($reference in 0, 1) {
+            $prefix = if ($reference) { 'reference_vr' } else { 'fixture_vr' }
+            & $dxc -T ps_6_6 -HV 2021 -E main -D VR=1 -D "REFERENCE=$reference" -WX -O3 -Fo (Join-Path $testHost "$($prefix)_ps.cso") (Join-Path $root 'tests\fixture_ps.hlsl')
+            if ($LASTEXITCODE) { throw 'VR test pixel shader failed' }
+        }
         & $compiler /nologo /W4 /WX /MD /O2 /LD (Join-Path $root 'tests\fake_nvngx.cpp') /link /OPT:NOICF /DEF:"$root\tests\fake_nvngx.def" /OUT:"$testHost\_nvngx.dll"
         if ($LASTEXITCODE) { throw 'Fake NGX compilation failed' }
         & $compiler /nologo /W4 /WX /MD /O2 /LD (Join-Path $root 'tests\fake_ffx.cpp') /link /OUT:"$testHost\amd_fidelityfx_dx12.dll"

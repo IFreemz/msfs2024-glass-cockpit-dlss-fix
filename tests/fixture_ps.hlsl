@@ -2,6 +2,7 @@
 //   scene colour = gain * linear(display at uv + scroll) + offset + glass layer
 // The glass layer is fixed to the screen (does not scroll): sun glare spot, fine dirt and a hard shadow edge.
 // REFERENCE=1 builds the unjittered output-resolution reference (different bytecode, so the add-on ignores it).
+// VR=1 takes the VR vertex shader's interpolants (stand-in for the VR display shader).
 #include "../src/cockpit_vertex.hlsli"
 
 cbuffer RenderState : register(b1) { float4 render_state; };
@@ -13,7 +14,11 @@ SamplerState base_sampler : register(s1);
 float3 srgb_to_linear(float3 c) { return select(c <= 0.04045, c / 12.92, pow(c * 0.947867 + 0.0521327, 2.4)); }
 
 // material[2] = gain, [3] = offset, [4] = glare (centre uv, radius, intensity), [5] = scroll uv, dirt amount, shadow edge u
+#if VR
+float4 main(CockpitVertexVR input) : SV_Target0
+#else
 float4 main(CockpitVertex input) : SV_Target0
+#endif
 {
     float alpha = base_texture.Sample(base_sampler, input.uv.xy).a * material[1].w;
     if (alpha <= render_state.x) discard;

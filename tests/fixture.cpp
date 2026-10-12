@@ -3,7 +3,11 @@
 // jitter; scene colour = gain * linear(texture) + offset. A fake _nvngx.dll "evaluate" leaves the 1920x1080 output
 // magenta, so after the hook every display pixel must come from the overlay. The result is compared with an
 // unjittered 1920x1080 reference render of the same quad. With --fsr the frames go through a fake
-// amd_fidelityfx_dx12.dll ffxDispatch instead, with the colour input left in a pixel-shader-only state.
+// amd_fidelityfx_dx12.dll ffxDispatch instead, with the colour input left in a pixel-shader-only state. With --vr
+// the display is drawn like the sim's VR mode: one instanced draw, one eye per instance into 2-layer targets, then
+// one upscaler call per eye (each eye's layer copied to the colour input) checked against that eye's reference. Like
+// the sim with foveated rendering, the eyes are upscaled out of layer order (eye 1 first) and each result is then
+// copied into its layer of a final layered image, from which the add-on learns the order.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -145,9 +149,9 @@ static void upload(ID3D12Resource* destination, const void* source, size_t bytes
     check(destination->Map(0, &none, &data)); std::memcpy(data, source, bytes); destination->Unmap(0, nullptr);
 }
 static ComPtr<ID3D12Resource> texture(ID3D12Device* device, UINT w, UINT h, UINT16 mips, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
-    D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear = nullptr) {
+    D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear = nullptr, UINT16 layers = 1) {
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, mips, format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, flags};
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, layers, mips, format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, flags};
     ComPtr<ID3D12Resource> r;
     check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, clear, IID_PPV_ARGS(&r)));
     return r;
@@ -202,7 +206,10 @@ int main(int argc, char** argv) {
     try {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
-        const bool fsr = argc > 1 && !std::strcmp(argv[1], "--fsr");
+        bool fsr = false, vr = false;
+        for (int i = 1; i < argc; ++i) { fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); }
+        const UINT views = vr ? 2 : 1;
+        if (vr) std::printf("display: VR (instanced stereo, %u eyes)\n", views);
         FfxDispatch ffx_dispatch = nullptr;
         if (fsr) {
             const auto ffx = LoadLibraryW((here / L"amd_fidelityfx_dx12.dll").c_str());
@@ -212,8 +219,9 @@ int main(int argc, char** argv) {
             std::printf("upscaler: FSR (fake ffxDispatch)\n");
         }
         if (!LoadLibraryW((here / L"ReShade64.asi").c_str())) { std::printf("LoadLibrary(ReShade64.asi) failed, error %lu\n", GetLastError()); return 2; }
-        const auto vs = load(here / "fixture_vs.cso");
-        const auto ps = load(here / "fixture_ps.cso"), reference_ps = load(here / "reference_ps.cso");
+        const auto vs = load(here / (vr ? "fixture_vr_vs.cso" : "fixture_vs.cso"));
+        const auto ps = load(here / (vr ? "fixture_vr_ps.cso" : "fixture_ps.cso")), reference_ps = load(here / (vr ? "reference_vr_ps.cso" : "reference_ps.cso"));
+        const auto reference_vs = vr ? load(here / "reference_vr_vs_eye0.cso") : vs, reference_vs_eye1 = vr ? load(here / "reference_vr_vs_eye1.cso") : vs;
 
         ComPtr<IDXGIFactory6> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
         ComPtr<IDXGIAdapter1> adapter; check(factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)));
@@ -282,8 +290,10 @@ int main(int argc, char** argv) {
         pd.DepthStencilState.DepthEnable = TRUE; pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
         ComPtr<ID3D12PipelineState> game_pso; check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&game_pso)));
-        auto rd = pd; rd.PS = {reference_ps.data(), reference_ps.size()}; rd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        auto rd = pd; rd.VS = {reference_vs.data(), reference_vs.size()}; rd.PS = {reference_ps.data(), reference_ps.size()}; rd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         ComPtr<ID3D12PipelineState> reference_pso; check(device->CreateGraphicsPipelineState(&rd, IID_PPV_ARGS(&reference_pso)));
+        rd.VS = {reference_vs_eye1.data(), reference_vs_eye1.size()};
+        ComPtr<ID3D12PipelineState> reference_pso_eye1; check(device->CreateGraphicsPipelineState(&rd, IID_PPV_ARGS(&reference_pso_eye1)));
 
         // Mesh, constants.
         std::array<Vertex, 7> vertices{};
@@ -396,9 +406,12 @@ int main(int argc, char** argv) {
 
         // Targets.
         D3D12_CLEAR_VALUE black{DXGI_FORMAT_R11G11B10_FLOAT, {}};
-        auto scene = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, &black);
+        auto scene = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, &black, UINT16(views));
+        // VR: each eye's layer is copied here before its upscaler call (the sim's per-view colour input).
+        auto eye_colour = vr ? texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST) : nullptr;
+        auto final_views = vr ? texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, UINT16(views)) : nullptr;
         D3D12_CLEAR_VALUE depth_clear{DXGI_FORMAT_D32_FLOAT}; depth_clear.DepthStencil.Depth = 1;
-        auto depth = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &stencil_clear);
+        auto depth = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &stencil_clear, UINT16(views));
         const float magenta[4]{1, 0, 1, 1};
         D3D12_CLEAR_VALUE magenta_clear{DXGI_FORMAT_R11G11B10_FLOAT, {1, 0, 1, 1}};
         auto output = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R11G11B10_FLOAT,
@@ -412,10 +425,18 @@ int main(int argc, char** argv) {
         const UINT rinc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV), dinc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         auto rtv = [&](UINT i) { auto h = rtv_heap->GetCPUDescriptorHandleForHeapStart(); h.ptr += i * rinc; return h; };
         auto dsv = [&](UINT i) { auto h = dsv_heap->GetCPUDescriptorHandleForHeapStart(); h.ptr += i * dinc; return h; };
-        device->CreateRenderTargetView(scene.Get(), nullptr, rtv(0));
+        if (vr) {
+            D3D12_RENDER_TARGET_VIEW_DESC layered{DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RTV_DIMENSION_TEXTURE2DARRAY};
+            layered.Texture2DArray = {0, 0, views, 0};
+            device->CreateRenderTargetView(scene.Get(), &layered, rtv(0));
+        } else device->CreateRenderTargetView(scene.Get(), nullptr, rtv(0));
         device->CreateRenderTargetView(output.Get(), nullptr, rtv(1));
         device->CreateRenderTargetView(reference.Get(), nullptr, rtv(2));
-        device->CreateDepthStencilView(depth.Get(), nullptr, dsv(0));
+        if (vr) {
+            D3D12_DEPTH_STENCIL_VIEW_DESC layered{DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2DARRAY};
+            layered.Texture2DArray = {0, 0, views};
+            device->CreateDepthStencilView(depth.Get(), &layered, dsv(0));
+        } else device->CreateDepthStencilView(depth.Get(), nullptr, dsv(0));
         device->CreateDepthStencilView(ref_depth.Get(), nullptr, dsv(1));
 
         auto bind = [&](ID3D12PipelineState* pso, int variant) {
@@ -460,15 +481,15 @@ int main(int argc, char** argv) {
             material[5] = {0, 0, f.dirt, f.shadow_u};
             upload(materials[0].Get(), material.data(), sizeof(material));
         };
-        auto render_reference = [&](int camera) {
+        auto render_reference = [&](int camera, UINT eye) {
             const float zero[4]{};
             list->ClearRenderTargetView(rtv(2), zero, 0, nullptr);
             list->ClearDepthStencilView(dsv(1), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
-            bind(reference_pso.Get(), camera);
+            bind(eye ? reference_pso_eye1.Get() : reference_pso.Get(), camera);
             const D3D12_VIEWPORT vp{0, 0, float(output_w), float(output_h), 0, 1}; const D3D12_RECT sc{0, 0, LONG(output_w), LONG(output_h)};
             list->RSSetViewports(1, &vp); list->RSSetScissorRects(1, &sc);
             auto r2 = rtv(2), d1 = dsv(1); list->OMSetRenderTargets(1, &r2, FALSE, &d1);
-            list->DrawIndexedInstanced(6, 1, 0, 1, 0);
+            list->DrawIndexedInstanced(6, views, 0, 1, 0);
             transition(list.Get(), reference.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             auto rb = readback(device.Get(), reference.Get()); copy(list.Get(), reference.Get(), rb);
             transition(list.Get(), reference.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -481,10 +502,11 @@ int main(int argc, char** argv) {
             return result;
         };
 
-        Params ngx; ngx.colour = scene.Get(); ngx.output = output.Get();
+        ID3D12Resource* const colour = vr ? eye_colour.Get() : scene.Get();
+        Params ngx; ngx.colour = colour; ngx.output = output.Get();
         auto out_rb = readback(device.Get(), output.Get());
         auto prefill_upload = buffer(device.Get(), out_rb.bytes, D3D12_HEAP_TYPE_UPLOAD);
-        std::vector<std::array<float, 4>> previous_ref;
+        std::array<std::vector<std::array<float, 4>>, 2> previous_refs;
         std::vector<uint32_t> prefill(size_t(output_w) * output_h);
         bool all_passed = true;
         for (const auto& f : frames) {
@@ -494,7 +516,24 @@ int main(int argc, char** argv) {
             static UINT current_scroll = 0;
             if (f.scroll != current_scroll) { upload_display(f.scroll); current_scroll = f.scroll; }
             const int variant = f.camera == 1 ? 1 : (f.glare ? 2 : 0);
-            const auto ref = render_reference(variant);
+            std::array<std::vector<std::array<float, 4>>, 2> refs;
+            for (UINT eye = 0; eye < views; ++eye) refs[eye] = render_reference(variant, eye);
+            list->ClearRenderTargetView(rtv(0), black.Color, 0, nullptr);
+            list->ClearDepthStencilView(dsv(0), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+            if (f.draw) {
+                bind(game_pso.Get(), variant);
+                // Jitter: geometry displaced by +J render pixels (y down). VR: one instance per eye.
+                const D3D12_VIEWPORT vp{f.jx, f.jy, float(render_w), float(render_h), 0, 1}; const D3D12_RECT sc{0, 0, LONG(render_w), LONG(render_h)};
+                list->RSSetViewports(1, &vp); list->RSSetScissorRects(1, &sc);
+                auto r0 = rtv(0), d0 = dsv(0); list->OMSetRenderTargets(1, &r0, FALSE, &d0);
+                list->DrawIndexedInstanced(6, views, 0, 1, 0);
+            }
+            transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, vr ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            submit();
+          for (UINT call = 0; call < views; ++call) {
+            const UINT eye = views - 1 - call; // out of layer order
+            const auto& ref = refs[eye];
+            auto& previous_ref = previous_refs[eye];
             // Fake DLSS output: the current unjittered image (perfect), the previous frame's (ghost) or magenta.
             const auto& source = f.prefill == Frame::perfect ? ref : previous_ref.empty() ? ref : previous_ref;
             for (size_t i = 0; i < prefill.size(); ++i)
@@ -505,17 +544,13 @@ int main(int argc, char** argv) {
                     std::memcpy(static_cast<uint8_t*>(data) + out_rb.footprint.Offset + size_t(y) * out_rb.footprint.Footprint.RowPitch, &prefill[size_t(y) * output_w], size_t(output_w) * 4);
                 prefill_upload->Unmap(0, nullptr);
             }
-            list->ClearRenderTargetView(rtv(0), black.Color, 0, nullptr);
-            list->ClearDepthStencilView(dsv(0), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
-            if (f.draw) {
-                bind(game_pso.Get(), variant);
-                // Jitter: geometry displaced by +J render pixels (y down).
-                const D3D12_VIEWPORT vp{f.jx, f.jy, float(render_w), float(render_h), 0, 1}; const D3D12_RECT sc{0, 0, LONG(render_w), LONG(render_h)};
-                list->RSSetViewports(1, &vp); list->RSSetScissorRects(1, &sc);
-                auto r0 = rtv(0), d0 = dsv(0); list->OMSetRenderTargets(1, &r0, FALSE, &d0);
-                list->DrawIndexedInstanced(6, 1, 0, 1, 0);
+            if (vr) {
+                // This eye's layer becomes the upscaler's colour input.
+                D3D12_TEXTURE_COPY_LOCATION to{eye_colour.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{scene.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                from.SubresourceIndex = eye;
+                list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                transition(list.Get(), eye_colour.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             }
-            transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
             {
                 D3D12_TEXTURE_COPY_LOCATION to{output.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{prefill_upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
@@ -525,25 +560,31 @@ int main(int argc, char** argv) {
             transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             ngx.jitter_x = f.jx; ngx.jitter_y = f.jy;
             if (fsr) {
-                transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                transition(list.Get(), colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 ffxDispatchDescUpscale desc{};
                 desc.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
                 desc.commandList = list.Get();
-                desc.color = {scene.Get(), {}, FFX_API_RESOURCE_STATE_PIXEL_READ};
+                desc.color = {colour, {}, FFX_API_RESOURCE_STATE_PIXEL_READ};
                 desc.output = {output.Get(), {}, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS};
                 desc.jitterOffset = {f.jx, f.jy};
                 desc.renderSize = {render_w, render_h};
                 desc.upscaleSize = {output_w, output_h};
                 desc.preExposure = 1;
                 require(ffx_dispatch(nullptr, &desc.header) == FFX_API_RETURN_OK, "ffxDispatch failed");
-                transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                transition(list.Get(), colour, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             } else {
                 require(evaluate(list.Get(), nullptr, &ngx, nullptr) == NVSDK_NGX_Result_Success, "evaluate failed");
             }
             transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             copy(list.Get(), output.Get(), out_rb);
+            if (vr) {
+                D3D12_TEXTURE_COPY_LOCATION to{final_views.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{output.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                to.SubresourceIndex = eye;
+                list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            }
             transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            if (vr) transition(list.Get(), eye_colour.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            if (call + 1 == views) transition(list.Get(), scene.Get(), vr ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             submit();
 
             // Compare with the current reference; "ghost" = what the fake DLSS output alone would show.
@@ -575,15 +616,17 @@ int main(int argc, char** argv) {
                 p[3] = 255;
             }
             out_rb.buffer->Unmap(0, nullptr);
-            save_png(here / (std::string("overlay-") + f.name + ".png"), output_w, output_h, output_w * 4, png.data());
+            const std::string name = vr ? std::string(f.name) + "/eye" + std::to_string(eye) : f.name;
+            save_png(here / ("overlay-" + (vr ? std::string(f.name) + "-eye" + std::to_string(eye) : name) + ".png"), output_w, output_h, output_w * 4, png.data());
             const double mean = interior ? error / interior : 0, ghost_mean = interior ? ghost / interior : 0;
             bool pass = true;
             if (f.check == Frame::quality) pass = interior > 10000 && mean < 0.02 && stray < covered / 50;
             if (f.check == Frame::untouched) pass = replaced == 0;
-            std::printf("%-12s covered=%llu replaced=%llu stray=%llu error=%.4f (dlss_alone=%.4f) max=%.3f %s\n", f.name, covered, replaced, stray,
+            std::printf("%-12s covered=%llu replaced=%llu stray=%llu error=%.4f (dlss_alone=%.4f) max=%.3f %s\n", name.c_str(), covered, replaced, stray,
                 mean, ghost_mean, max_error, f.check == Frame::info ? "(info)" : pass ? "PASS" : "FAIL");
             all_passed &= pass;
             previous_ref = ref;
+          }
         }
         std::printf(all_passed ? "ALL PASSED\n" : "FAILED\n");
         return all_passed ? 0 : 1;

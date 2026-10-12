@@ -53,9 +53,11 @@ template <typename T> struct alignas(void*) StreamField {
 #pragma warning(pop)
 
 // Only losslessly representable graphics streams are cloned.
+// VR pipelines carry a view-instancing subobject (several views per draw); it is returned separately.
 inline bool decode_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& stream,
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC& out) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC& out, D3D12_VIEW_INSTANCING_DESC* view_instancing = nullptr, unsigned* unknown_type = nullptr) {
     out = {};
+    if (view_instancing) *view_instancing = {};
     if (!stream.pPipelineStateSubobjectStream || !stream.SizeInBytes || stream.SizeInBytes > 8192) return false;
     auto bytes = static_cast<const unsigned char*>(stream.pPipelineStateSubobjectStream);
     std::bitset<64> seen;
@@ -100,10 +102,11 @@ inline bool decode_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& stream,
         FIELD(SAMPLE_DESC, DXGI_SAMPLE_DESC, out.SampleDesc = field.data)
         FIELD(NODE_MASK, UINT, out.NodeMask = field.data)
         FIELD(CACHED_PSO, D3D12_CACHED_PIPELINE_STATE, out.CachedPSO = field.data)
+        FIELD(VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC, if (view_instancing) *view_instancing = field.data)
         FIELD(FLAGS, D3D12_PIPELINE_STATE_FLAGS,
             if (field.data != D3D12_PIPELINE_STATE_FLAG_NONE) return false;
             out.Flags = field.data)
-        default: return false;
+        default: if (unknown_type) *unknown_type = unsigned(type); return false;
         }
 #undef FIELD
     }

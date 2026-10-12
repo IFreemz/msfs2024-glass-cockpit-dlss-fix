@@ -55,6 +55,8 @@ size_t pipeline_stream_slot();
 namespace {
 // MSFS 2024 cockpit display shader pair (replaced by the stand-in shaders' hashes in the offline test host).
 uint64_t display_vs = 0xf102f1e3f5d9f66fULL, display_ps = 0x37e87c938bc76310ULL;
+// The same display drawn in VR: instanced stereo, one instance per view into a layered render target.
+uint64_t vr_display_vs = 0x715948137700a5d6ULL, vr_display_ps = 0x9ba9df5bca0ad4b9ULL;
 
 uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the bytecode
     auto data = static_cast<const unsigned char*>(bytes);
@@ -155,6 +157,7 @@ struct DisplayPipeline {
     std::vector<std::string> names;
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12Device> device;
+    bool vr = false;
     std::array<std::atomic<ID3D12PipelineState*>, slot_count> variants{};
     std::array<std::atomic<bool>, slot_count> requested{};
 };
@@ -180,6 +183,17 @@ const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shader
     SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
 #undef SLOT
 }};
+const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shaders_vr{{
+#define SLOT(n) {map_ps_vr_##n, sizeof(map_ps_vr_##n)},
+    SLOT(0) SLOT(1) SLOT(2) SLOT(3) SLOT(4) SLOT(5) SLOT(6) SLOT(7)
+    SLOT(8) SLOT(9) SLOT(10) SLOT(11) SLOT(12) SLOT(13) SLOT(14) SLOT(15)
+    SLOT(16) SLOT(17) SLOT(18) SLOT(19) SLOT(20) SLOT(21) SLOT(22) SLOT(23)
+    SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
+#undef SLOT
+}};
+const std::pair<const unsigned char*, size_t>& map_shader(const DisplayPipeline& pipeline, unsigned slot) {
+    return pipeline.vr ? map_shaders_vr[slot] : map_shaders[slot];
+}
 
 // Variant PSOs are compiled on a worker thread; draws are skipped (not stalled) until theirs is ready.
 std::mutex work_mutex;
@@ -191,7 +205,8 @@ void worker() {
         { std::unique_lock lock(work_mutex); work_ready.wait(lock, [] { return !work.empty(); }); item = work.front(); work.pop_front(); }
         auto [pipeline, slot] = item;
         D3D12_GRAPHICS_PIPELINE_STATE_DESC clone{};
-        if (!glass::clone_pipeline(pipeline->desc, {map_shaders[slot].first, map_shaders[slot].second}, clone)) {
+        const auto& shader = map_shader(*pipeline, slot);
+        if (!glass::clone_pipeline(pipeline->desc, {shader.first, shader.second}, clone)) {
             log("variant_rejected slot=%u", slot); continue;
         }
         ID3D12PipelineState* created = nullptr;
@@ -210,12 +225,16 @@ ID3D12PipelineState* variant(DisplayPipeline* pipeline, unsigned slot) {
     return nullptr;
 }
 
-void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D12PipelineState* pso) noexcept try {
+void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D12PipelineState* pso,
+    const D3D12_VIEW_INSTANCING_DESC& views = {}) noexcept try {
     if (!desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode) return;
     const auto ps = shader_hash(desc.PS.pShaderBytecode, desc.PS.BytecodeLength), vs = shader_hash(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
-    if (ps != display_ps || vs != display_vs) return;
+    if (views.ViewInstanceCount > 1) return; // view-instanced pipelines: not how MSFS draws its displays
+    const bool vr = ps == vr_display_ps && vs == vr_display_vs;
+    if (!vr && (ps != display_ps || vs != display_vs)) return;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC probe{};
-    if (!glass::clone_pipeline(desc, {map_shaders[0].first, map_shaders[0].second}, probe)) {
+    const auto& shader = vr ? map_shaders_vr[0] : map_shaders[0];
+    if (!glass::clone_pipeline(desc, {shader.first, shader.second}, probe)) {
         log("pipeline_unsupported pso=%p", pso); return;
     }
     auto copy = new DisplayPipeline;
@@ -231,12 +250,14 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     copy->desc.InputLayout = {copy->elements.data(), UINT(copy->elements.size())};
     copy->root = desc.pRootSignature;
     copy->device = device;
+    copy->vr = vr;
     std::lock_guard lock(pipelines_mutex);
     for (size_t i = 0; i < max_pipelines; ++i) if (!pipeline_keys[i].load()) {
         pipeline_values[i] = copy;
         pipeline_keys[i].store(reinterpret_cast<uint64_t>(pso), std::memory_order_release);
         if (stats.display_pipelines++ == 0) log("milestone cockpit display shader found (glass cockpit screens can be recognised)");
-        log("display_pipeline pso=%p root=%p targets=%u depth_format=%u", pso, desc.pRootSignature, desc.NumRenderTargets, unsigned(desc.DSVFormat));
+        log("display_pipeline pso=%p root=%p targets=%u depth_format=%u vr=%d", pso, desc.pRootSignature, desc.NumRenderTargets, unsigned(desc.DSVFormat), vr);
+        if (vr) LOG_ONCE("milestone VR cockpit display shader found");
         return;
     }
     log("display_pipeline_overflow");
@@ -257,7 +278,15 @@ HRESULT STDMETHODCALLTYPE stream_hook(ID3D12Device2* device, const D3D12_PIPELIN
     const auto hr = original_stream(device, desc, iid, out);
     if (SUCCEEDED(hr) && desc && out && *out && iid == __uuidof(ID3D12PipelineState)) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
-        if (glass::decode_stream(*desc, graphics)) pipeline_created(device, graphics, static_cast<ID3D12PipelineState*>(*out));
+        D3D12_VIEW_INSTANCING_DESC views{};
+        unsigned unknown = 0;
+        if (glass::decode_stream(*desc, graphics, &views, &unknown)) pipeline_created(device, graphics, static_cast<ID3D12PipelineState*>(*out), views);
+        else if (unknown) {
+            static std::mutex types_mutex;
+            static std::set<unsigned> types;
+            std::lock_guard lock(types_mutex);
+            if (types.size() < 8 && types.insert(unknown).second) log("pipeline_stream_unknown_subobject type=%u (pipelines with it are not inspected)", unknown);
+        }
     }
     return hr;
 }
@@ -326,11 +355,11 @@ int slot_of(ID3D12Resource* resource, DXGI_FORMAT format) {
 
 // ---------------------------------------------------------------------------------------------------------------
 struct Map {
-    UINT width = 0, height = 0;
+    UINT width = 0, height = 0, layers = 1; // one layer per view (VR: 2 eyes, or 4 views with foveated rendering)
     ComPtr<ID3D12Resource> texture, tiles, residual;
     ComPtr<ID3D12DescriptorHeap> rtv;
     bool initialised = false;
-    std::atomic<bool> drawn{false};
+    std::atomic<uint32_t> views{0}; // layers drawn this frame and not yet composited (upscaler calls come in view order)
 };
 
 struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
@@ -361,25 +390,27 @@ struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
     uint32_t generation = 0;
 };
 
-Map* map_for(DeviceState& device, UINT width, UINT height) {
+Map* map_for(DeviceState& device, UINT width, UINT height, UINT layers) {
     std::lock_guard lock(device.maps_mutex);
-    for (auto& map : device.maps) if (map->width == width && map->height == height) return map.get();
-    if (device.maps.size() >= 4 || !width || !height || width > 8192 || height > 8192) return nullptr;
+    for (auto& map : device.maps) if (map->width == width && map->height == height && map->layers == layers) return map.get();
+    if (device.maps.size() >= 6 || !width || !height || width > 8192 || height > 8192 || !layers || layers > 8) return nullptr;
     auto map = std::make_unique<Map>();
-    map->width = width; map->height = height;
+    map->width = width; map->height = height; map->layers = layers;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, glass::map_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, UINT16(layers), 1, glass::map_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     D3D12_CLEAR_VALUE clear{glass::map_format, {}};
     if (FAILED(device.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&map->texture)))) return nullptr;
-    desc.Width = (width + 7) / 8; desc.Height = (height + 7) / 8; desc.Format = DXGI_FORMAT_R32_UINT; desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    desc.Width = (width + 7) / 8; desc.Height = (height + 7) / 8; desc.DepthOrArraySize = 1; desc.Format = DXGI_FORMAT_R32_UINT; desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (FAILED(device.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&map->tiles)))) return nullptr;
     desc.Width = width; desc.Height = height; desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; // per render pixel
     if (FAILED(device.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&map->residual)))) return nullptr;
     D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(device.native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&map->rtv)))) return nullptr;
-    device.native->CreateRenderTargetView(map->texture.Get(), nullptr, map->rtv->GetCPUDescriptorHandleForHeapStart());
-    log("map_created w=%u h=%u", width, height);
+    D3D12_RENDER_TARGET_VIEW_DESC rtv{glass::map_format, D3D12_RTV_DIMENSION_TEXTURE2DARRAY};
+    rtv.Texture2DArray = {0, 0, layers, 0};
+    device.native->CreateRenderTargetView(map->texture.Get(), &rtv, map->rtv->GetCPUDescriptorHandleForHeapStart());
+    log("map_created w=%u h=%u layers=%u", width, height, layers);
     device.maps.push_back(std::move(map));
     return device.maps.back().get();
 }
@@ -447,6 +478,30 @@ void on_init_device(api::device* device) {
     install_ngx();
     install_ffx();
 }
+std::shared_mutex hashes_mutex;
+std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> pipeline_hashes; // pso -> vs, ps (VR probe)
+
+void on_init_pipeline(api::device*, api::pipeline_layout, uint32_t count, const api::pipeline_subobject* subobjects, api::pipeline pipeline) {
+    uint64_t vs = 0, ps = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& o = subobjects[i];
+        if (!o.data || !o.count) continue;
+        const auto& shader = *static_cast<const api::shader_desc*>(o.data);
+        if (o.type == api::pipeline_subobject_type::vertex_shader && shader.code) vs = shader_hash(shader.code, shader.code_size);
+        if (o.type == api::pipeline_subobject_type::pixel_shader && shader.code) ps = shader_hash(shader.code, shader.code_size);
+    }
+    if (vs || ps) {
+        std::unique_lock lock(hashes_mutex);
+        if (pipeline_hashes.size() < 65536) pipeline_hashes[pipeline.handle] = {vs, ps};
+    }
+    if (ps != display_ps || find_pipeline(pipeline.handle)) return;
+    static std::atomic<int> logged{0};
+    if (logged++ >= 16) return;
+    char types[128]{};
+    for (uint32_t i = 0; i < count && i < 24; ++i) snprintf(types + strlen(types), sizeof(types) - strlen(types), " %u", unsigned(subobjects[i].type));
+    log("display_pipeline_missed pso=%p vs=%016llx display_vs=%d subobjects:%s", reinterpret_cast<void*>(pipeline.handle), vs, vs == display_vs, types);
+}
+
 void on_destroy_device(api::device* device) {
     if (device->get_private_data<DeviceState>()) device->destroy_private_data<DeviceState>();
 }
@@ -544,7 +599,9 @@ void on_reset_list(api::command_list* list) {
 }
 void on_bind_pipeline(api::command_list* list, api::pipeline_stage stages, api::pipeline pipeline) {
     if (!enabled.load(std::memory_order_relaxed) || (stages & api::pipeline_stage::all_graphics) == api::pipeline_stage{}) return;
-    if (auto state = list->get_private_data<ListState>()) { state->pso = pipeline.handle; state->display = find_pipeline(pipeline.handle); }
+    if (auto state = list->get_private_data<ListState>()) {
+        state->pso = pipeline.handle; state->display = find_pipeline(pipeline.handle);
+    }
 }
 void on_bind_tables(api::command_list* list, api::shader_stage stages, api::pipeline_layout layout, uint32_t first, uint32_t count, const api::descriptor_table* tables) {
     if (!enabled.load(std::memory_order_relaxed) || (stages & api::shader_stage::all_graphics) == api::shader_stage{}) return;
@@ -607,7 +664,9 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
     const auto target = list->get_device()->get_resource_from_view({state.targets[0].ptr});
     if (!target.handle) { note(stats.unsupported_draw, "target_unknown"); return; }
     const auto desc = reinterpret_cast<ID3D12Resource*>(target.handle)->GetDesc();
-    auto map = map_for(device, UINT(desc.Width), desc.Height);
+    // VR draws all views at once into a layered target; the map gets the same layers.
+    const UINT layers = state.display->vr ? std::clamp<UINT>(desc.DepthOrArraySize, 1, 8) : 1;
+    auto map = map_for(device, UINT(desc.Width), desc.Height, layers);
     if (!map) { note(stats.unsupported_draw, "map_allocation"); return; }
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native());
     const auto rtv = map->rtv->GetCPUDescriptorHandleForHeapStart();
@@ -627,13 +686,68 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
     native->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pso));
     native->OMSetRenderTargets(state.target_count, state.targets.data(), FALSE, &state.depth);
     transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, map_resting);
-    map->drawn = true;
+    map->views = map->layers;
     if (stats.replays++ == 0) log("milestone first cockpit screen recorded (render target %ux%u)", UINT(desc.Width), desc.Height);
+    if (layers > 1) LOG_ONCE("milestone first VR cockpit screen recorded (render target %ux%u, %u views)", UINT(desc.Width), desc.Height, layers);
 } catch (...) { note(stats.unsupported_draw, "exception"); }
+
+// VR probe window (in presents), started when the upscaler runs at a size with no cockpit map (VR or another view).
+std::atomic<uint64_t> probe_until{0};
+void probe_screen_draw(api::command_list* list, const ListState& state, uint32_t count, uint32_t instances) noexcept try {
+    if (!state.device || !state.layout) return;
+    std::pair<uint32_t, uint32_t> binding;
+    {
+        std::shared_lock lock(state.device->layouts_mutex);
+        const auto found = state.device->display_bindings.find(state.layout);
+        if (found == state.device->display_bindings.end()) return;
+        binding = found->second;
+    }
+    const auto table = state.tables[binding.first];
+    if (!table) return;
+    api::descriptor_heap heap{}; uint32_t offset = 0;
+    list->get_device()->get_descriptor_heap_offset({table}, binding.second, 0, &heap, &offset);
+    if (!heap.handle) return;
+    auto native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
+    Signature s{};
+    if (!read_bytes(reinterpret_cast<const void*>(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size), s.bytes.data(), descriptor_size)) return;
+    ID3D12Resource* resource = nullptr;
+    {
+        std::shared_lock lock(textures_mutex);
+        const auto found = signatures.find(s);
+        if (found == signatures.end()) return;
+        resource = found->second.resource;
+    }
+    bool screen = false;
+    for (const auto& slot : slot_resources) screen |= slot.load() == resource;
+    if (!screen) return;
+    static std::mutex logged_mutex;
+    static std::set<uint64_t> logged;
+    {
+        std::lock_guard lock(logged_mutex);
+        if (logged.size() >= 24 || !logged.insert(state.pso).second) return;
+    }
+    std::pair<uint64_t, uint64_t> hashes{};
+    {
+        std::shared_lock lock(hashes_mutex);
+        if (const auto found = pipeline_hashes.find(state.pso); found != pipeline_hashes.end()) hashes = found->second;
+    }
+    auto device = list->get_device();
+    char targets[160]{};
+    for (uint32_t i = 0; i < state.target_count && i < 2; ++i) {
+        const auto rt = device->get_resource_from_view({uint64_t(state.targets[i].ptr)});
+        if (!rt.handle) continue;
+        const auto r = device->get_resource_desc(rt);
+        snprintf(targets + strlen(targets), sizeof(targets) - strlen(targets), " rt%u=%ux%u layers=%u format=%u", i, r.texture.width, r.texture.height,
+            unsigned(r.texture.depth_or_layers), unsigned(r.texture.format));
+    }
+    log("probe_screen_draw pso=%p vs=%016llx ps=%016llx screen=%p count=%u instances=%u in_pass=%d targets=%u%s", reinterpret_cast<void*>(state.pso),
+        hashes.first, hashes.second, resource, count, instances, state.in_pass, state.target_count, targets);
+} catch (...) {}
 
 bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, uint32_t first_instance) {
     if (!enabled.load(std::memory_order_relaxed)) return false;
     auto state = list->get_private_data<ListState>();
+    if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
     if (state && state->display) ++stats.display_draws;
     if (state && state->display && state->generation == generation.load(std::memory_order_relaxed)) replay(list, *state, {false, count, instances, first, first_instance, 0});
     return false;
@@ -641,10 +755,12 @@ bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32
 bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, int32_t vertex, uint32_t first_instance) {
     if (!enabled.load(std::memory_order_relaxed)) return false;
     auto state = list->get_private_data<ListState>();
+    if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
     if (state && state->display) ++stats.display_draws;
     if (state && state->display && state->generation == generation.load(std::memory_order_relaxed)) replay(list, *state, {true, count, instances, first, first_instance, vertex});
     return false;
 }
+
 
 // ---------------------------------------------------------------------------------------------------------------
 // Composite after DLSS.
@@ -690,6 +806,53 @@ ID3D12Resource* ngx_resource(const NVSDK_NGX_Parameter& params, const char* name
     return params.Get(name, &pointer) == NVSDK_NGX_Result_Success ? static_cast<ID3D12Resource*>(pointer) : nullptr;
 }
 
+// VR view order. The sim upscales its views one by one (into a temporary texture, then copies it into its layer of
+// the final layered image) and need not do that in layer order: with foveated rendering it doesn't. The copies tell
+// which layer each call of a frame belongs to; learnt on the first frames, used from then on.
+struct ViewOrder {
+    std::mutex mutex;
+    UINT views = 0;                                  // views per frame (map layers) the order below belongs to
+    ID3D12Resource* last_output = nullptr;           // output of the latest call (the sim reuses one temporary texture)
+    UINT last_call = 0;
+    std::array<int, 8> layer{-1, -1, -1, -1, -1, -1, -1, -1};
+} view_order;
+
+UINT layer_for_call(UINT call, UINT views, ID3D12Resource* output) {
+    std::lock_guard lock(view_order.mutex);
+    if (view_order.views != views) {
+        view_order.views = views;
+        view_order.layer.fill(-1);
+    }
+    if (call >= 8) return call;
+    view_order.last_output = output;
+    view_order.last_call = call;
+    if (view_order.layer[call] >= 0) return UINT(view_order.layer[call]);
+    // Only one call left unknown: it gets the remaining layer.
+    UINT known = 0, used = 0;
+    for (UINT i = 0; i < views; ++i) if (view_order.layer[i] >= 0) { ++known; used |= 1u << view_order.layer[i]; }
+    if (known + 1 == views) for (UINT l = 0; l < views; ++l) if (!(used & (1u << l))) return l;
+    return call;
+}
+
+bool on_copy_region(api::command_list*, api::resource source, uint32_t, const api::subresource_box*, api::resource dest, uint32_t dest_subresource,
+    const api::subresource_box*, api::filter_mode) {
+    if (!view_order.views) return false;
+    const auto src = reinterpret_cast<ID3D12Resource*>(source.handle);
+    std::lock_guard lock(view_order.mutex);
+    // A copy of the latest call's output into a layered texture: that call's view is the destination layer.
+    if (!src || src != view_order.last_output) return false;
+    const auto desc = reinterpret_cast<ID3D12Resource*>(dest.handle)->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != view_order.views) return false;
+    const UINT call = view_order.last_call;
+    view_order.last_output = nullptr; // one copy per call; frames without a fixed view must not reuse it
+    const int layer = int(dest_subresource / std::max<UINT16>(desc.MipLevels, 1));
+    if (call < 8 && view_order.layer[call] != layer) {
+        view_order.layer[call] = layer;
+        log("vr view order: upscaler call %u of %u -> layer %d", call, view_order.views, layer);
+    }
+    return false;
+}
+
 // What the upscaler (DLSS or FSR) was given and wrote, and the states it left its colour input and output in.
 struct Upscale {
     const char* name;
@@ -718,6 +881,24 @@ void composite_dlss(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Paramet
     params->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &jitter_x);
     params->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &jitter_y);
     auto colour = ngx_resource(*params, NVSDK_NGX_Parameter_Color), output = ngx_resource(*params, NVSDK_NGX_Parameter_Output);
+    {
+        // The first calls of every render size in detail: shows how the sim lays out views (one per eye in VR, side by
+        // side, arrays...).
+        static std::mutex sizes_mutex;
+        static std::unordered_map<uint64_t, int> sizes;
+        std::unique_lock sizes_lock(sizes_mutex);
+        auto& seen = sizes[(uint64_t(render_w) << 32) | render_h];
+        const bool log_call = sizes.size() <= 8 && seen++ < 6;
+        sizes_lock.unlock();
+        if (log_call) {
+            D3D12_RESOURCE_DESC c{}, o{};
+            if (colour) c = colour->GetDesc();
+            if (output) o = output->GetDesc();
+            log("dlss_call render=%ux%u colour=%p %llux%u layers=%u base=%u,%u output=%p %llux%u layers=%u base=%u,%u jitter=%g,%g",
+                render_w, render_h, colour, c.Width, c.Height, unsigned(c.DepthOrArraySize), base[0], base[1],
+                output, o.Width, o.Height, unsigned(o.DepthOrArraySize), base[2], base[3], jitter_x, jitter_y);
+        }
+    }
     if (!colour || !output || base[0] || base[1] || base[2] || base[3]) {
         LOG_ONCE("dlss_inputs_unsupported colour=%p output=%p colour_base=%u,%u output_base=%u,%u", colour, output, base[0], base[1], base[2], base[3]);
         note(stats.composite_skipped, "dlss_inputs_unsupported"); return;
@@ -779,13 +960,22 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     if (!map) {
         // Normal for views without a cockpit; suspicious if screens were drawn at another size.
         std::lock_guard lock(d.maps_mutex);
-        for (auto& m : d.maps) if (m->drawn) {
+        for (auto& m : d.maps) if (m->views) {
             LOG_ONCE("note %s render size %ux%u differs from the cockpit render target %ux%u (screens drawn in another view?)", u.name, render_w, render_h, m->width, m->height);
+            static std::atomic<uint64_t> probed_size{0};
+            const uint64_t render_size = (uint64_t(render_w) << 32) | render_h;
+            if (probed_size.exchange(render_size) != render_size) {
+                probe_until = present_count.load() + 900;
+                log("vr_probe started for %ux%u: looking for draws that read a cockpit screen texture with another pipeline", render_w, render_h);
+            }
             break;
         }
         return;
     }
-    if (!map->drawn.exchange(false)) return;
+    // Which view this call upscales: the sim runs the upscaler once per view, in layer order.
+    uint32_t pending = map->views.load();
+    do { if (!pending) return; } while (!map->views.compare_exchange_weak(pending, pending - 1));
+    const UINT layer = map->layers > 1 ? layer_for_call(map->layers - pending, map->layers, output) : 0;
     const auto out = output->GetDesc(), in = colour->GetDesc();
     // Any float or UNORM colour output the compute pass can write (DLSS in MSFS: R11G11B10_FLOAT).
     const DXGI_FORMAT out_format = typed(out.Format), in_format = typed(in.Format);
@@ -813,11 +1003,18 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     auto cpu = d.heap->GetCPUDescriptorHandleForHeapStart(); cpu.ptr += SIZE_T(first) * descriptor_size;
     auto gpu = d.heap->GetGPUDescriptorHandleForHeapStart(); gpu.ptr += UINT64(first) * descriptor_size;
     auto at = [&](UINT i) { auto h = cpu; h.ptr += SIZE_T(i) * descriptor_size; return h; };
+    D3D12_SHADER_RESOURCE_VIEW_DESC map_srv{glass::map_format, D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    map_srv.Texture2DArray = {0, 1, 0, map->layers, 0, 0};
+    d.native->CreateShaderResourceView(map->texture.Get(), &map_srv, at(0));
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{glass::map_format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     srv.Texture2D.MipLevels = 1;
-    d.native->CreateShaderResourceView(map->texture.Get(), &srv, at(0));
     srv.Format = in_format;
-    d.native->CreateShaderResourceView(colour, &srv, at(1));
+    if (in.DepthOrArraySize > 1) {
+        // VR: layered textures (one layer per view). The upscaler reads and writes layer 0.
+        D3D12_SHADER_RESOURCE_VIEW_DESC first_layer{in_format, D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        first_layer.Texture2DArray = {0, 1, 0, 1, 0, 0};
+        d.native->CreateShaderResourceView(colour, &first_layer, at(1));
+    } else d.native->CreateShaderResourceView(colour, &srv, at(1));
     for (unsigned i = 0; i < slot_count; ++i) {
         auto resource = slot_resources[i].load();
         srv.Format = resource ? slot_formats[i] : DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -825,21 +1022,26 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         d.native->CreateShaderResourceView(resource, &srv, at(2 + i));
     }
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{out_format, D3D12_UAV_DIMENSION_TEXTURE2D};
-    d.native->CreateUnorderedAccessView(output, nullptr, &uav, at(uav_base + 0));
+    if (out.DepthOrArraySize > 1) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC first_layer{out_format, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
+        first_layer.Texture2DArray = {0, 0, 1, 0};
+        d.native->CreateUnorderedAccessView(output, nullptr, &first_layer, at(uav_base + 0));
+    } else d.native->CreateUnorderedAccessView(output, nullptr, &uav, at(uav_base + 0));
     uav.Format = DXGI_FORMAT_R32_UINT;
     d.native->CreateUnorderedAccessView(map->tiles.Get(), nullptr, &uav, at(uav_base + 1));
     D3D12_UNORDERED_ACCESS_VIEW_DESC structured{DXGI_FORMAT_UNKNOWN, D3D12_UAV_DIMENSION_BUFFER};
     structured.Buffer = {0, slot_count * 2, 16, 0, D3D12_BUFFER_UAV_FLAG_NONE};
     d.native->CreateUnorderedAccessView(d.params.Get(), nullptr, &structured, at(uav_base + 2));
-    uav.Format = glass::map_format;
-    d.native->CreateUnorderedAccessView(map->texture.Get(), nullptr, &uav, at(uav_base + 3));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC map_uav{glass::map_format, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
+    map_uav.Texture2DArray = {0, 0, map->layers, 0};
+    d.native->CreateUnorderedAccessView(map->texture.Get(), nullptr, &map_uav, at(uav_base + 3));
     uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     d.native->CreateUnorderedAccessView(map->residual.Get(), nullptr, &uav, at(uav_base + 4));
 
-    struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT pad; } constants{
+    struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
         jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u),
-        smoothing_percent / 50.0f, 0};
+        smoothing_percent / 50.0f, layer};
 
     api::command_list* api_list = list;
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(api_list->get_native());
@@ -1060,7 +1262,8 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghostin
     X(init_command_list, on_init_list) X(destroy_command_list, on_destroy_list) X(reset_command_list, on_reset_list) \
     X(bind_pipeline, on_bind_pipeline) X(bind_descriptor_tables, on_bind_tables) \
     X(bind_render_targets_and_depth_stencil, on_bind_targets) X(begin_render_pass, on_begin_pass) X(end_render_pass, on_end_pass) \
-    X(draw, on_draw) X(draw_indexed, on_draw_indexed) X(reshade_present, on_present)
+    X(draw, on_draw) X(draw_indexed, on_draw_indexed) X(reshade_present, on_present) X(init_pipeline, on_init_pipeline) \
+    X(copy_texture_region, on_copy_region)
 
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_module) {
     wchar_t executable[MAX_PATH]{};
@@ -1084,6 +1287,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
         };
         display_ps = hash_file(fixture_directory / L"fixture_ps.cso");
         display_vs = hash_file(fixture_directory / L"fixture_vs.cso");
+        vr_display_ps = hash_file(fixture_directory / L"fixture_vr_ps.cso");
+        vr_display_vs = hash_file(fixture_directory / L"fixture_vr_vs.cso");
     }
     // Keep the previous session's log: after a crash people usually relaunch before sending it.
     const auto log_path = addon_directory / L"glass-cockpit-dlss-fix.log";

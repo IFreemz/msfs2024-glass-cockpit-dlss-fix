@@ -32,4 +32,4 @@ fake DLSS that leaves worst-case ghosts, and checks the result pixel by pixel ag
 powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -Version <version in src\version.h>
 ```
 
-This creates `dist\glass-cockpit-dlss-fix-<version>.zip`.
+This creates `dist\glass-cockpit-dlss-fix.addon64`, the file attached to the release.

@@ -8,4 +8,6 @@ try {
     if ($LASTEXITCODE) { throw "Offline test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --fsr
     if ($LASTEXITCODE) { throw "Offline FSR test failed ($LASTEXITCODE)" }
+    & .\FlightSimulator2024.exe --vr
+    if ($LASTEXITCODE) { throw "Offline VR test failed ($LASTEXITCODE)" }
 } finally { Pop-Location }

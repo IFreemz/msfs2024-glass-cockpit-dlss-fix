@@ -2,7 +2,7 @@
 
 A ReShade add-on that removes **upscaler ghosting and smearing from glass cockpit displays** in Microsoft Flight
 Simulator 2024: speed and altitude tapes, moving maps, ECAM pages and so on stay sharp and readable with **DLSS or
-FSR**, in every quality mode.
+FSR**, in every quality mode, on a monitor and in VR.
 
 ![Fenix A320 PFD in DLSS Performance: 8 s of stock DLSS smearing the altitude readout, then 8 s with the fix](docs/comparison.webp)
 
@@ -34,6 +34,10 @@ The same idea that DLSS mods for other games use for HUDs: **draw the screen con
 3. Brightness is matched to the sim every frame, so night lighting and the brightness knobs still work. Dirt, sun
    glare and shadows on the glass are taken from the upscaled image itself, limited to what this frame actually
    shows, so they stay sharp while trails of old screen content are removed.
+
+In VR the sim draws every view (both eyes, plus the sharp centre views with foveated rendering) in one go and then
+upscales them one by one; the add-on records each view separately and learns from the sim which upscale belongs to
+which view.
 
 It works at any resolution and in any quality mode, and costs one extra draw per screen plus a few small GPU passes:
 no measurable FPS difference with the fix on or off in testing.
@@ -90,6 +94,9 @@ followed by milestones in order:
 4. `milestone first cockpit screen recorded`
 5. `milestone first overlay frame drawn (fix is active)`
 
+In VR also `milestone VR cockpit display shader found`, `milestone first VR cockpit screen recorded` and
+`vr view order` lines.
+
 The first missing milestone shows where it stopped. Lines starting with `WARNING` or `ERROR` explain common
 problems in plain words, e.g. no upscaler selected, or a sim update that changed the display shader.
 
@@ -110,7 +117,9 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 ## Known limitations
 
 - DLSS Super Resolution and FSR only (not TAA). Works with DLSS Frame Generation (tested up to 6x Multi Frame
-  Generation). Not yet tested in VR.
+  Generation).
+- VR: tested with DLSS on a Quest 3 through Virtual Desktop, with and without foveated rendering. FSR in VR and other
+  headsets/runtimes are untested, reports welcome.
 - A thin band at each screen's edge (about one render pixel) still comes from the upscaler.
 - Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) would be covered by it.
 - Sim updates that change the cockpit display shader stop the fix (the sim then just looks like stock DLSS/FSR)

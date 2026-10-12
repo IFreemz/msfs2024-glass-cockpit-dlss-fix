@@ -18,16 +18,16 @@ cbuffer Constants : register(b0)
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
                              // bit 3: smooth lines
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
-    uint padding;
+    uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
 };
 
-Texture2D<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
+Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
 Texture2D<float4> scene : register(t1);     // DLSS input colour (render resolution, pre-exposed linear)
 Texture2D<float4> displays[32] : register(t2);
 RWTexture2D<float4> output : register(u0);  // DLSS output, R11G11B10_FLOAT
 RWTexture2D<uint> tiles : register(u1);     // per 8x8 map tile: display slot + 1 this frame (0 = none)
 RWStructuredBuffer<float4> params : register(u2); // per slot: [2s] = a.rgb, valid; [2s+1] = b.rgb, samples
-RWTexture2D<float4> map_rw : register(u3);
+RWTexture2DArray<float4> map_rw : register(u3);
 RWByteAddressBuffer sums : register(u4);    // per slot 13 x uint64 fixed point
 RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * display, w = slot + 1 (0 = none)
 SamplerState display_sampler : register(s0);
@@ -100,7 +100,7 @@ void accumulate(uint slot, float3 x, float3 y)
 
 float4 load_map(int2 p)
 {
-    return all(p >= 0) && all(p < int2(map_size)) ? map.Load(int3(p, 0)) : 0;
+    return all(p >= 0) && all(p < int2(map_size)) ? map.Load(int4(p, layer, 0)) : 0;
 }
 
 [numthreads(8, 8, 1)]
@@ -249,5 +249,5 @@ void composite(uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void clear(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID)
 {
-    if (all(id.xy < map_size) && all(group.xy < (map_size + 7) / 8) && tiles[group.xy]) map_rw[id.xy] = 0;
+    if (all(id.xy < map_size) && all(group.xy < (map_size + 7) / 8) && tiles[group.xy]) map_rw[uint3(id.xy, layer)] = 0;
 }
