@@ -12,7 +12,7 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", GLASS_AUTHOR
-            VALUE "FileDescription", "Removes DLSS ghosting from MSFS 2024 glass cockpit displays"
+            VALUE "FileDescription", "Removes DLSS and FSR ghosting from MSFS 2024 glass cockpit displays"
             VALUE "FileVersion", GLASS_VERSION_STRING
             VALUE "InternalName", "glass-cockpit-dlss-fix"
             VALUE "LegalCopyright", "Copyright (c) 2026 IFreemz. MIT license."

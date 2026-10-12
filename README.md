@@ -1,4 +1,4 @@
-# Glass Cockpit DLSS Fix for MSFS 2024
+# Glass Cockpit DLSS Fix for MSFS 2024 (DLSS, FSR and VR)
 
 A ReShade add-on that removes **upscaler ghosting and smearing from glass cockpit displays** in Microsoft Flight
 Simulator 2024: speed and altitude tapes, moving maps, ECAM pages and so on stay sharp and readable with **DLSS or
