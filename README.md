@@ -10,7 +10,7 @@ FSR**, in every quality mode, on a monitor and in VR.
 [Watch in full quality on YouTube](https://www.youtube.com/watch?v=Hcz8hwFndoc).*
 
 It works with every aircraft that uses the simulator's standard cockpit display shader. Tested on the Fenix A320
-family, iniBuilds A220, A330, A350 and A380 and the default DA62, and by community testers on the PMDG 737 and 777
+family, iniBuilds A220, A330, A340, A350 and A380 and the default DA62, and by community testers on the PMDG 737 and 777
 and the default Cessna Longitude. It should cover most glass cockpits.
 
 > Unofficial community mod. Not affiliated with Microsoft, Asobo, NVIDIA, AMD or any aircraft developer.
