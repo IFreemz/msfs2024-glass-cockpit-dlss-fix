@@ -438,6 +438,8 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     std::vector<std::unique_ptr<Map>> maps;
     std::shared_mutex layouts_mutex;
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> display_bindings; // layout -> root index, table offset of t1
+    struct SrvRange { uint32_t param, offset, reg, space, count; };
+    std::unordered_map<uint64_t, std::vector<SrvRange>> srv_ranges; // layout -> pixel shader texture ranges (screen probe)
     std::mutex composite_mutex;
     bool composite_ready = false, composite_failed = false, accumulators_zeroed = false, output_readable = false;
     ComPtr<ID3D12RootSignature> root;
@@ -585,6 +587,20 @@ void on_destroy_device(api::device* device) {
 void on_init_layout(api::device* device, uint32_t count, const api::pipeline_layout_param* params, api::pipeline_layout layout) {
     auto state = device->get_private_data<DeviceState>();
     if (!state) return;
+    {
+        std::vector<DeviceState::SrvRange> found;
+        for (uint32_t i = 0; i < count && i < 64; ++i) {
+            const api::descriptor_range* ranges = nullptr; uint32_t range_count = 0;
+            if (params[i].type == api::pipeline_layout_param_type::descriptor_table) { ranges = params[i].descriptor_table.ranges; range_count = params[i].descriptor_table.count; }
+            else if (params[i].type == api::pipeline_layout_param_type::descriptor_table_with_static_samplers) {
+                ranges = params[i].descriptor_table_with_static_samplers.ranges; range_count = params[i].descriptor_table_with_static_samplers.count;
+            } else continue;
+            for (uint32_t j = 0; j < range_count; ++j)
+                if (ranges[j].type == api::descriptor_type::texture_shader_resource_view && (ranges[j].visibility & api::shader_stage::pixel) != api::shader_stage{})
+                    found.push_back({i, ranges[j].binding, ranges[j].dx_register_index, ranges[j].dx_register_space, std::min<uint32_t>(ranges[j].count, 16)});
+        }
+        if (!found.empty()) { std::unique_lock lock(state->layouts_mutex); state->srv_ranges[layout.handle] = std::move(found); }
+    }
     for (uint32_t i = 0; i < count && i < 64; ++i) {
         const api::descriptor_range* ranges = nullptr; uint32_t range_count = 0;
         if (params[i].type == api::pipeline_layout_param_type::descriptor_table || params[i].type == api::pipeline_layout_param_type::push_descriptors_with_ranges) {
@@ -864,9 +880,74 @@ void probe_screen_draw(api::command_list* list, const ListState& state, uint32_t
         hashes.first, hashes.second, resource, count, instances, state.in_pass, state.target_count, targets);
 } catch (...) {}
 
+// Screen probe (Ctrl+Shift+F12, 600 frames): draws with any other pipeline whose pixel shader reads a gauge-like texture
+// (GPU-written RGBA8 with mip maps, like every cockpit screen texture), to find screens drawn with another shader.
+std::atomic<uint64_t> screen_probe_until{0};
+void screen_probe(api::command_list* list, const ListState& state, uint32_t count, uint32_t instances) noexcept try {
+    if (!state.device || !state.layout) return;
+    std::vector<DeviceState::SrvRange> ranges;
+    {
+        std::shared_lock lock(state.device->layouts_mutex);
+        const auto found = state.device->srv_ranges.find(state.layout);
+        if (found == state.device->srv_ranges.end()) return;
+        ranges = found->second;
+    }
+    auto device = list->get_device();
+    for (const auto& r : ranges) {
+        const auto table = r.param < state.tables.size() ? state.tables[r.param] : 0;
+        if (!table) continue;
+        for (uint32_t k = 0; k < r.count; ++k) {
+            api::descriptor_heap heap{}; uint32_t offset = 0;
+            device->get_descriptor_heap_offset({table}, r.offset + k, 0, &heap, &offset);
+            if (!heap.handle) continue;
+            const auto native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
+            const auto address = uintptr_t(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size);
+            Signature sig{};
+            if (!read_bytes(reinterpret_cast<const void*>(address), sig.bytes.data(), descriptor_size)) continue;
+            ID3D12Resource* resource = nullptr;
+            {
+                std::shared_lock lock(textures_mutex);
+                if (const auto found = signatures.find(sig); found != signatures.end()) resource = found->second.resource;
+            }
+            if (!resource && track_descriptors.load(std::memory_order_relaxed)) {
+                std::shared_lock lock(tracked_mutex);
+                if (const auto found = tracked.find(address); found != tracked.end()) resource = found->second.resource;
+            }
+            if (!resource) continue;
+            const auto desc = resource->GetDesc();
+            if (desc.MipLevels < 2) continue; // scene render targets have one mip; cockpit screens have several
+            static std::mutex logged_mutex;
+            static std::set<std::pair<uint64_t, ID3D12Resource*>> logged;
+            {
+                std::lock_guard lock(logged_mutex);
+                if (logged.size() >= 64 || !logged.insert({state.pso, resource}).second) continue;
+            }
+            bool slot = false;
+            for (const auto& s : slot_resources) slot |= s.load() == resource;
+            std::pair<uint64_t, uint64_t> hashes{};
+            {
+                std::shared_lock lock(hashes_mutex);
+                if (const auto found = pipeline_hashes.find(state.pso); found != pipeline_hashes.end()) hashes = found->second;
+            }
+            char targets[160]{};
+            for (uint32_t i = 0; i < state.target_count && i < 2; ++i) {
+                const auto rt = device->get_resource_from_view({uint64_t(state.targets[i].ptr)});
+                if (!rt.handle) continue;
+                const auto t = device->get_resource_desc(rt);
+                snprintf(targets + strlen(targets), sizeof(targets) - strlen(targets), " rt%u=%ux%u layers=%u format=%u", i, t.texture.width, t.texture.height,
+                    unsigned(t.texture.depth_or_layers), unsigned(t.texture.format));
+            }
+            log("screen_probe pso=%p vs=%016llx ps=%016llx t%u space%u texture=%p %llux%u mips=%u format=%u screen_slot=%d count=%u instances=%u layout=%p targets=%u%s",
+                reinterpret_cast<void*>(state.pso), hashes.first, hashes.second, r.reg + k, r.space, resource, uint64_t(desc.Width), desc.Height,
+                unsigned(desc.MipLevels), unsigned(desc.Format), slot, count, instances, reinterpret_cast<void*>(state.layout), state.target_count, targets);
+        }
+    }
+} catch (...) {}
+
 bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, uint32_t first_instance) {
     if (!enabled.load(std::memory_order_relaxed)) return false;
     auto state = list->get_private_data<ListState>();
+    if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
     if (state && state->display) ++stats.display_draws;
     if (state && state->display && state->generation == generation.load(std::memory_order_relaxed)) replay(list, *state, {false, count, instances, first, first_instance, 0});
@@ -875,6 +956,7 @@ bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32
 bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, int32_t vertex, uint32_t first_instance) {
     if (!enabled.load(std::memory_order_relaxed)) return false;
     auto state = list->get_private_data<ListState>();
+    if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
     if (state && state->display) ++stats.display_draws;
     if (state && state->display && state->generation == generation.load(std::memory_order_relaxed)) replay(list, *state, {true, count, instances, first, first_instance, vertex});
@@ -1296,6 +1378,10 @@ void on_present(api::effect_runtime* runtime) {
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
     if (chord && runtime->is_key_pressed(VK_F10)) glass::set_jitter_positive(!jitter_positive);
     if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
+    if (chord && runtime->is_key_pressed(VK_F12)) {
+        screen_probe_until = present_count.load() + 600;
+        log("screen_probe started: looking for draws that read cockpit-screen-like textures with other shaders");
+    }
     static uint64_t next = 0;
     const auto now = GetTickCount64();
     if (now < next) return;
