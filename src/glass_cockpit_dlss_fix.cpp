@@ -19,7 +19,9 @@
 #include <reshade.hpp>
 #include <MinHook.h>
 #include "ngx_interface.hpp"
+#include "ffx_interface.hpp"
 #include <wrl/client.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -60,12 +62,16 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
     for (size_t i = 0; i < size; ++i) hash = (hash ^ data[i]) * 1099511628211ULL;
     return size ? hash : 0;
 }
-constexpr unsigned slot_count = 16, ring_size = 8, descriptors_per_frame = 23;
+// Per frame: map, scene colour, one SRV per display slot, then output, tiles, params, map UAV and residual UAVs.
+constexpr unsigned slot_count = 32, ring_size = 8, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 5;
 std::filesystem::path addon_directory;
 ID3D12Device* main_device = nullptr;
 uint64_t init_tick = 0;
 
 std::atomic<bool> enabled{true}, jitter_positive{true}, tint{false};
+// Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like (softest).
+constexpr int max_smoothing = 50, default_smoothing = 35;
+std::atomic<int> smoothing_percent{default_smoothing};
 // Bumped when the overlay is switched on: lists recorded while it was off have stale binding state.
 std::atomic<uint32_t> generation{1};
 FILE* logfile = nullptr;
@@ -83,7 +89,8 @@ constexpr const char* overlay_version = GLASS_VERSION_STRING;
 
 // Shown in the ReShade status panel.
 std::mutex info_mutex;
-std::string gpu_name, gpu_driver, dlss_version;
+std::string gpu_name, gpu_driver, dlss_version, fsr_version;
+std::atomic<const char*> last_upscaler{"DLSS"};
 std::atomic<bool> gpu_known{false}, gpu_nvidia{false};
 std::atomic<unsigned> last_render_w{0}, last_render_h{0}, last_out_w{0}, last_out_h{0};
 std::atomic<uint64_t> last_composite_present{0};
@@ -103,7 +110,7 @@ void note(std::atomic<uint64_t>& counter, const char* reason) {
 
 struct Stats {
     std::atomic<uint64_t> replays{0}, variant_pending{0}, unknown_texture{0}, unsupported_draw{0},
-        composites{0}, composite_skipped{0}, evaluations{0}, display_draws{0}, display_pipelines{0};
+        composites{0}, composite_skipped{0}, evaluations{0}, fsr_dispatches{0}, display_draws{0}, display_pipelines{0};
 } stats;
 
 std::string file_version(const wchar_t* path) {
@@ -169,6 +176,8 @@ const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shader
 #define SLOT(n) {map_ps_##n, sizeof(map_ps_##n)},
     SLOT(0) SLOT(1) SLOT(2) SLOT(3) SLOT(4) SLOT(5) SLOT(6) SLOT(7)
     SLOT(8) SLOT(9) SLOT(10) SLOT(11) SLOT(12) SLOT(13) SLOT(14) SLOT(15)
+    SLOT(16) SLOT(17) SLOT(18) SLOT(19) SLOT(20) SLOT(21) SLOT(22) SLOT(23)
+    SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
 #undef SLOT
 }};
 
@@ -202,9 +211,9 @@ ID3D12PipelineState* variant(DisplayPipeline* pipeline, unsigned slot) {
 }
 
 void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D12PipelineState* pso) noexcept try {
-    if (!desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode ||
-        shader_hash(desc.PS.pShaderBytecode, desc.PS.BytecodeLength) != display_ps ||
-        shader_hash(desc.VS.pShaderBytecode, desc.VS.BytecodeLength) != display_vs) return;
+    if (!desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode) return;
+    const auto ps = shader_hash(desc.PS.pShaderBytecode, desc.PS.BytecodeLength), vs = shader_hash(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
+    if (ps != display_ps || vs != display_vs) return;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC probe{};
     if (!glass::clone_pipeline(desc, {map_shaders[0].first, map_shaders[0].second}, probe)) {
         log("pipeline_unsupported pso=%p", pso); return;
@@ -388,6 +397,7 @@ void uav_barrier(ID3D12GraphicsCommandList* list) {
 }
 
 void install_ngx();
+void install_ffx();
 
 // ---------------------------------------------------------------------------------------------------------------
 // ReShade events.
@@ -407,7 +417,7 @@ void on_init_device(api::device* device) {
         log("gpu name=\"%ls\" vendor=0x%04x device=0x%04x vram_mb=%llu driver=%u.%u.%u.%u", adapter_desc.Description, adapter_desc.VendorId,
             adapter_desc.DeviceId, uint64_t(adapter_desc.DedicatedVideoMemory >> 20),
             known ? HIWORD(driver.HighPart) : 0, known ? LOWORD(driver.HighPart) : 0, known ? HIWORD(driver.LowPart) : 0, known ? LOWORD(driver.LowPart) : 0);
-        if (adapter_desc.VendorId != 0x10de) log("WARNING not an NVIDIA GPU: DLSS (and this fix) needs an NVIDIA RTX card");
+        if (adapter_desc.VendorId != 0x10de) log("note not an NVIDIA GPU: DLSS is unavailable, select FSR in the sim's graphics settings");
         {
             std::lock_guard lock(info_mutex);
             gpu_name = utf8(adapter_desc.Description);
@@ -435,6 +445,7 @@ void on_init_device(api::device* device) {
         hooked &= hook((*reinterpret_cast<void***>(device2.Get()))[pipeline_stream_slot()], reinterpret_cast<void*>(&stream_hook), original_stream);
     log("device native=%p pso_hooks=%d descriptor_size=%u", state->native, hooked, descriptor_size);
     install_ngx();
+    install_ffx();
 }
 void on_destroy_device(api::device* device) {
     if (device->get_private_data<DeviceState>()) device->destroy_private_data<DeviceState>();
@@ -469,15 +480,21 @@ void on_init_view(api::device* device, api::resource resource, api::resource_usa
     auto state = device->get_private_data<DeviceState>();
     if (!state || !state->scratch || descriptor_size > 32) return;
     const auto r = device->get_resource_desc(resource);
-    // Fenix display textures are mip-mapped render targets (PFD: 768x768, 5 mips, RGBA8).
-    if (r.type != api::resource_type::texture_2d || (r.usage & api::resource_usage::render_target) == api::resource_usage{} ||
-        r.texture.samples != 1 || r.texture.depth_or_layers != 1 || r.texture.levels < 2 || r.texture.width < 128 || r.texture.height < 128 ||
-        r.texture.width > 2048 || r.texture.height > 2048 || !rgba8(r.texture.format)) return;
+    // Cockpit screens are plain single-sample 2D textures.
+    if (r.type != api::resource_type::texture_2d || r.texture.samples != 1 || r.texture.depth_or_layers != 1 ||
+        r.texture.width < 64 || r.texture.height < 64) return;
+    // Only RGBA8 colour textures the GPU writes (render target or UAV), the kind cockpit screens are. Recreating views
+    // of other textures (depth/stencil planes, video, streamed material textures) at sim startup removed the device.
+    const bool written = (r.usage & (api::resource_usage::render_target | api::resource_usage::unordered_access)) != api::resource_usage{};
+    if (!written || !rgba8(r.texture.format) || (r.usage & api::resource_usage::depth_stencil) != api::resource_usage{}) return;
     // Recreate exactly the view the game made (a null desc stays null), so the call is valid by construction.
     const bool default_view = desc.type == api::resource_view_type::unknown;
     auto native = reinterpret_cast<ID3D12Resource*>(resource.handle);
-    const auto format = DXGI_FORMAT(default_view ? r.texture.format : desc.format);
-    if (format == DXGI_FORMAT_R8G8B8A8_TYPELESS || format == DXGI_FORMAT_B8G8R8A8_TYPELESS || format == DXGI_FORMAT_UNKNOWN) return;
+    const auto view_format = default_view ? r.texture.format : desc.format;
+    if (view_format == api::format::unknown ||
+        (view_format == api::format_to_typeless(view_format) && view_format != api::format_to_default_typed(view_format))) return;
+    const auto format = DXGI_FORMAT(view_format);
+    // Any size: Fenix PFD 768x768; the A220 draws its main screens side by side into one 7410x1110 texture.
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     if (!default_view) {
         const uint32_t first = desc.texture.first_level, count = desc.texture.level_count;
@@ -489,7 +506,7 @@ void on_init_view(api::device* device, api::resource resource, api::resource_usa
     std::unique_lock lock(textures_mutex);
     state->native->CreateShaderResourceView(native, default_view ? nullptr : &srv, slot);
     Signature s{};
-    if (read_bytes(reinterpret_cast<const void*>(slot.ptr), s.bytes.data(), descriptor_size) && signatures.size() < 4096) {
+    if (read_bytes(reinterpret_cast<const void*>(slot.ptr), s.bytes.data(), descriptor_size) && signatures.size() < 16384) {
         signatures[s] = {native, format};
         static std::atomic<int> logged{0};
         if (logged++ < 40) log("texture_candidate resource=%p w=%llu h=%u mips=%u format=%u default_view=%d", native, r.texture.width, r.texture.height,
@@ -633,9 +650,9 @@ bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances
 // Composite after DLSS.
 bool create_composite(DeviceState& d) {
     D3D12_DESCRIPTOR_RANGE ranges[3]{
-        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 18, 0, 0, 0},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, 18},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 5, 0, 22}}; // u4 is the root UAV (fit sums)
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, uav_base, 0, 0, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, uav_base},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 5, 0, uav_base + 4}}; // u4 is the root UAV (fit sums)
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = {0, 0, 12};
@@ -673,18 +690,21 @@ ID3D12Resource* ngx_resource(const NVSDK_NGX_Parameter& params, const char* name
     return params.Get(name, &pointer) == NVSDK_NGX_Result_Success ? static_cast<ID3D12Resource*>(pointer) : nullptr;
 }
 
-void composite(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Parameter* params) noexcept try {
+// What the upscaler (DLSS or FSR) was given and wrote, and the states it left its colour input and output in.
+struct Upscale {
+    const char* name;
+    ID3D12Resource* colour = nullptr;
+    ID3D12Resource* output = nullptr;
+    unsigned render_w = 0, render_h = 0;
+    float jitter_x = 0, jitter_y = 0;
+    D3D12_RESOURCE_STATES colour_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+};
+void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept;
+
+DXGI_FORMAT typed(DXGI_FORMAT format) { return DXGI_FORMAT(api::format_to_default_typed(api::format(format))); }
+
+void composite_dlss(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Parameter* params) noexcept try {
     if (!supplied || !params || !enabled.load(std::memory_order_relaxed)) return;
-    api::command_list* list = nullptr; UINT size = sizeof(list);
-    if (FAILED(supplied->GetPrivateData(__uuidof(ListState), &size, &list)) || size != sizeof(list) || !list) {
-        note(stats.composite_skipped, "dlss_command_list_unknown (DLSS ran on a command list ReShade did not report)"); return;
-    }
-    auto state = list->get_private_data<ListState>();
-    if (!state) return;
-    auto& d = *state->device;
-    if (reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native())->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
-        note(stats.composite_skipped, "ngx_list_not_direct"); return;
-    }
     unsigned render_w = 0, render_h = 0, base[6]{};
     float jitter_x = 0, jitter_y = 0;
     if (params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &render_w) != NVSDK_NGX_Result_Success ||
@@ -707,6 +727,50 @@ void composite(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Parameter* p
         LOG_ONCE("milestone first DLSS frame render=%ux%u output=%llux%u output_format=%u colour_format=%u jitter=%g,%g",
             render_w, render_h, o.Width, o.Height, unsigned(o.Format), unsigned(c.Format), jitter_x, jitter_y);
     }
+    Upscale u{"DLSS", colour, output, render_w, render_h, jitter_x, jitter_y};
+    composite(supplied, u);
+} catch (...) { ++stats.composite_skipped; }
+
+D3D12_RESOURCE_STATES d3d12_state(uint32_t ffx) {
+    D3D12_RESOURCE_STATES s = D3D12_RESOURCE_STATE_COMMON;
+    if (ffx & FFX_API_RESOURCE_STATE_UNORDERED_ACCESS) s |= D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (ffx & FFX_API_RESOURCE_STATE_COMPUTE_READ) s |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (ffx & FFX_API_RESOURCE_STATE_PIXEL_READ) s |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (ffx & FFX_API_RESOURCE_STATE_COPY_SRC) s |= D3D12_RESOURCE_STATE_COPY_SOURCE;
+    if (ffx & FFX_API_RESOURCE_STATE_COPY_DEST) s |= D3D12_RESOURCE_STATE_COPY_DEST;
+    if (ffx & FFX_API_RESOURCE_STATE_RENDER_TARGET) s |= D3D12_RESOURCE_STATE_RENDER_TARGET;
+    return s;
+}
+
+void composite_fsr(const ffxDispatchDescUpscale& desc) noexcept try {
+    if (!desc.commandList || !enabled.load(std::memory_order_relaxed)) return;
+    Upscale u{"FSR", static_cast<ID3D12Resource*>(desc.color.resource), static_cast<ID3D12Resource*>(desc.output.resource),
+        desc.renderSize.width, desc.renderSize.height, desc.jitterOffset.x, desc.jitterOffset.y,
+        d3d12_state(desc.color.state), d3d12_state(desc.output.state)};
+    if (!u.colour || !u.output) { note(stats.composite_skipped, "fsr_inputs_missing"); return; }
+    {
+        const auto o = u.output->GetDesc(), c = u.colour->GetDesc();
+        LOG_ONCE("milestone first FSR frame render=%ux%u output=%llux%u output_format=%u colour_format=%u jitter=%g,%g colour_state=0x%x output_state=0x%x",
+            u.render_w, u.render_h, o.Width, o.Height, unsigned(o.Format), unsigned(c.Format), u.jitter_x, u.jitter_y, desc.color.state, desc.output.state);
+    }
+    composite(static_cast<ID3D12GraphicsCommandList*>(desc.commandList), u);
+} catch (...) { ++stats.composite_skipped; }
+
+void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept try {
+    api::command_list* list = nullptr; UINT size = sizeof(list);
+    if (FAILED(supplied->GetPrivateData(__uuidof(ListState), &size, &list)) || size != sizeof(list) || !list) {
+        note(stats.composite_skipped, "upscaler_command_list_unknown (the upscaler ran on a command list ReShade did not report)"); return;
+    }
+    auto state = list->get_private_data<ListState>();
+    if (!state) return;
+    auto& d = *state->device;
+    if (reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native())->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        note(stats.composite_skipped, "upscaler_list_not_direct"); return;
+    }
+    const unsigned render_w = u.render_w, render_h = u.render_h;
+    const float jitter_x = u.jitter_x, jitter_y = u.jitter_y;
+    ID3D12Resource* colour = u.colour;
+    ID3D12Resource* output = u.output;
     Map* map = nullptr;
     {
         std::lock_guard lock(d.maps_mutex);
@@ -716,28 +780,30 @@ void composite(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Parameter* p
         // Normal for views without a cockpit; suspicious if screens were drawn at another size.
         std::lock_guard lock(d.maps_mutex);
         for (auto& m : d.maps) if (m->drawn) {
-            LOG_ONCE("note DLSS render size %ux%u differs from the cockpit render target %ux%u (screens drawn in another view?)", render_w, render_h, m->width, m->height);
+            LOG_ONCE("note %s render size %ux%u differs from the cockpit render target %ux%u (screens drawn in another view?)", u.name, render_w, render_h, m->width, m->height);
             break;
         }
         return;
     }
     if (!map->drawn.exchange(false)) return;
     const auto out = output->GetDesc(), in = colour->GetDesc();
-    if (out.Format != DXGI_FORMAT_R11G11B10_FLOAT || !(out.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
-        in.Width < render_w || in.Height < render_h) {
-        LOG_ONCE("WARNING unsupported DLSS output format=%u flags=0x%x (expected R11G11B10_FLOAT=26 with UAV) colour=%llux%u", unsigned(out.Format), unsigned(out.Flags), in.Width, in.Height);
-        note(stats.composite_skipped, "dlss_output_unsupported"); return;
+    // Any float or UNORM colour output the compute pass can write (DLSS in MSFS: R11G11B10_FLOAT).
+    const DXGI_FORMAT out_format = typed(out.Format), in_format = typed(in.Format);
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT out_support{out_format};
+    if (!(out.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || in.Width < render_w || in.Height < render_h ||
+        FAILED(d.native->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &out_support, sizeof(out_support))) ||
+        !(out_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) {
+        LOG_ONCE("WARNING unsupported %s output format=%u flags=0x%x (needs a UAV-writable colour format) colour=%llux%u", u.name, unsigned(out.Format), unsigned(out.Flags), in.Width, in.Height);
+        note(stats.composite_skipped, "upscaler_output_unsupported"); return;
     }
+    const bool output_readable = (out_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
     const UINT out_w = UINT(out.Width), out_h = out.Height;
 
     std::lock_guard lock(d.composite_mutex);
     if (!d.composite_ready) {
         if (d.composite_failed) return;
         d.composite_ready = create_composite(d);
-        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_R11G11B10_FLOAT};
-        d.output_readable = SUCCEEDED(d.native->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
-            (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD);
-        log("dlss_output_readable=%d (sharp glass detail from the DLSS output)", d.output_readable);
+        log("%s output format=%u readable=%d (sharp glass detail from the upscaled image)", u.name, unsigned(out_format), output_readable);
         d.composite_failed = !d.composite_ready;
         log(d.composite_ready ? "composite_init ok" : "ERROR composite_init failed (shader model 6.6 / 64-bit atomics unsupported?) - overlay disabled");
         if (!d.composite_ready) return;
@@ -750,7 +816,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Parameter* p
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{glass::map_format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     srv.Texture2D.MipLevels = 1;
     d.native->CreateShaderResourceView(map->texture.Get(), &srv, at(0));
-    srv.Format = in.Format;
+    srv.Format = in_format;
     d.native->CreateShaderResourceView(colour, &srv, at(1));
     for (unsigned i = 0; i < slot_count; ++i) {
         auto resource = slot_resources[i].load();
@@ -758,21 +824,22 @@ void composite(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Parameter* p
         srv.Texture2D.MipLevels = resource ? UINT(-1) : 1;
         d.native->CreateShaderResourceView(resource, &srv, at(2 + i));
     }
-    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{out.Format, D3D12_UAV_DIMENSION_TEXTURE2D};
-    d.native->CreateUnorderedAccessView(output, nullptr, &uav, at(18));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{out_format, D3D12_UAV_DIMENSION_TEXTURE2D};
+    d.native->CreateUnorderedAccessView(output, nullptr, &uav, at(uav_base + 0));
     uav.Format = DXGI_FORMAT_R32_UINT;
-    d.native->CreateUnorderedAccessView(map->tiles.Get(), nullptr, &uav, at(19));
+    d.native->CreateUnorderedAccessView(map->tiles.Get(), nullptr, &uav, at(uav_base + 1));
     D3D12_UNORDERED_ACCESS_VIEW_DESC structured{DXGI_FORMAT_UNKNOWN, D3D12_UAV_DIMENSION_BUFFER};
     structured.Buffer = {0, slot_count * 2, 16, 0, D3D12_BUFFER_UAV_FLAG_NONE};
-    d.native->CreateUnorderedAccessView(d.params.Get(), nullptr, &structured, at(20));
+    d.native->CreateUnorderedAccessView(d.params.Get(), nullptr, &structured, at(uav_base + 2));
     uav.Format = glass::map_format;
-    d.native->CreateUnorderedAccessView(map->texture.Get(), nullptr, &uav, at(21));
+    d.native->CreateUnorderedAccessView(map->texture.Get(), nullptr, &uav, at(uav_base + 3));
     uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    d.native->CreateUnorderedAccessView(map->residual.Get(), nullptr, &uav, at(22));
+    d.native->CreateUnorderedAccessView(map->residual.Get(), nullptr, &uav, at(uav_base + 4));
 
-    struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags, pad0, pad1; } constants{
+    struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT pad; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
-        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (d.output_readable ? 4u : 0u), 0, 0};
+        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u),
+        smoothing_percent / 50.0f, 0};
 
     api::command_list* api_list = list;
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(api_list->get_native());
@@ -782,7 +849,12 @@ void composite(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Parameter* p
     native->SetComputeRoot32BitConstants(0, 12, &constants, 0);
     native->SetComputeRootDescriptorTable(1, gpu);
     native->SetComputeRootUnorderedAccessView(2, d.sums->GetGPUVirtualAddress());
-    uav_barrier(native); // DLSS just wrote the output
+    // DLSS leaves its colour input compute-readable and the output as UAV; FSR reports the states it restores.
+    const bool colour_moved = !(u.colour_state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const bool output_moved = u.output_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (colour_moved) transition(native, colour, u.colour_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (output_moved) transition(native, output, u.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    uav_barrier(native); // the upscaler just wrote the output
     if (!d.accumulators_zeroed) {
         native->SetPipelineState(d.passes[0].Get());
         native->Dispatch(1, 1, 1);
@@ -805,9 +877,12 @@ void composite(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Parameter* p
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
     transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, map_resting);
     uav_barrier(native);
-    // The caller of NGX evaluate restores its own heaps, root signature and pipeline afterwards (NGX contract).
+    if (colour_moved) transition(native, colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, u.colour_state);
+    if (output_moved) transition(native, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, u.output_state);
+    // Callers of NGX evaluate and ffxDispatch restore their own heaps, root signature and pipeline afterwards.
     last_render_w = render_w; last_render_h = render_h; last_out_w = out_w; last_out_h = out_h;
     last_composite_present = present_count.load(std::memory_order_relaxed);
+    last_upscaler = u.name;
     if (stats.composites++ == 0) log("milestone first overlay frame drawn render=%ux%u output=%ux%u (fix is active)", render_w, render_h, out_w, out_h);
 } catch (...) { ++stats.composite_skipped; }
 
@@ -819,17 +894,44 @@ EvaluateC original_evaluate_c = nullptr;
 NVSDK_NGX_Result evaluate_hook(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, PFN_NVSDK_NGX_ProgressCallback callback) {
     const auto result = original_evaluate(list, handle, params, callback);
     ++stats.evaluations;
-    if (result == NVSDK_NGX_Result_Success) composite(list, params);
+    if (result == NVSDK_NGX_Result_Success) composite_dlss(list, params);
     else LOG_ONCE("note DLSS evaluate returned 0x%x (not success)", unsigned(result));
     return result;
 }
 NVSDK_NGX_Result evaluate_c_hook(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, PFN_NVSDK_NGX_ProgressCallback_C callback) {
     const auto result = original_evaluate_c(list, handle, params, callback);
     ++stats.evaluations;
-    if (result == NVSDK_NGX_Result_Success) composite(list, params);
+    if (result == NVSDK_NGX_Result_Success) composite_dlss(list, params);
     else LOG_ONCE("note DLSS evaluate returned 0x%x (not success)", unsigned(result));
     return result;
 }
+// FSR (FidelityFX API, amd_fidelityfx_dx12.dll next to the game): ffxDispatch with an upscale description.
+FfxDispatch original_ffx_dispatch = nullptr;
+ffxReturnCode_t ffx_dispatch_hook(ffxContext* context, const ffxApiHeader* desc) {
+    const auto result = original_ffx_dispatch(context, desc);
+    if (desc && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
+        ++stats.fsr_dispatches;
+        if (result == FFX_API_RETURN_OK) composite_fsr(*reinterpret_cast<const ffxDispatchDescUpscale*>(desc));
+        else LOG_ONCE("note FSR dispatch returned 0x%x (not success)", unsigned(result));
+    }
+    return result;
+}
+bool ffx_hooked = false;
+void install_ffx() {
+    if (ffx_hooked) return;
+    HMODULE module = GetModuleHandleW(L"amd_fidelityfx_dx12.dll");
+    if (!module) return;
+    auto dispatch = GetProcAddress(module, "ffxDispatch");
+    HMODULE pinned = nullptr;
+    if (dispatch) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(dispatch), &pinned);
+    const bool hooked = dispatch && hook(reinterpret_cast<void*>(dispatch), reinterpret_cast<void*>(&ffx_dispatch_hook), original_ffx_dispatch);
+    ffx_hooked = true;
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(module, path, MAX_PATH);
+    log("FSR runtime found: amd_fidelityfx_dx12.dll %s path=%ls hook=%d", file_version(path).c_str(), path, hooked);
+    { std::lock_guard lock(info_mutex); fsr_version = file_version(path); }
+}
+
 bool ngx_hooked = false;
 void install_ngx() {
     if (ngx_hooked) return;
@@ -853,10 +955,12 @@ std::wstring settings_path() { return (addon_directory / L"glass-cockpit-dlss-fi
 void load_settings() {
     enabled = GetPrivateProfileIntW(L"overlay", L"enabled", 1, settings_path().c_str()) != 0;
     jitter_positive = GetPrivateProfileIntW(L"overlay", L"jitter_positive", 1, settings_path().c_str()) != 0;
+    smoothing_percent = std::clamp(int(GetPrivateProfileIntW(L"overlay", L"line_smoothing", default_smoothing, settings_path().c_str())), 0, max_smoothing);
 }
 void save_settings() {
     WritePrivateProfileStringW(L"overlay", L"enabled", enabled ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"overlay", L"jitter_positive", jitter_positive ? L"1" : L"0", settings_path().c_str());
+    WritePrivateProfileStringW(L"overlay", L"line_smoothing", std::to_wstring(smoothing_percent.load()).c_str(), settings_path().c_str());
 }
 
 void on_present(api::effect_runtime* runtime) {
@@ -870,6 +974,7 @@ void on_present(api::effect_runtime* runtime) {
     if (now < next) return;
     next = now + 10000;
     install_ngx();
+    install_ffx();
     scan_modules();
     if (main_device) {
         const HRESULT removed = main_device->GetDeviceRemovedReason();
@@ -877,10 +982,9 @@ void on_present(api::effect_runtime* runtime) {
     }
     const auto minutes = (now - init_tick) / 60000.0;
     const char* found = nullptr;
-    if (gpu_known && !gpu_nvidia) found = "This GPU is not an NVIDIA card. DLSS, and this fix, need an NVIDIA RTX GPU.";
-    if (!ngx_hooked && minutes > 2) {
-        LOG_ONCE("WARNING DLSS runtime (_nvngx.dll) not loaded after 2 minutes: is DLSS selected in the sim's graphics settings?");
-        if (!found) found = "DLSS is not loaded. Select DLSS Super Resolution in the sim's graphics settings.";
+    if (!ngx_hooked && !ffx_hooked && minutes > 2) {
+        LOG_ONCE("WARNING neither DLSS (_nvngx.dll) nor FSR (amd_fidelityfx_dx12.dll) loaded after 2 minutes: is DLSS or FSR selected in the sim's graphics settings?");
+        found = "No upscaler loaded. Select DLSS or FSR in the sim's graphics settings.";
     }
     if (!stats.display_pipelines && minutes > 5) {
         LOG_ONCE("WARNING no cockpit display shader seen after 5 minutes: not in a glass cockpit yet, or a sim update changed the shader (fix needs an update)");
@@ -889,15 +993,15 @@ void on_present(api::effect_runtime* runtime) {
     static uint64_t display_since = 0;
     if (stats.display_draws && !display_since) display_since = now;
     if (display_since && now - display_since > 20000 && !found) {
-        if (!stats.evaluations) {
-            LOG_ONCE("WARNING cockpit screens are drawn but DLSS is never called: select DLSS (not TAA/FSR/DLAA-off) in the sim's graphics settings");
-            found = "Cockpit screens are drawn but DLSS is never called. Select DLSS (not TAA or FSR) in the sim's graphics settings.";
+        if (!stats.evaluations && !stats.fsr_dispatches) {
+            LOG_ONCE("WARNING cockpit screens are drawn but neither DLSS nor FSR is called: select DLSS or FSR (not TAA) in the sim's graphics settings");
+            found = "Cockpit screens are drawn but neither DLSS nor FSR is running. Select DLSS or FSR (not TAA) in the sim's graphics settings.";
         } else if (!stats.replays) {
             LOG_ONCE("WARNING cockpit screens are drawn but none could be recorded: see skip reasons above");
             found = "Cockpit screens are drawn but could not be recorded. Please report this with your log files.";
         } else if (!stats.composites && enabled) {
-            LOG_ONCE("WARNING screens recorded and DLSS running, but no overlay frame yet: see skip reasons above");
-            found = "DLSS is running and screens are recorded, but the fix could not be drawn yet. Please report this with your log files.";
+            LOG_ONCE("WARNING screens recorded and the upscaler running, but no overlay frame yet: see skip reasons above");
+            found = "The upscaler is running and screens are recorded, but the fix could not be drawn yet. Please report this with your log files.";
         }
     }
     if (stats.composites) found = nullptr;
@@ -908,8 +1012,8 @@ void on_present(api::effect_runtime* runtime) {
         stats.unsupported_draw.load(), uint64_t(enabled.load())};
     if (current != last) {
         last = current;
-        log("stats overlay=%d jitter_positive=%d dlss_calls=%llu screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu shader_pending=%llu unknown_texture=%llu unsupported=%llu",
-            enabled.load(), jitter_positive.load(), stats.evaluations.load(), stats.display_draws.load(), stats.replays.load(), stats.composites.load(),
+        log("stats overlay=%d jitter_positive=%d dlss_calls=%llu fsr_calls=%llu screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu shader_pending=%llu unknown_texture=%llu unsupported=%llu",
+            enabled.load(), jitter_positive.load(), stats.evaluations.load(), stats.fsr_dispatches.load(), stats.display_draws.load(), stats.replays.load(), stats.composites.load(),
             stats.composite_skipped.load(), stats.variant_pending.load(), stats.unknown_texture.load(), stats.unsupported_draw.load());
     }
 }
@@ -920,11 +1024,11 @@ Status status() {
     Status s;
     {
         std::lock_guard lock(info_mutex);
-        s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version;
+        s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
-    s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.jitter_positive = jitter_positive;
-    s.dlss_calls = stats.evaluations; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
+    s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
+    s.enabled = enabled; s.tint = tint; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent;
+    s.dlss_calls = stats.evaluations; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
     s.active = s.enabled && s.overlay_frames && now <= last_composite_present + 30;
@@ -940,6 +1044,7 @@ void set_enabled(bool on) {
     enabled = on; save_settings(); log("setting overlay=%d", int(on));
 }
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
+void set_line_smoothing(int percent) { smoothing_percent = std::clamp(percent, 0, max_smoothing); save_settings(); log("setting line_smoothing=%d", smoothing_percent.load()); }
 void set_jitter_positive(bool on) { jitter_positive = on; save_settings(); log("setting jitter_positive=%d", int(on)); }
 }
 
@@ -994,7 +1099,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     log("Glass Cockpit DLSS Fix %s (built " __DATE__ " " __TIME__ ")", overlay_version);
     log("windows %lu.%lu.%lu  game=%ls", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, executable);
     log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
-    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d", module, fixture, enabled.load(), jitter_positive.load());
+    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d", module, fixture, enabled.load(), jitter_positive.load(), smoothing_percent.load());
     log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F10 flip jitter direction, Ctrl+Shift+F11 green tint");
     scan_modules();
     std::thread(worker).detach();
@@ -1005,6 +1110,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     return true;
 }
 extern "C" __declspec(dllexport) void GlassFixJitterPositive(bool positive) { jitter_positive = positive; }
+extern "C" __declspec(dllexport) void GlassFixLineSmoothing(int percent) { smoothing_percent = percent; }
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE) {
     enabled = false;
     glass::uninit_status_panel();

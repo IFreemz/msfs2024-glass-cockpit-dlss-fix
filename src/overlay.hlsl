@@ -15,13 +15,15 @@ cbuffer Constants : register(b0)
     float2 map_per_output;   // render pixels per output pixel
     float2 jitter;           // offset added to map coordinates to undo this frame's camera jitter
     float smoothing;         // weight of the new fit per frame
-    uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load)
-    uint2 padding;
+    uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
+                             // bit 3: smooth lines
+    float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
+    uint padding;
 };
 
 Texture2D<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
 Texture2D<float4> scene : register(t1);     // DLSS input colour (render resolution, pre-exposed linear)
-Texture2D<float4> displays[16] : register(t2);
+Texture2D<float4> displays[32] : register(t2);
 RWTexture2D<float4> output : register(u0);  // DLSS output, R11G11B10_FLOAT
 RWTexture2D<uint> tiles : register(u1);     // per 8x8 map tile: display slot + 1 this frame (0 = none)
 RWStructuredBuffer<float4> params : register(u2); // per slot: [2s] = a.rgb, valid; [2s+1] = b.rgb, samples
@@ -30,7 +32,7 @@ RWByteAddressBuffer sums : register(u4);    // per slot 13 x uint64 fixed point
 RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * display, w = slot + 1 (0 = none)
 SamplerState display_sampler : register(s0);
 
-static const uint slot_count = 16;
+static const uint slot_count = 32;
 static const uint terms = 13;
 static const float fixed_scale = 16777216.0;
 
@@ -48,6 +50,24 @@ float3 sample_display(uint slot, float2 uv, float2 dx, float2 dy)
     [unroll] for (uint i = 0; i < 4; ++i)
         sum += displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv + offsets[i].x * dx + offsets[i].y * dy, dx * 0.5, dy * 0.5).rgb;
     return srgb_to_linear(saturate(sum * 0.25));
+}
+
+// Smooth lines: what DLSS converges to on a still screen, without its history. DLSS averages each pixel over the area of
+// one jittered render pixel across frames; this averages a 4x4 grid over that area (at least 1.25 output pixels) in one
+// frame, so stair steps on thin slanted lines in the screen texture are smoothed instead of shown texel-sharp.
+float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    float2 width = max(1.0 / map_per_output, 1.25) * line_width;
+    float2 fx = dx * width.x, fy = dy * width.y;
+    float3 sum = 0;
+    [unroll] for (uint i = 0; i < 16; ++i)
+    {
+        // Rotated 4x4 grid: no two samples share a row or column, so near-horizontal and near-vertical lines get
+        // 16 distinct coverage levels.
+        float2 o = (float2(i % 4, i / 4) + float2(((i / 4) * 0.25 + 0.125), ((i % 4) * 0.25 + 0.125))) / 4.0 - 0.5;
+        sum += displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv + o.x * fx + o.y * fy, fx * 0.25, fy * 0.25).rgb;
+    }
+    return srgb_to_linear(saturate(sum / 16.0));
 }
 
 uint map_slot(float4 m)
@@ -185,7 +205,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     float2 uv = lerp(lerp(a.xy, b.xy, f.x), lerp(c.xy, d.xy, f.x), f.y);
     float2 dx = lerp(b.xy - a.xy, d.xy - c.xy, f.y) * map_per_output.x;
     float2 dy = lerp(c.xy - a.xy, d.xy - b.xy, f.x) * map_per_output.y;
-    float3 content = sample_display(slot, uv, dx, dy) * gain.rgb;
+    float3 content = ((flags & 8) ? sample_display_smooth(slot, uv, dx, dy) : sample_display(slot, uv, dx, dy)) * gain.rgb;
 
     // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder: bilinear value at this pixel and its
     // spread over the 3x3 render pixels around it (same display only).

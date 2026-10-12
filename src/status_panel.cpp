@@ -35,18 +35,19 @@ std::string format(const char* text, ...) {
 }
 
 std::string summary(const glass::Status& s) {
-    if (s.active) return format("Working: fixing %u screen%s (DLSS %ux%u -> %ux%u)", s.screens, s.screens == 1 ? "" : "s", s.render_w, s.render_h, s.out_w, s.out_h);
+    if (s.active) return format("Working: fixing %u screen%s (%s %ux%u -> %ux%u)", s.screens, s.screens == 1 ? "" : "s", s.upscaler, s.render_w, s.render_h, s.out_w, s.out_h);
     if (!s.enabled) return "Off (Ctrl+Shift+F9 to turn on)";
     if (s.problem) return std::string("Not working: ") + s.problem;
-    return "Waiting for a glass cockpit with DLSS selected";
+    return "Waiting for a glass cockpit with DLSS or FSR selected";
 }
 
 std::string report(const glass::Status& s) {
-    return format("Glass Cockpit DLSS Fix %s\nstatus: %s\ngpu: %s (driver %s)\ndlss: %s, calls=%llu\nshader_found=%d screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu\n"
-        "enabled=%d jitter_positive=%d tint=%d\n",
+    return format("Glass Cockpit DLSS Fix %s\nstatus: %s\ngpu: %s (driver %s)\ndlss: %s, calls=%llu\nfsr: %s, calls=%llu\nshader_found=%d screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu\n"
+        "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d\n",
         GLASS_VERSION_STRING, summary(s).c_str(), s.gpu.empty() ? "unknown" : s.gpu.c_str(), s.driver.c_str(),
-        s.dlss_loaded ? (s.dlss_version.empty() ? "loaded" : s.dlss_version.c_str()) : "not loaded", s.dlss_calls, s.shader_found, s.screen_draws,
-        s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint);
+        s.dlss_loaded ? (s.dlss_version.empty() ? "loaded" : s.dlss_version.c_str()) : "not loaded", s.dlss_calls,
+        s.fsr_loaded ? (s.fsr_version.empty() ? "loaded" : s.fsr_version.c_str()) : "not loaded", s.fsr_calls, s.shader_found, s.screen_draws,
+        s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing);
 }
 
 void draw(reshade::api::effect_runtime*) {
@@ -60,20 +61,28 @@ void draw(reshade::api::effect_runtime*) {
 
     ImGui::SeparatorText("Settings");
     bool enabled = s.enabled, tint = s.tint, flipped = !s.jitter_positive;
+    int smoothing = s.line_smoothing;
     if (ImGui::Checkbox("Fix enabled  (Ctrl+Shift+F9)", &enabled)) glass::set_enabled(enabled);
+    if (ImGui::SliderInt("Line smoothing", &smoothing, 0, 50, smoothing ? "%d%%" : "off (sharpest)", ImGuiSliderFlags_AlwaysClamp))
+        glass::set_line_smoothing(smoothing);
+    ImGui::SetItemTooltip("Smooths stair steps on thin slanted lines, like DLSS did. 0 = sharpest, 35 = default, 50 = softest.\n"
+        "Ctrl+click to type a value.");
     if (ImGui::Checkbox("Green tint on fixed screens  (Ctrl+Shift+F11)", &tint)) glass::set_tint(tint);
     if (ImGui::Checkbox("Flip jitter direction  (Ctrl+Shift+F10)", &flipped)) glass::set_jitter_positive(!flipped);
     ImGui::SetItemTooltip("Only needed if the screen text shimmers while the camera is still.");
 
     ImGui::SeparatorText("Checks");
     if (ImGui::BeginTable("checks", 3, ImGuiTableFlags_SizingFixedFit)) {
-        check_row(!s.gpu_known ? Check::waiting : s.nvidia ? Check::ok : Check::failed, "NVIDIA GPU",
-            s.gpu_known ? s.gpu + (s.driver.empty() ? "" : "  (driver " + s.driver + ")") : "");
-        check_row(s.dlss_calls ? Check::ok : Check::waiting, "DLSS running",
-            s.dlss_calls ? "DLSS " + s.dlss_version : s.dlss_loaded ? "loaded, not called yet (select DLSS in the sim's graphics settings)" : "not loaded yet");
+        check_row(s.gpu_known ? Check::ok : Check::waiting, "GPU",
+            s.gpu_known ? s.gpu + (s.driver.empty() ? "" : "  (driver " + s.driver + ")") + (s.nvidia ? "" : "  - FSR only") : "");
+        std::string upscaler;
+        if (s.dlss_calls) upscaler = "DLSS " + s.dlss_version;
+        if (s.fsr_calls) upscaler += (upscaler.empty() ? "FSR " : ", FSR ") + s.fsr_version;
+        check_row(s.dlss_calls || s.fsr_calls ? Check::ok : Check::waiting, "Upscaler running",
+            !upscaler.empty() ? upscaler : s.dlss_loaded || s.fsr_loaded ? "loaded, not called yet (select DLSS or FSR in the sim's graphics settings)" : "not loaded yet");
         check_row(s.shader_found ? Check::ok : Check::waiting, "Cockpit display shader", s.shader_found ? "found" : "not seen yet (load a flight with a glass cockpit)");
         check_row(s.recorded ? Check::ok : Check::waiting, "Cockpit screens", s.recorded ? format("%u visible now", s.screens) : "none recorded yet");
-        check_row(s.active ? Check::ok : Check::waiting, "Fix drawn after DLSS",
+        check_row(s.active ? Check::ok : Check::waiting, "Fix drawn after upscaling",
             s.overlay_frames ? format("%llu frames", s.overlay_frames) : "not yet");
         ImGui::EndTable();
     }

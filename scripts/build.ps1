@@ -27,9 +27,9 @@ Push-Location $build
 try {
     & $compiler /nologo /c /TC /W3 /MD /O2 (Join-Path $minhook 'src\buffer.c') (Join-Path $minhook 'src\hook.c') (Join-Path $minhook 'src\trampoline.c') (Join-Path $minhook 'src\hde\hde64.c')
     if ($LASTEXITCODE) { throw 'MinHook compilation failed' }
-    # Shaders -> one generated header (16 display-slot variants of the map shader + 5 compute passes).
+    # Shaders -> one generated header (32 display-slot variants of the map shader + 5 compute passes).
     $headers = @()
-    foreach ($slot in 0..15) {
+    foreach ($slot in 0..31) {
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -WX -O3 -Fh "map_ps_$slot.h" -Vn "map_ps_$slot" (Join-Path $root 'src\display_map.hlsl')
         if ($LASTEXITCODE) { throw "Map shader $slot failed" }
         $headers += "map_ps_$slot.h"
@@ -58,6 +58,8 @@ try {
         if ($LASTEXITCODE) { throw 'Reference shader failed' }
         & $compiler /nologo /W4 /WX /MD /O2 /LD (Join-Path $root 'tests\fake_nvngx.cpp') /link /OPT:NOICF /DEF:"$root\tests\fake_nvngx.def" /OUT:"$testHost\_nvngx.dll"
         if ($LASTEXITCODE) { throw 'Fake NGX compilation failed' }
+        & $compiler /nologo /W4 /WX /MD /O2 /LD (Join-Path $root 'tests\fake_ffx.cpp') /link /OUT:"$testHost\amd_fidelityfx_dx12.dll"
+        if ($LASTEXITCODE) { throw 'Fake FidelityFX compilation failed' }
         & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /Fe:"$testHost\FlightSimulator2024.exe" (Join-Path $root 'tests\fixture.cpp') /link d3d12.lib dxgi.lib ole32.lib windowscodecs.lib
         if ($LASTEXITCODE) { throw 'Test host compilation failed' }
         Copy-Item -LiteralPath 'glass-cockpit-dlss-fix.addon64' -Destination $testHost -Force

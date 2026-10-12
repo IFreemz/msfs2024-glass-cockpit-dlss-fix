@@ -2,7 +2,8 @@
 // A perspective display quad (captured cockpit VS) samples a detailed 768x768 texture at 1280x720 with per-frame
 // jitter; scene colour = gain * linear(texture) + offset. A fake _nvngx.dll "evaluate" leaves the 1920x1080 output
 // magenta, so after the hook every display pixel must come from the overlay. The result is compared with an
-// unjittered 1920x1080 reference render of the same quad.
+// unjittered 1920x1080 reference render of the same quad. With --fsr the frames go through a fake
+// amd_fidelityfx_dx12.dll ffxDispatch instead, with the colour input left in a pixel-shader-only state.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -11,6 +12,7 @@
 #include <wrl/client.h>
 #include <wincodec.h>
 #include "../src/ngx_interface.hpp"
+#include "../src/ffx_interface.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -196,10 +198,19 @@ static std::array<uint8_t, 4> pattern(UINT x, UINT y) {
     return {0, 0, 0, 255};
 }
 
-int main(int, char** argv) {
+int main(int argc, char** argv) {
     try {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
+        const bool fsr = argc > 1 && !std::strcmp(argv[1], "--fsr");
+        FfxDispatch ffx_dispatch = nullptr;
+        if (fsr) {
+            const auto ffx = LoadLibraryW((here / L"amd_fidelityfx_dx12.dll").c_str());
+            require(ffx != nullptr, "fake amd_fidelityfx_dx12.dll missing");
+            ffx_dispatch = reinterpret_cast<FfxDispatch>(GetProcAddress(ffx, "ffxDispatch"));
+            require(ffx_dispatch != nullptr, "ffxDispatch missing");
+            std::printf("upscaler: FSR (fake ffxDispatch)\n");
+        }
         if (!LoadLibraryW((here / L"ReShade64.asi").c_str())) { std::printf("LoadLibrary(ReShade64.asi) failed, error %lu\n", GetLastError()); return 2; }
         const auto vs = load(here / "fixture_vs.cso");
         const auto ps = load(here / "fixture_ps.cso"), reference_ps = load(here / "reference_ps.cso");
@@ -212,6 +223,10 @@ int main(int, char** argv) {
         const auto set_jitter = reinterpret_cast<void (*)(bool)>(GetProcAddress(addon, "GlassFixJitterPositive"));
         const auto evaluate = reinterpret_cast<NgxEvaluate>(GetProcAddress(GetModuleHandleW(L"_nvngx.dll"), "NVSDK_NGX_D3D12_EvaluateFeature"));
         require(set_jitter && evaluate, "exports missing");
+        // The reference is the game's own sharp sampling; smooth lines deliberately differ from it.
+        const auto set_smooth = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixLineSmoothing"));
+        require(set_smooth != nullptr, "exports missing");
+        set_smooth(0);
 
         ComPtr<ID3D12CommandQueue> queue; D3D12_COMMAND_QUEUE_DESC qd{};
         check(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)));
@@ -359,6 +374,22 @@ int main(int, char** argv) {
         auto cpu1 = cpu0; cpu1.ptr += inc;
         device->CreateShaderResourceView(alpha.Get(), nullptr, cpu0);
         device->CreateShaderResourceView(display.Get(), nullptr, cpu1);
+        // Views the sim creates that the add-on must leave alone: a depth-stencil texture read as depth (plane 0)
+        // and as stencil (plane 1), plus a plain sampled RGBA8 texture and an HDR UAV texture.
+        D3D12_CLEAR_VALUE stencil_clear{DXGI_FORMAT_D24_UNORM_S8_UINT}; stencil_clear.DepthStencil.Depth = 1;
+        auto depth_stencil = texture(device.Get(), 256, 256, 1, DXGI_FORMAT_R24G8_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &stencil_clear);
+        auto sampled = texture(device.Get(), 512, 512, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+        auto hdr = texture(device.Get(), 256, 256, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        {
+            auto spare = cpu0; spare.ptr += 2 * inc;
+            D3D12_SHADER_RESOURCE_VIEW_DESC v{DXGI_FORMAT_R24_UNORM_X8_TYPELESS, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+            v.Texture2D.MipLevels = 1;
+            device->CreateShaderResourceView(depth_stencil.Get(), &v, spare);
+            v.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT; v.Texture2D.PlaneSlice = 1;
+            device->CreateShaderResourceView(depth_stencil.Get(), &v, spare);
+            device->CreateShaderResourceView(sampled.Get(), nullptr, spare);
+            device->CreateShaderResourceView(hdr.Get(), nullptr, spare);
+        }
         auto gpu_slot = gpu0; gpu_slot.ptr += 4 * inc; // table at slot 4
         device->CopyDescriptorsSimple(2, gpu_slot, cpu0, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto table = gpu_heap->GetGPUDescriptorHandleForHeapStart(); table.ptr += 4 * inc;
@@ -367,14 +398,14 @@ int main(int, char** argv) {
         D3D12_CLEAR_VALUE black{DXGI_FORMAT_R11G11B10_FLOAT, {}};
         auto scene = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, &black);
         D3D12_CLEAR_VALUE depth_clear{DXGI_FORMAT_D32_FLOAT}; depth_clear.DepthStencil.Depth = 1;
-        auto depth = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear);
+        auto depth = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &stencil_clear);
         const float magenta[4]{1, 0, 1, 1};
         D3D12_CLEAR_VALUE magenta_clear{DXGI_FORMAT_R11G11B10_FLOAT, {1, 0, 1, 1}};
         auto output = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R11G11B10_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET, &magenta_clear);
         D3D12_CLEAR_VALUE ref_clear{DXGI_FORMAT_R32G32B32A32_FLOAT, {}};
         auto reference = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, &ref_clear);
-        auto ref_depth = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear);
+        auto ref_depth = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &stencil_clear);
         ComPtr<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
         D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0}, dh{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         check(device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&rtv_heap))); check(device->CreateDescriptorHeap(&dh, IID_PPV_ARGS(&dsv_heap)));
@@ -493,7 +524,22 @@ int main(int, char** argv) {
             }
             transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             ngx.jitter_x = f.jx; ngx.jitter_y = f.jy;
-            require(evaluate(list.Get(), nullptr, &ngx, nullptr) == NVSDK_NGX_Result_Success, "evaluate failed");
+            if (fsr) {
+                transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                ffxDispatchDescUpscale desc{};
+                desc.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+                desc.commandList = list.Get();
+                desc.color = {scene.Get(), {}, FFX_API_RESOURCE_STATE_PIXEL_READ};
+                desc.output = {output.Get(), {}, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS};
+                desc.jitterOffset = {f.jx, f.jy};
+                desc.renderSize = {render_w, render_h};
+                desc.upscaleSize = {output_w, output_h};
+                desc.preExposure = 1;
+                require(ffx_dispatch(nullptr, &desc.header) == FFX_API_RETURN_OK, "ffxDispatch failed");
+                transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            } else {
+                require(evaluate(list.Get(), nullptr, &ngx, nullptr) == NVSDK_NGX_Result_Success, "evaluate failed");
+            }
             transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             copy(list.Get(), output.Get(), out_rb);
             transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
