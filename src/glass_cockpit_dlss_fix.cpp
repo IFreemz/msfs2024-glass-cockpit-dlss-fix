@@ -356,22 +356,34 @@ bool force_tracking = false; // offline test: identify textures by tracking only
 std::shared_mutex tracked_mutex;
 std::unordered_map<uintptr_t, Texture> tracked;
 std::unordered_set<uintptr_t> tracked_views; // addresses where the game created the view (the rest are copies)
+std::unordered_map<uintptr_t, uint64_t> tracked_copy_frames; // copy -> present count when it was made
+extern std::atomic<uint64_t> present_count;
 std::atomic<uintptr_t> tracked_low{UINTPTR_MAX}, tracked_high{0};
 size_t tracked_capacity = 65536; // [debug] tracking_capacity: smaller to test the table-full path quickly
 
 void track_insert(uintptr_t address, const Texture& texture, bool view = false) { // tracked_mutex held exclusively
     if (tracked.size() >= tracked_capacity) {
         // The sim copies the screen descriptors to new places every frame, so copies pile up faster than they are
-        // overwritten. Forget the copies (the next frame's copies are tracked again) and keep the views.
+        // overwritten. Forget the older copies and keep the views and the last few frames' copies (still about to be
+        // drawn with); if that is not enough, forget all copies.
         const auto before = tracked.size();
-        std::erase_if(tracked, [](const auto& p) { return !tracked_views.contains(p.first); });
+        const uint64_t now = present_count.load(std::memory_order_relaxed);
+        auto old_copy = [&](uintptr_t a, uint64_t age) {
+            if (tracked_views.contains(a)) return false;
+            const auto f = tracked_copy_frames.find(a);
+            return f == tracked_copy_frames.end() || f->second + age <= now;
+        };
+        std::erase_if(tracked, [&](const auto& p) { return old_copy(p.first, 8); });
+        if (tracked.size() >= tracked_capacity) std::erase_if(tracked, [&](const auto& p) { return old_copy(p.first, 0); });
+        std::erase_if(tracked_copy_frames, [](const auto& p) { return !tracked.contains(p.first); });
         static std::atomic<int> logged{0};
-        if (logged++ < 3) log("descriptor tracking: table full, %llu copied entries cleared (%llu views kept)", uint64_t(before - tracked.size()),
-            uint64_t(tracked.size()));
+        if (logged++ < 3) log("descriptor tracking: table full, %llu older copies cleared (%llu views and recent copies kept)",
+            uint64_t(before - tracked.size()), uint64_t(tracked.size()));
         if (tracked.size() >= tracked_capacity) return;
     }
     tracked[address] = texture;
     if (view) tracked_views.insert(address);
+    else tracked_copy_frames[address] = present_count.load(std::memory_order_relaxed);
     for (auto low = tracked_low.load(); address < low && !tracked_low.compare_exchange_weak(low, address);) {}
     for (auto high = tracked_high.load(); address > high && !tracked_high.compare_exchange_weak(high, address);) {}
 }
