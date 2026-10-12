@@ -180,7 +180,8 @@ void solve(uint3 id : SV_DispatchThreadID)
         b[c] = float(my[c] - a[c] * mx[c]);
     }
     // Fit quality: how much of the scene's variation on the screen the screen texture explains (r squared, all
-    // channels pooled). Healthy screens match closely; if the sim shows something the texture doesn't (e.g. a tablet
+    // channels pooled). Healthy screens score about 0.3 to 1 (glare on the glass lowers it), a picture the texture
+    // doesn't hold below 0.1: if the sim shows something the texture doesn't (e.g. a tablet
     // whose picture is drawn differently), redrawing the texture would show wrong colours, so that screen is left to
     // the upscaler. A screen texture with no contrast (blank, or a tablet whose picture isn't in it) has no moving
     // content to keep sharp, so it is left to the upscaler too.
@@ -188,7 +189,7 @@ void solve(uint3 id : SV_DispatchThreadID)
         ? pooled_covariance * pooled_covariance / (pooled_variance * pooled_scene_variance) : 0.0;
     float w = previous_a.w > 0 ? smoothing : 1;
     float q = previous_a.w != 0 ? lerp(previous_q.w, float(quality), smoothing) : float(quality);
-    bool keep = previous_a.w < 0 ? q > 0.6 : q > 0.4; // hysteresis: no flicker near the limit
+    bool keep = previous_a.w < 0 ? q > 0.25 : q > 0.15; // hysteresis: no flicker near the limit
     params[slot * 3] = float4(lerp(previous_a.rgb, a, w), keep ? 1 : -1); // w: valid (1), rejected (-1)
     params[slot * 3 + 1] = float4(lerp(previous_b.rgb, b, w), float(n));
     params[slot * 3 + 2] = float4(float3(mx[0], mx[1], mx[2]), q);
