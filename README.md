@@ -109,9 +109,9 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
 - **ReShade presets and effects:** work as usual.
 - **DLSS 5 / Neural Rendering add-ons:** tested alongside the RenoDX DLSS 5 add-on.
 - **OptiShade:** the OptiShade developer is building this fix into OptiShade.
-- **OptiScaler:** works when OptiScaler's upscaler is set to DLSS (reported by the community). With OptiScaler's own
-  FSR or XeSS selected it does not apply. If another mod also needs to be `dxgi.dll`, load ReShade through an ASI
-  loader or through OptiScaler's `LoadReshade` option instead.
+- **OptiScaler:** works when OptiScaler's upscaler is set to DLSS, including OptiScaler's DLSS 5 Neural Rendering. If
+  ReShade says "There were errors loading some add-ons", update to 0.7.4 or newer. If another mod also needs to be
+  `dxgi.dll`, load ReShade through an ASI loader or through OptiScaler's `LoadReshade` option instead.
 
 ## Troubleshooting
 
