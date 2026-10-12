@@ -383,6 +383,12 @@ void STDMETHODCALLTYPE copy_hook(ID3D12Device* device, UINT dest_ranges, const D
     }
 }
 
+// Diagnostics: what each 2D shader resource view's descriptor points at, so an unrecognised screen texture can be
+// described in the log (size, format, usage). Only the game's own descriptor bytes are read; no views are created.
+struct ViewInfo { uint32_t width = 0, height = 0, format = 0, usage = 0; uint16_t layers = 0, samples = 0, levels = 0; };
+std::mutex diag_mutex;
+std::unordered_map<Signature, ViewInfo, SignatureHash> diag_views;
+
 bool read_bytes(const void* source, void* destination, size_t size) {
     __try { std::memcpy(destination, source, size); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -613,6 +619,15 @@ void on_init_view(api::device* device, api::resource resource, api::resource_usa
     auto state = device->get_private_data<DeviceState>();
     if (!state || !state->scratch || descriptor_size > 32) return;
     const auto r = device->get_resource_desc(resource);
+    if (r.type == api::resource_type::texture_2d && view.handle) {
+        Signature d{};
+        if (read_bytes(reinterpret_cast<const void*>(view.handle), d.bytes.data(), descriptor_size)) {
+            std::lock_guard lock(diag_mutex);
+            if (diag_views.size() >= 65536) diag_views.clear();
+            diag_views[d] = {uint32_t(r.texture.width), r.texture.height, uint32_t(r.texture.format), uint32_t(r.usage),
+                uint16_t(r.texture.depth_or_layers), uint16_t(r.texture.samples), uint16_t(r.texture.levels)};
+        }
+    }
     // Cockpit screens are plain single-sample 2D textures.
     if (r.type != api::resource_type::texture_2d || r.texture.samples != 1 || r.texture.depth_or_layers != 1 ||
         r.texture.width < 64 || r.texture.height < 64) return;
@@ -746,11 +761,19 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
         if (recognised) LOG_ONCE("milestone screen texture found through descriptor tracking");
     }
     if (!recognised) {
-        if (stats.unknown_texture < 3) {
+        static std::mutex logged_mutex;
+        static std::unordered_set<Signature, SignatureHash> logged; // each unrecognised texture once
+        bool first;
+        { std::lock_guard lock(logged_mutex); first = logged.size() < 24 && logged.insert(s).second; }
+        if (first) {
             size_t tracked_count;
             { std::shared_lock lock(tracked_mutex); tracked_count = tracked.size(); }
-            log("unrecognised_descriptor heap=%p offset=%u bytes=%s known=%llu tracked=%llu", native_heap, offset, hex(s).c_str(),
-                uint64_t(signatures.size()), uint64_t(tracked_count));
+            ViewInfo info{};
+            bool described = false;
+            { std::lock_guard lock(diag_mutex); if (const auto d = diag_views.find(s); d != diag_views.end()) { info = d->second; described = true; } }
+            log("unrecognised_descriptor heap=%p offset=%u bytes=%s known=%llu tracked=%llu texture=%s w=%u h=%u format=%u usage=0x%x layers=%u samples=%u mips=%u",
+                native_heap, offset, hex(s).c_str(), uint64_t(signatures.size()), uint64_t(tracked_count), described ? "described" : "unknown",
+                info.width, info.height, info.format, info.usage, info.layers, info.samples, info.levels);
         }
         note(stats.unknown_texture, "texture_not_recognised"); return;
     }
