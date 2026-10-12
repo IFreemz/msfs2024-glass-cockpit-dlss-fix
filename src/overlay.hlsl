@@ -26,14 +26,14 @@ Texture2D<float4> scene : register(t1);     // DLSS input colour (render resolut
 Texture2D<float4> displays[32] : register(t2);
 RWTexture2D<float4> output : register(u0);  // DLSS output, R11G11B10_FLOAT
 RWTexture2D<uint> tiles : register(u1);     // per 8x8 map tile: display slot + 1 this frame (0 = none)
-RWStructuredBuffer<float4> params : register(u2); // per slot: [2s] = a.rgb, valid; [2s+1] = b.rgb, samples
+RWStructuredBuffer<float4> params : register(u2); // per slot: [3s] = a.rgb, valid; [3s+1] = b.rgb, samples; [3s+2] = mean screen.rgb, fit quality
 RWTexture2DArray<float4> map_rw : register(u3);
-RWByteAddressBuffer sums : register(u4);    // per slot 13 x uint64 fixed point
+RWByteAddressBuffer sums : register(u4);    // per slot 16 x uint64 fixed point
 RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * display, w = slot + 1 (0 = none)
 SamplerState display_sampler : register(s0);
 
 static const uint slot_count = 32;
-static const uint terms = 13;
+static const uint terms = 16;
 static const float fixed_scale = 16777216.0;
 
 float3 srgb_to_linear(float3 c)
@@ -78,8 +78,8 @@ uint map_slot(float4 m)
 [numthreads(64, 1, 1)]
 void zero(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x < slot_count * terms) sums.Store<uint64_t>(id.x * 8, 0);
-    if (id.x < slot_count * 2) params[id.x] = 0;
+    for (uint i = id.x; i < slot_count * terms; i += 64) sums.Store<uint64_t>(i * 8, 0);
+    for (uint j = id.x; j < slot_count * 3; j += 64) params[j] = 0;
 }
 
 groupshared uint tile_slot;
@@ -88,12 +88,12 @@ void accumulate(uint slot, float3 x, float3 y)
 {
     uint base = slot * terms * 8;
     uint count = WaveActiveCountBits(true);
-    float3 sx = WaveActiveSum(x), sy = WaveActiveSum(y), sxx = WaveActiveSum(x * x), sxy = WaveActiveSum(x * y);
+    float3 sx = WaveActiveSum(x), sy = WaveActiveSum(y), sxx = WaveActiveSum(x * x), sxy = WaveActiveSum(x * y), syy = WaveActiveSum(y * y);
     if (WaveIsFirstLane())
     {
         sums.InterlockedAdd64(base, uint64_t(count));
-        float values[12] = { sx.r, sx.g, sx.b, sy.r, sy.g, sy.b, sxx.r, sxx.g, sxx.b, sxy.r, sxy.g, sxy.b };
-        [unroll] for (uint i = 0; i < 12; ++i)
+        float values[15] = { sx.r, sx.g, sx.b, sy.r, sy.g, sy.b, sxx.r, sxx.g, sxx.b, sxy.r, sxy.g, sxy.b, syy.r / 1024, syy.g / 1024, syy.b / 1024 }; // y*y scaled: fixed point headroom
+        [unroll] for (uint i = 0; i < 15; ++i)
             sums.InterlockedAdd64(base + (i + 1) * 8, uint64_t(max(values[i], 0.0) * fixed_scale));
     }
 }
@@ -130,7 +130,7 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     GroupMemoryBarrierWithGroupSync();
 
     // Per-pixel remainder against last frame's gain (glass layer: dirt, glare, reflections, shadows).
-    float4 gain = active ? params[slot * 2] : 0;
+    float4 gain = active ? params[slot * 3] : 0;
     if (all(p < int2(map_size))) residual[p] = active && gain.w > 0 ? float4(y - gain.rgb * x, slot + 1) : 0;
     if (index == 0 && all(group.xy < (map_size + 7) / 8)) tiles[group.xy] = tile_slot < slot_count ? tile_slot + 1 : 0;
 
@@ -161,22 +161,37 @@ void solve(uint3 id : SV_DispatchThreadID)
         v[i] = i == 0 ? double(raw) : double(raw) / fixed_scale;
         sums.Store<uint64_t>(base + i * 8, 0);
     }
-    float4 previous_a = params[slot * 2], previous_b = params[slot * 2 + 1];
+    float4 previous_a = params[slot * 3], previous_b = params[slot * 3 + 1], previous_q = params[slot * 3 + 2];
     if (flags & 1) previous_a.w = 0;
     double n = v[0];
-    if (n < 64) { params[slot * 2] = previous_a; return; }
+    if (n < 64) { params[slot * 3] = previous_a; return; }
+    // Per channel: scene = gain * screen + offset (least squares).
+    double mx[3], my[3], variance[3], covariance[3], pooled_variance = 0, pooled_covariance = 0, pooled_scene_variance = 0;
+    [unroll] for (uint c = 0; c < 3; ++c)
+    {
+        mx[c] = v[1 + c] / n; my[c] = v[4 + c] / n;
+        variance[c] = v[7 + c] / n - mx[c] * mx[c]; covariance[c] = v[10 + c] / n - mx[c] * my[c];
+        pooled_variance += variance[c]; pooled_covariance += covariance[c]; pooled_scene_variance += max(v[13 + c] * 1024 / n - my[c] * my[c], 0.0);
+    }
     float3 a, b;
     [unroll] for (uint c = 0; c < 3; ++c)
     {
-        double mx = v[1 + c] / n, my = v[4 + c] / n;
-        double variance = v[7 + c] / n - mx * mx, covariance = v[10 + c] / n - mx * my;
-        double gain = variance > 1e-6 ? max(covariance / variance, 0.0) : (mx > 1e-4 ? my / mx : 0.0);
-        a[c] = float(gain);
-        b[c] = float(my - gain * mx);
+        a[c] = variance[c] > 1e-6 ? float(max(covariance[c] / variance[c], 0.0)) : (mx[c] > 1e-4 ? float(my[c] / mx[c]) : 0);
+        b[c] = float(my[c] - a[c] * mx[c]);
     }
+    // Fit quality: how much of the scene's variation on the screen the screen texture explains (r squared, all
+    // channels pooled). Healthy screens match closely; if the sim shows something the texture doesn't (e.g. a tablet
+    // whose picture is drawn differently), redrawing the texture would show wrong colours, so that screen is left to
+    // the upscaler. A screen texture with no contrast (blank, or a tablet whose picture isn't in it) has no moving
+    // content to keep sharp, so it is left to the upscaler too.
+    double quality = pooled_variance > 3e-6 && pooled_scene_variance > 1e-9 && pooled_covariance > 0
+        ? pooled_covariance * pooled_covariance / (pooled_variance * pooled_scene_variance) : 0.0;
     float w = previous_a.w > 0 ? smoothing : 1;
-    params[slot * 2] = float4(lerp(previous_a.rgb, a, w), 1);
-    params[slot * 2 + 1] = float4(lerp(previous_b.rgb, b, w), float(n));
+    float q = previous_a.w != 0 ? lerp(previous_q.w, float(quality), smoothing) : float(quality);
+    bool keep = previous_a.w < 0 ? q > 0.6 : q > 0.4; // hysteresis: no flicker near the limit
+    params[slot * 3] = float4(lerp(previous_a.rgb, a, w), keep ? 1 : -1); // w: valid (1), rejected (-1)
+    params[slot * 3 + 1] = float4(lerp(previous_b.rgb, b, w), float(n));
+    params[slot * 3 + 2] = float4(float3(mx[0], mx[1], mx[2]), q);
 }
 
 bool tap(int2 p, out float4 value)
@@ -199,7 +214,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     // Never blend across a display edge.
     if (a.w != b.w || a.w != c.w || a.w != d.w) return;
     uint slot = map_slot(a);
-    float4 gain = params[slot * 2], offset = params[slot * 2 + 1];
+    float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
     if (gain.w <= 0) return;
     float2 f = location - cell;
     float2 uv = lerp(lerp(a.xy, b.xy, f.x), lerp(c.xy, d.xy, f.x), f.y);

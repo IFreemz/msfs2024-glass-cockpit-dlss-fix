@@ -1057,10 +1057,10 @@ bool create_composite(DeviceState& d) {
     D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ring_size * descriptors_per_frame, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(d.native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&d.heap)))) return false;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slot_count * 13 * 8, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+    D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slot_count * 16 * 8, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
         D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.sums)))) return false;
-    buffer.Width = slot_count * 2 * 16;
+    buffer.Width = slot_count * 3 * 16;
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.params)))) return false;
     D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -1076,18 +1076,20 @@ void log_brightness(DeviceState& d) {
     uint64_t ready = d.readback_ready.load();
     if (now < ready || !d.readback_ready.compare_exchange_strong(ready, UINT64_MAX)) return;
     float* data = nullptr;
-    const D3D12_RANGE range{0, slot_count * 2 * 16};
+    const D3D12_RANGE range{0, slot_count * 3 * 16};
     if (FAILED(d.params_readback->Map(0, &range, reinterpret_cast<void**>(&data)))) return;
     static std::atomic<int> dumps{0};
     if (dumps++ < 60) {
         for (unsigned slot = 0; slot < slot_count; ++slot) {
-            const float* a = data + slot * 8;
+            const float* a = data + slot * 12;
             const float* b = a + 4;
+            const float* q = a + 8;
             const auto resource = slot_resources[slot].load();
-            if (a[3] <= 0 || !resource) continue;
+            if (a[3] == 0 || !resource) continue;
             const auto desc = resource->GetDesc();
-            log("brightness slot=%u screen=%llux%u gain=%.3f,%.3f,%.3f offset=%.4f,%.4f,%.4f samples=%.0f", slot, uint64_t(desc.Width), desc.Height,
-                a[0], a[1], a[2], b[0], b[1], b[2], b[3]);
+            log("brightness slot=%u screen=%llux%u gain=%.3f,%.3f,%.3f offset=%.4f,%.4f,%.4f mean=%.4f,%.4f,%.4f quality=%.3f samples=%.0f%s", slot,
+                uint64_t(desc.Width), desc.Height, a[0], a[1], a[2], b[0], b[1], b[2], q[0], q[1], q[2], q[3], b[3],
+                a[3] < 0 ? " skipped (screen doesn't match the sim's picture)" : "");
         }
     }
     const D3D12_RANGE none{0, 0};
@@ -1325,7 +1327,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     uav.Format = DXGI_FORMAT_R32_UINT;
     d.native->CreateUnorderedAccessView(map->tiles.Get(), nullptr, &uav, at(uav_base + 1));
     D3D12_UNORDERED_ACCESS_VIEW_DESC structured{DXGI_FORMAT_UNKNOWN, D3D12_UAV_DIMENSION_BUFFER};
-    structured.Buffer = {0, slot_count * 2, 16, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+    structured.Buffer = {0, slot_count * 3, 16, 0, D3D12_BUFFER_UAV_FLAG_NONE};
     d.native->CreateUnorderedAccessView(d.params.Get(), nullptr, &structured, at(uav_base + 2));
     D3D12_UNORDERED_ACCESS_VIEW_DESC map_uav{glass::map_format, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
     map_uav.Texture2DArray = {0, 0, map->layers, 0};
@@ -1372,7 +1374,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         uint64_t next = d.readback_next.load();
         if (now >= next && d.readback_ready.load() == UINT64_MAX && d.readback_next.compare_exchange_strong(next, now + 600)) {
             transition(native, d.params.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            native->CopyBufferRegion(d.params_readback.Get(), 0, d.params.Get(), 0, slot_count * 2 * 16);
+            native->CopyBufferRegion(d.params_readback.Get(), 0, d.params.Get(), 0, slot_count * 3 * 16);
             transition(native, d.params.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             d.readback_ready = now + 30;
         }
