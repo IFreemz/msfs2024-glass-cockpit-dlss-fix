@@ -497,6 +497,8 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     std::array<ComPtr<ID3D12PipelineState>, 5> passes; // zero, fit, solve, composite, clear
     ComPtr<ID3D12DescriptorHeap> heap, scratch;
     ComPtr<ID3D12Resource> sums, params;
+    ComPtr<ID3D12Resource> params_readback; // brightness match per screen, copied out now and then for the log
+    std::atomic<uint64_t> readback_next{600}, readback_ready{UINT64_MAX};
     uint64_t frame = 0;
 };
 
@@ -1059,7 +1061,37 @@ bool create_composite(DeviceState& d) {
         D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.sums)))) return false;
     buffer.Width = slot_count * 2 * 16;
-    return SUCCEEDED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.params)));
+    if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.params)))) return false;
+    D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
+    buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
+    if (FAILED(d.native->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&d.params_readback))))
+        d.params_readback = nullptr; // diagnostics only
+    return true;
+}
+
+// Log the brightness match (scene = gain * screen + offset, per colour channel) of every screen in use. Copied from
+// the GPU every ~600 frames and read ~30 frames later, when the copy has long finished.
+void log_brightness(DeviceState& d) {
+    const uint64_t now = present_count.load(std::memory_order_relaxed);
+    uint64_t ready = d.readback_ready.load();
+    if (now < ready || !d.readback_ready.compare_exchange_strong(ready, UINT64_MAX)) return;
+    float* data = nullptr;
+    const D3D12_RANGE range{0, slot_count * 2 * 16};
+    if (FAILED(d.params_readback->Map(0, &range, reinterpret_cast<void**>(&data)))) return;
+    static std::atomic<int> dumps{0};
+    if (dumps++ < 60) {
+        for (unsigned slot = 0; slot < slot_count; ++slot) {
+            const float* a = data + slot * 8;
+            const float* b = a + 4;
+            const auto resource = slot_resources[slot].load();
+            if (a[3] <= 0 || !resource) continue;
+            const auto desc = resource->GetDesc();
+            log("brightness slot=%u screen=%llux%u gain=%.3f,%.3f,%.3f offset=%.4f,%.4f,%.4f samples=%.0f", slot, uint64_t(desc.Width), desc.Height,
+                a[0], a[1], a[2], b[0], b[1], b[2], b[3]);
+        }
+    }
+    const D3D12_RANGE none{0, 0};
+    d.params_readback->Unmap(0, &none);
 }
 
 ID3D12Resource* ngx_resource(const NVSDK_NGX_Parameter& params, const char* name) {
@@ -1334,6 +1366,17 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     native->SetPipelineState(d.passes[2].Get());
     native->Dispatch(1, 1, 1);
     uav_barrier(native);
+    if (d.params_readback) {
+        log_brightness(d);
+        const uint64_t now = present_count.load(std::memory_order_relaxed);
+        uint64_t next = d.readback_next.load();
+        if (now >= next && d.readback_ready.load() == UINT64_MAX && d.readback_next.compare_exchange_strong(next, now + 600)) {
+            transition(native, d.params.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            native->CopyBufferRegion(d.params_readback.Get(), 0, d.params.Get(), 0, slot_count * 2 * 16);
+            transition(native, d.params.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            d.readback_ready = now + 30;
+        }
+    }
     native->SetPipelineState(d.passes[3].Get());
     native->Dispatch((out_w + 7) / 8, (out_h + 7) / 8, 1);
     transition(native, map->texture.Get(), map_resting, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
