@@ -1442,8 +1442,8 @@ void on_present(api::effect_runtime* runtime) {
     if (stats.display_draws && !display_since) display_since = now;
     if (display_since && now - display_since > 20000 && !found) {
         if (!stats.evaluations && !stats.fsr_dispatches) {
-            LOG_ONCE("WARNING cockpit screens are drawn but neither DLSS nor FSR is called: select DLSS or FSR (not TAA) in the sim's graphics settings");
-            found = "Cockpit screens are drawn but neither DLSS nor FSR is running. Select DLSS or FSR (not TAA) in the sim's graphics settings.";
+            LOG_ONCE("WARNING cockpit screens are drawn but neither DLSS nor FSR is called: select DLSS or FSR in the sim's graphics settings");
+            found = "Cockpit screens are drawn but neither DLSS nor FSR is running. Select DLSS or FSR in the sim's graphics settings.";
         } else if (!stats.replays) {
             LOG_ONCE("WARNING cockpit screens are drawn but none could be recorded: see skip reasons above");
             found = "Cockpit screens are drawn but could not be recorded. Please report this with your log files.";
