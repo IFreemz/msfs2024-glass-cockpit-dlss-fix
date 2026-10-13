@@ -297,6 +297,8 @@ int main(int argc, char** argv) {
         check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
         ComPtr<ID3D12Fence> fence; check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
         UINT64 fence_value = 0;
+        const auto cost_tick = reinterpret_cast<void (*)(ID3D12CommandQueue*)>(GetProcAddress(addon, "GlassFixCostTick"));
+        require(cost_tick != nullptr, "exports missing");
         auto submit = [&] {
             check(list->Close()); ID3D12CommandList* lists[]{list.Get()}; queue->ExecuteCommandLists(1, lists);
             check(queue->Signal(fence.Get(), ++fence_value));
@@ -304,6 +306,7 @@ int main(int argc, char** argv) {
             check(fence->SetEventOnCompletion(fence_value, e)); require(WaitForSingleObject(e, 10000) == WAIT_OBJECT_0, "GPU timeout"); CloseHandle(e);
             require(device->GetDeviceRemovedReason() == S_OK, "device removed");
             check(allocator->Reset()); check(list->Reset(allocator.Get(), nullptr));
+            cost_tick(queue.Get()); // stands in for the present event: drives the add-on's cost measurement
         };
 
         // Root signature shaped like the game's: VS b0-b2, PS b1/b3, SRV table t0-t1, static s1.

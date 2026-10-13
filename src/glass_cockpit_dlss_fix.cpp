@@ -78,6 +78,8 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
 constexpr unsigned slot_count = 32, ring_size = 8, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 5;
 std::filesystem::path addon_directory;
 ID3D12Device* main_device = nullptr;
+struct DeviceState;
+DeviceState* main_state = nullptr; // the main device's state (the offline test host's cost tick)
 uint64_t init_tick = 0;
 
 std::atomic<bool> enabled{true}, jitter_positive{true}, tint{false};
@@ -119,6 +121,25 @@ void note(std::atomic<uint64_t>& counter, const char* reason) {
 }
 // Logs a message only the first time (milestones and one-off warnings).
 #define LOG_ONCE(...) do { static std::atomic<bool> logged_{false}; if (!logged_.exchange(true)) log(__VA_ARGS__); } while (0)
+
+// Cost diagnostics: every 10 s the add-on's own CPU time (inside ReShade's events and the D3D12/upscaler hooks) and GPU
+// time (the passes after the upscaler) are measured over 120 frames and logged. Off in between: one relaxed load per event.
+enum CpuSlot { cpu_draws, cpu_binds, cpu_targets, cpu_passes, cpu_views, cpu_copies, cpu_descriptors, cpu_composite, cpu_slots };
+constexpr const char* cpu_slot_names[cpu_slots]{"draws", "binds", "targets", "passes", "views", "copies", "descriptors", "composite"};
+std::atomic<bool> measuring{false};
+std::array<std::atomic<uint64_t>, cpu_slots> cpu_ticks{}, cpu_calls{};
+struct CpuScope {
+    int slot; bool on; LARGE_INTEGER start{};
+    explicit CpuScope(int s) : slot(s), on(measuring.load(std::memory_order_relaxed)) { if (on) QueryPerformanceCounter(&start); }
+    ~CpuScope() {
+        if (!on) return;
+        LARGE_INTEGER end; QueryPerformanceCounter(&end);
+        cpu_ticks[slot].fetch_add(uint64_t(end.QuadPart - start.QuadPart), std::memory_order_relaxed);
+        cpu_calls[slot].fetch_add(1, std::memory_order_relaxed);
+    }
+};
+std::atomic<uint64_t> timestamp_frequency{0}; // of the queue the sim presents on (the upscaler runs on it too)
+constexpr UINT max_timed_calls = 256;
 
 struct Stats {
     std::atomic<uint64_t> replays{0}, variant_pending{0}, unknown_texture{0}, unsupported_draw{0},
@@ -474,11 +495,13 @@ Copy original_copy = nullptr;
 void STDMETHODCALLTYPE copy_simple_hook(ID3D12Device* device, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE dest, D3D12_CPU_DESCRIPTOR_HANDLE source,
     D3D12_DESCRIPTOR_HEAP_TYPE type) {
     original_copy_simple(device, count, dest, source, type);
+    CpuScope scope(cpu_descriptors);
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device == main_device) track_copy(dest.ptr, source.ptr, count);
 }
 void STDMETHODCALLTYPE copy_hook(ID3D12Device* device, UINT dest_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts, const UINT* dest_sizes,
     UINT source_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* source_starts, const UINT* source_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     original_copy(device, dest_ranges, dest_starts, dest_sizes, source_ranges, source_starts, source_sizes, type);
+    CpuScope scope(cpu_descriptors);
     if (type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || device != main_device || !dest_starts || !source_starts) return;
     // Both sides are lists of ranges with the same total length; walk them together.
     UINT d = 0, s = 0, d_done = 0, s_done = 0;
@@ -558,6 +581,9 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     ComPtr<ID3D12Resource> params_readback; // brightness match per screen, copied out now and then for the log
     std::atomic<uint64_t> readback_next{600}, readback_ready{UINT64_MAX};
     uint64_t frame = 0;
+    ComPtr<ID3D12QueryHeap> timestamps; // cost diagnostics: start and end of the passes of each upscaler call
+    ComPtr<ID3D12Resource> timestamps_readback;
+    UINT timed_calls = 0; // under composite_mutex
 };
 
 struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
@@ -650,6 +676,7 @@ void on_init_device(api::device* device) {
     state->native = native;
     descriptor_size = size;
     main_device = native;
+    main_state = state;
     D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     state->native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&state->scratch));
     const auto table = *reinterpret_cast<void***>(state->native);
@@ -694,7 +721,10 @@ void on_init_pipeline(api::device*, api::pipeline_layout, uint32_t count, const 
 }
 
 void on_destroy_device(api::device* device) {
-    if (device->get_private_data<DeviceState>()) device->destroy_private_data<DeviceState>();
+    if (auto state = device->get_private_data<DeviceState>()) {
+        if (main_state == state) main_state = nullptr;
+        device->destroy_private_data<DeviceState>();
+    }
 }
 
 void on_init_layout(api::device* device, uint32_t count, const api::pipeline_layout_param* params, api::pipeline_layout layout) {
@@ -741,6 +771,7 @@ void on_init_layout(api::device* device, uint32_t count, const api::pipeline_lay
 }
 
 void on_init_view(api::device* device, api::resource resource, api::resource_usage usage, const api::resource_view_desc& desc, api::resource_view view) {
+    CpuScope scope(cpu_views);
     if (track_descriptors.load(std::memory_order_relaxed) && view.handle) set_tracked(uintptr_t(view.handle), 0); // a new view replaces what was there
     // A default view (null D3D12 view desc) arrives with type/format "unknown".
     if (usage != api::resource_usage::shader_resource || !resource.handle ||
@@ -817,18 +848,21 @@ void on_destroy_list(api::command_list* list) {
     list->destroy_private_data<ListState>();
 }
 void on_reset_list(api::command_list* list) {
+    CpuScope scope(cpu_passes);
     if (auto state = list->get_private_data<ListState>()) {
         const auto device = state->device;
         *state = ListState{}; state->list = list; state->device = device; state->generation = generation;
     }
 }
 void on_bind_pipeline(api::command_list* list, api::pipeline_stage stages, api::pipeline pipeline) {
+    CpuScope scope(cpu_binds);
     if (!enabled.load(std::memory_order_relaxed) || (stages & api::pipeline_stage::all_graphics) == api::pipeline_stage{}) return;
     if (auto state = list->get_private_data<ListState>()) {
         state->pso = pipeline.handle; state->display = find_pipeline(pipeline.handle);
     }
 }
 void on_bind_tables(api::command_list* list, api::shader_stage stages, api::pipeline_layout layout, uint32_t first, uint32_t count, const api::descriptor_table* tables) {
+    CpuScope scope(cpu_binds);
     if (!enabled.load(std::memory_order_relaxed) || (stages & api::shader_stage::all_graphics) == api::shader_stage{}) return;
     auto state = list->get_private_data<ListState>();
     if (!state) return;
@@ -836,6 +870,7 @@ void on_bind_tables(api::command_list* list, api::shader_stage stages, api::pipe
     for (uint32_t i = 0; i < count && first + i < state->tables.size(); ++i) state->tables[first + i] = tables[i].handle;
 }
 void on_bind_targets(api::command_list* list, uint32_t count, const api::resource_view* targets, api::resource_view depth) {
+    CpuScope scope(cpu_targets);
     if (!enabled.load(std::memory_order_relaxed)) return;
     auto state = list->get_private_data<ListState>();
     if (!state) return;
@@ -844,10 +879,12 @@ void on_bind_targets(api::command_list* list, uint32_t count, const api::resourc
     state->depth.ptr = SIZE_T(depth.handle);
 }
 void on_begin_pass(api::command_list* list, uint32_t, const api::render_pass_render_target_desc*, const api::render_pass_depth_stencil_desc*) {
+    CpuScope scope(cpu_passes);
     if (!enabled.load(std::memory_order_relaxed)) return;
     if (auto state = list->get_private_data<ListState>()) state->in_pass = true;
 }
 void on_end_pass(api::command_list* list) {
+    CpuScope scope(cpu_passes);
     if (!enabled.load(std::memory_order_relaxed)) return;
     if (auto state = list->get_private_data<ListState>()) { state->in_pass = false; state->target_count = 0; state->depth = {}; }
 }
@@ -1053,6 +1090,7 @@ void screen_probe(api::command_list* list, const ListState& state, uint32_t coun
 } catch (...) {}
 
 bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, uint32_t first_instance) {
+    CpuScope scope(cpu_draws);
     if (!enabled.load(std::memory_order_relaxed)) return false;
     auto state = list->get_private_data<ListState>();
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
@@ -1062,6 +1100,7 @@ bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32
     return false;
 }
 bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, int32_t vertex, uint32_t first_instance) {
+    CpuScope scope(cpu_draws);
     if (!enabled.load(std::memory_order_relaxed)) return false;
     auto state = list->get_private_data<ListState>();
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
@@ -1111,6 +1150,11 @@ bool create_composite(DeviceState& d) {
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
     if (FAILED(d.native->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&d.params_readback))))
         d.params_readback = nullptr; // diagnostics only
+    D3D12_QUERY_HEAP_DESC queries{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, max_timed_calls * 2, 0};
+    buffer.Width = max_timed_calls * 2 * sizeof(uint64_t);
+    if (FAILED(d.native->CreateQueryHeap(&queries, IID_PPV_ARGS(&d.timestamps))) ||
+        FAILED(d.native->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&d.timestamps_readback))))
+        d.timestamps = nullptr, d.timestamps_readback = nullptr; // diagnostics only
     return true;
 }
 
@@ -1178,6 +1222,7 @@ UINT layer_for_call(UINT call, UINT views, ID3D12Resource* output) {
 
 bool on_copy_region(api::command_list*, api::resource source, uint32_t, const api::subresource_box*, api::resource dest, uint32_t dest_subresource,
     const api::subresource_box*, api::filter_mode) {
+    CpuScope scope(cpu_copies);
     if (!view_order.views) return false;
     const auto src = reinterpret_cast<ID3D12Resource*>(source.handle);
     std::lock_guard lock(view_order.mutex);
@@ -1280,6 +1325,7 @@ void composite_fsr(const ffxDispatchDescUpscale& desc) noexcept try {
 } catch (...) { ++stats.composite_skipped; }
 
 void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept try {
+    CpuScope scope(cpu_composite);
     api::command_list* list = nullptr; UINT size = sizeof(list);
     if (FAILED(supplied->GetPrivateData(__uuidof(ListState), &size, &list)) || size != sizeof(list) || !list) {
         note(stats.composite_skipped, "upscaler_command_list_unknown (the upscaler ran on a command list ReShade did not report)"); return;
@@ -1399,6 +1445,8 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     if (colour_moved) transition(native, colour, u.colour_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (output_moved) transition(native, output, u.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     uav_barrier(native); // the upscaler just wrote the output
+    const UINT timed = measuring.load(std::memory_order_relaxed) && d.timestamps && d.timed_calls < max_timed_calls ? ++d.timed_calls : 0;
+    if (timed) native->EndQuery(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2);
     if (!d.accumulators_zeroed) {
         native->SetPipelineState(d.passes[0].Get());
         native->Dispatch(1, 1, 1);
@@ -1432,6 +1480,10 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
     transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, map_resting);
     uav_barrier(native);
+    if (timed) {
+        native->EndQuery(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2 + 1);
+        native->ResolveQueryData(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2, 2, d.timestamps_readback.Get(), uint64_t(timed - 1) * 2 * sizeof(uint64_t));
+    }
     if (colour_moved) transition(native, colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, u.colour_state);
     if (output_moved) transition(native, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, u.output_state);
     // Callers of NGX evaluate and ffxDispatch restore their own heaps, root signature and pipeline afterwards.
@@ -1605,8 +1657,71 @@ void save_settings() {
     WritePrivateProfileStringW(L"overlay", L"line_smoothing", std::to_wstring(smoothing_percent.load()).c_str(), settings_path().c_str());
 }
 
+// One measurement window every 10 s: 120 frames, reported ~30 frames later (the GPU has finished them by then).
+// The offline test host has no swapchain; it calls this through GlassFixCostTick with a short window.
+uint64_t cost_window = 120, cost_delay = 30, cost_spacing_ms = 10000;
+void measure_cost(ID3D12CommandQueue* queue, DeviceState* d, uint64_t now) {
+    static uint64_t next_window = 0, window_start = 0, report_at = 0, frames = 0;
+    static LARGE_INTEGER started{}, ended{};
+    const uint64_t tick = GetTickCount64();
+    if (!timestamp_frequency.load(std::memory_order_relaxed)) {
+        UINT64 frequency = 0;
+        if (queue && SUCCEEDED(queue->GetTimestampFrequency(&frequency))) timestamp_frequency = frequency;
+    }
+    if (!measuring && !report_at && tick >= next_window) {
+        next_window = tick + cost_spacing_ms;
+        for (auto& t : cpu_ticks) t = 0;
+        for (auto& c : cpu_calls) c = 0;
+        if (d) { std::lock_guard lock(d->composite_mutex); d->timed_calls = 0; }
+        window_start = now;
+        QueryPerformanceCounter(&started);
+        measuring = true;
+    } else if (measuring && now - window_start >= cost_window) {
+        measuring = false;
+        QueryPerformanceCounter(&ended);
+        frames = now - window_start;
+        report_at = now + cost_delay;
+    } else if (report_at && now >= report_at) {
+        report_at = 0;
+        LARGE_INTEGER qpf; QueryPerformanceFrequency(&qpf);
+        const double ms_per_tick = 1000.0 / double(qpf.QuadPart), seconds = double(ended.QuadPart - started.QuadPart) / double(qpf.QuadPart);
+        char cpu[512]{};
+        double cpu_total = 0;
+        for (int i = 0; i < cpu_slots; ++i) {
+            const double ms = double(cpu_ticks[i].load()) * ms_per_tick / double(frames);
+            cpu_total += ms;
+            snprintf(cpu + strlen(cpu), sizeof(cpu) - strlen(cpu), " %s=%.3f(%llu)", cpu_slot_names[i], ms, cpu_calls[i].load() / frames);
+        }
+        char gpu[160] = "gpu=unavailable";
+        const uint64_t frequency = timestamp_frequency.load();
+        if (d && d->timestamps_readback && frequency) {
+            std::lock_guard lock(d->composite_mutex);
+            const UINT calls = d->timed_calls;
+            uint64_t* stamps = nullptr;
+            const D3D12_RANGE range{0, SIZE_T(calls) * 2 * sizeof(uint64_t)};
+            if (calls && SUCCEEDED(d->timestamps_readback->Map(0, &range, reinterpret_cast<void**>(&stamps)))) {
+                double sum = 0, worst = 0; UINT valid = 0;
+                for (UINT i = 0; i < calls; ++i) {
+                    if (stamps[i * 2 + 1] <= stamps[i * 2]) continue;
+                    const double ms = double(stamps[i * 2 + 1] - stamps[i * 2]) * 1000.0 / double(frequency);
+                    if (ms > 100) continue; // not finished or garbage
+                    sum += ms; worst = std::max(worst, ms); ++valid;
+                }
+                const D3D12_RANGE none{0, 0};
+                d->timestamps_readback->Unmap(0, &none);
+                if (valid) snprintf(gpu, sizeof(gpu), "gpu_ms_per_frame=%.3f (per upscaler call avg=%.3f max=%.3f, %u calls)", sum / double(frames), sum / valid, worst, valid);
+                else snprintf(gpu, sizeof(gpu), "gpu=no finished samples (%u calls)", calls);
+            } else if (!calls) snprintf(gpu, sizeof(gpu), "gpu=no upscaler calls drawn");
+        }
+        log("cost frames=%llu fps=%.1f cpu_ms_per_frame=%.3f [%s ] %s", frames, seconds > 0 ? double(frames) / seconds : 0.0, cpu_total, cpu + 1, gpu);
+    }
+}
+
 void on_present(api::effect_runtime* runtime) {
     ++present_count;
+    const auto queue = runtime->get_command_queue();
+    measure_cost(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr, runtime->get_device()->get_private_data<DeviceState>(),
+        present_count.load(std::memory_order_relaxed));
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
     if (chord && runtime->is_key_pressed(VK_F10)) glass::set_jitter_positive(!jitter_positive);
@@ -1784,6 +1899,12 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
 }
 extern "C" __declspec(dllexport) void GlassFixJitterPositive(bool positive) { jitter_positive = positive; }
 extern "C" __declspec(dllexport) void GlassFixLineSmoothing(int percent) { smoothing_percent = percent; }
+// Offline test host: one call per frame stands in for the present event (cost window of 4 frames, reported 2 later).
+extern "C" __declspec(dllexport) void GlassFixCostTick(ID3D12CommandQueue* queue) {
+    static uint64_t frame = 0;
+    cost_window = 4; cost_delay = 2; cost_spacing_ms = 0;
+    measure_cost(queue, main_state, ++frame);
+}
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE) {
     enabled_before_unload = enabled.exchange(false);
     log("add-on unloaded by ReShade");
