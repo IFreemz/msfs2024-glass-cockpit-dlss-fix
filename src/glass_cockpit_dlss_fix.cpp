@@ -122,7 +122,8 @@ void note(std::atomic<uint64_t>& counter, const char* reason) {
 
 struct Stats {
     std::atomic<uint64_t> replays{0}, variant_pending{0}, unknown_texture{0}, unsupported_draw{0},
-        composites{0}, composite_skipped{0}, evaluations{0}, fsr_dispatches{0}, display_draws{0}, display_pipelines{0};
+        composites{0}, composite_skipped{0}, evaluations{0}, fsr_dispatches{0}, display_draws{0}, display_pipelines{0},
+        dlss_upscales{0}; // evaluations that upscale (have a render size); the others are DLSS Frame Generation
 } stats;
 
 std::string file_version(const wchar_t* path) {
@@ -1449,6 +1450,12 @@ EvaluateC original_evaluate_c = nullptr;
 // call with DLSS): only the outermost call, the one the sim made, draws the fix, once, on its final output. The inner
 // call would take a view meant for the outer one (VR: screens of the other eye drawn all over the picture).
 thread_local int upscaler_depth = 0;
+// DLSS Super Resolution calls carry a render size; DLSS Frame Generation calls (same evaluate function) don't.
+void count_evaluation(const NVSDK_NGX_Parameter* params) {
+    ++stats.evaluations;
+    unsigned width = 0;
+    if (params && params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &width) == NVSDK_NGX_Result_Success) ++stats.dlss_upscales;
+}
 bool nested_upscaler() {
     if (upscaler_depth == 0) return false;
     LOG_ONCE("note an upscaler ran inside another one (e.g. OptiScaler answering the sim's FSR with DLSS): the fix is drawn once, after the outer one");
@@ -1458,7 +1465,7 @@ NVSDK_NGX_Result evaluate_hook(ID3D12GraphicsCommandList* list, const NVSDK_NGX_
     ++upscaler_depth;
     const auto result = original_evaluate(list, handle, params, callback);
     --upscaler_depth;
-    ++stats.evaluations;
+    count_evaluation(params);
     if (result == NVSDK_NGX_Result_Success) { if (!nested_upscaler()) composite_dlss(list, params); }
     else LOG_ONCE("note DLSS evaluate returned 0x%x (not success)", unsigned(result));
     return result;
@@ -1467,7 +1474,7 @@ NVSDK_NGX_Result evaluate_c_hook(ID3D12GraphicsCommandList* list, const NVSDK_NG
     ++upscaler_depth;
     const auto result = original_evaluate_c(list, handle, params, callback);
     --upscaler_depth;
-    ++stats.evaluations;
+    count_evaluation(params);
     if (result == NVSDK_NGX_Result_Success) { if (!nested_upscaler()) composite_dlss(list, params); }
     else LOG_ONCE("note DLSS evaluate returned 0x%x (not success)", unsigned(result));
     return result;
@@ -1634,7 +1641,10 @@ void on_present(api::effect_runtime* runtime) {
     static uint64_t display_since = 0;
     if (stats.display_draws && !display_since) display_since = now;
     if (display_since && now - display_since > 20000 && !found) {
-        if (!stats.evaluations && !stats.fsr_dispatches) {
+        if (!stats.dlss_upscales && !stats.fsr_dispatches && stats.evaluations) {
+            LOG_ONCE("WARNING only DLSS Frame Generation is running, no DLSS or FSR upscaling: select DLSS or FSR as anti-aliasing in the sim's graphics settings");
+            found = "Only DLSS Frame Generation is running. Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR in the sim's graphics settings; Frame Generation can stay on.";
+        } else if (!stats.dlss_upscales && !stats.fsr_dispatches) {
             LOG_ONCE("WARNING cockpit screens are drawn but neither DLSS nor FSR is called: select DLSS or FSR in the sim's graphics settings");
             found = "Cockpit screens are drawn but neither DLSS nor FSR is running. Select DLSS or FSR in the sim's graphics settings.";
         } else if (!stats.replays) {
@@ -1653,8 +1663,8 @@ void on_present(api::effect_runtime* runtime) {
         stats.unsupported_draw.load(), uint64_t(enabled.load())};
     if (current != last) {
         last = current;
-        log("stats overlay=%d jitter_positive=%d dlss_calls=%llu fsr_calls=%llu screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu shader_pending=%llu unknown_texture=%llu unsupported=%llu",
-            enabled.load(), jitter_positive.load(), stats.evaluations.load(), stats.fsr_dispatches.load(), stats.display_draws.load(), stats.replays.load(), stats.composites.load(),
+        log("stats overlay=%d jitter_positive=%d dlss_calls=%llu dlss_upscales=%llu fsr_calls=%llu screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu shader_pending=%llu unknown_texture=%llu unsupported=%llu",
+            enabled.load(), jitter_positive.load(), stats.evaluations.load(), stats.dlss_upscales.load(), stats.fsr_dispatches.load(), stats.display_draws.load(), stats.replays.load(), stats.composites.load(),
             stats.composite_skipped.load(), stats.variant_pending.load(), stats.unknown_texture.load(), stats.unsupported_draw.load());
     }
 }
@@ -1669,7 +1679,7 @@ Status status() {
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
     s.enabled = enabled; s.tint = tint; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent;
-    s.dlss_calls = stats.evaluations; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
+    s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
     s.active = s.enabled && s.overlay_frames && now <= last_composite_present + 30;
