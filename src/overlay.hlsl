@@ -23,6 +23,7 @@ cbuffer Constants : register(b0)
     float edge_fade;         // fade into the upscaler's picture over this many render pixels at display edges (0-12)
     float edge_stretch;      // test: extend displays outwards by up to this many render pixels
     float detail_clamp;      // test: 0..1, keep the redrawn screen within the sim's own local brightness range this frame
+    float angle_soften;      // test: 0..1, sample screens seen at a steep angle like the sim does (softer)
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -313,6 +314,24 @@ void composite(uint3 id : SV_DispatchThreadID)
     if (blend <= 0) return;
     float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
     if (gain.w <= 0) return;
+    // Angle softening: on a screen seen at a steep angle the texture footprint of a pixel is long and thin. Anisotropic
+    // filtering at output resolution keeps one-texel lines there crisp (they break into dashes); the sim samples at
+    // render resolution and its picture is soft there. Move towards an isotropic footprint the size of a render pixel,
+    // more the steeper the angle (anisotropy 1.5 -> 4). Screens seen straight on are unchanged.
+    if (angle_soften > 0)
+    {
+        float lx = length(dx), ly = length(dy);
+        float major = max(lx, ly), minor = max(min(lx, ly), 1e-9);
+        float t = angle_soften * saturate((major / minor - 1.5) / 2.5);
+        if (t > 0)
+        {
+            float2 render_scale = 1 / max(map_per_output, 1e-3);
+            float2 sim_dx = (lx > 0 ? dx / lx : float2(1, 0)) * major * render_scale.x;
+            float2 sim_dy = (ly > 0 ? dy / ly : float2(0, 1)) * major * render_scale.y;
+            dx = lerp(dx, sim_dx, t);
+            dy = lerp(dy, sim_dy, t);
+        }
+    }
     float3 content = ((flags & 8) ? sample_display_smooth(slot, uv, dx, dy) : sample_display(slot, uv, dx, dy)) * gain.rgb;
 
     // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder: bilinear value at this pixel and its
@@ -327,12 +346,17 @@ void composite(uint3 id : SV_DispatchThreadID)
         float4 rv = residual[q];
         if (uint(rv.w + 0.5) != slot + 1) continue;
         m1 += rv.rgb; m2 += rv.rgb * rv.rgb; count += 1;
-        if (detail_clamp > 0)
+    }
+    // Detail clamp range: what the sim drew in the 5x5 render pixels around this one (same display). A wider window
+    // than 3x3 changes less from frame to frame as the jitter moves, so the clamp doesn't flicker.
+    if (detail_clamp > 0)
+        [unroll] for (int s = 0; s < 25; ++s)
         {
+            int2 q = centre + int2(s % 5 - 2, s / 5 - 2);
+            if (any(q < 0) || any(q >= int2(map_size)) || uint(residual[q].w + 0.5) != slot + 1) continue;
             float3 y = scene.Load(int3(q, 0)).rgb;
             if (all(isfinite(y))) { scene_low = min(scene_low, y); scene_high = max(scene_high, y); }
         }
-    }
     [unroll] for (uint k = 0; k < 4; ++k)
     {
         int2 q = cell + int2(k & 1, k >> 1);

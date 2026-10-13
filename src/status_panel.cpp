@@ -77,6 +77,9 @@ void draw(reshade::api::effect_runtime*) {
     changed |= ImGui::SliderInt("Detail clamp", &edge[2], 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
     ImGui::SetItemTooltip("Keeps the redrawn screens within the brightness the sim itself drew around each pixel this frame (0 = off). Holds down texture detail too thin for the sim to show.");
     if (changed) glass::set_edge_test(edge[0], edge[1], edge[2]);
+    int angle = s.angle_soften;
+    if (ImGui::SliderInt("Angle softening", &angle, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) glass::set_angle_soften(angle);
+    ImGui::SetItemTooltip("Screens seen at a steep angle are drawn softer, like the sim does (0 = off). Screens seen straight on are unchanged.");
     if (!s.jitter_positive || s.glass_strength != 100) ImGui::TextColored(yellow, "Advanced settings changed (see Troubleshooting below)");
 
     ImGui::SeparatorText("Checks");
