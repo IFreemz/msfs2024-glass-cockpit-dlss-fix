@@ -87,8 +87,8 @@ std::atomic<bool> enabled{true}, jitter_positive{true}, tint{false};
 // Edge fade (hundredths of a render pixel, 0-1200) and the test build's edge stretcher (0-400).
 constexpr int default_edge_fade = 100, max_edge_fade = 1200;
 std::atomic<int> edge_fade_percent{default_edge_fade}, edge_stretch_percent{0};
-// Test build: border fade, texels of the screen texture (0-64).
-std::atomic<int> border_fade_texels{0};
+// Test build: detail clamp, percent (0-100).
+std::atomic<int> detail_clamp_percent{0};
 // Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like (softest).
 constexpr int max_smoothing = 50, default_smoothing = 35;
 std::atomic<int> smoothing_percent{default_smoothing};
@@ -1479,11 +1479,11 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     d.native->CreateUnorderedAccessView(map->residual.Get(), nullptr, &uav, at(uav_base + 4));
 
-    struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, border_fade; } constants{
+    struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
         jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) ,
         smoothing_percent / 50.0f, layer, glass_percent / 100.0f, edge_fade_percent / 100.0f,
-        edge_stretch_percent / 100.0f, float(border_fade_texels.load())};
+        edge_stretch_percent / 100.0f, detail_clamp_percent / 100.0f};
 
     api::command_list* api_list = list;
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(api_list->get_native());
@@ -1787,7 +1787,7 @@ void load_settings() {
     glass_percent = std::clamp(int(GetPrivateProfileIntW(L"advanced", L"glass_strength", 100, settings_path().c_str())), 0, 100);
     edge_fade_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"edge_fade", default_edge_fade, settings_path().c_str())), 0, max_edge_fade);
     edge_stretch_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"edge_stretch", 0, settings_path().c_str())), 0, 400);
-    border_fade_texels = std::clamp(int(GetPrivateProfileIntW(L"test", L"border_fade", 0, settings_path().c_str())), 0, 64);
+    detail_clamp_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"detail_clamp", 0, settings_path().c_str())), 0, 100);
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
@@ -1801,7 +1801,7 @@ void save_settings() {
     WritePrivateProfileStringW(L"advanced", L"glass_strength", std::to_wstring(glass_percent.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"test", L"edge_fade", std::to_wstring(edge_fade_percent.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"test", L"edge_stretch", std::to_wstring(edge_stretch_percent.load()).c_str(), settings_path().c_str());
-    WritePrivateProfileStringW(L"test", L"border_fade", std::to_wstring(border_fade_texels.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"test", L"detail_clamp", std::to_wstring(detail_clamp_percent.load()).c_str(), settings_path().c_str());
 }
 
 // One measurement window every 10 s: 120 frames, reported ~30 frames later (the GPU has finished them by then).
@@ -1941,7 +1941,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.edge_fade = edge_fade_percent; s.edge_stretch = edge_stretch_percent; s.border_fade = border_fade_texels; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.glass_strength = glass_percent;
+    s.enabled = enabled; s.tint = tint; s.edge_fade = edge_fade_percent; s.edge_stretch = edge_stretch_percent; s.detail_clamp = detail_clamp_percent; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
@@ -1962,9 +1962,9 @@ void set_line_smoothing(int percent) { smoothing_percent = std::clamp(percent, 0
 void set_jitter_positive(bool on) { jitter_positive = on; save_settings(); log("setting jitter_positive=%d", int(on)); }
 void set_edge_test(int fade, int stretch, int border) {
     edge_fade_percent = std::clamp(fade, 0, max_edge_fade); edge_stretch_percent = std::clamp(stretch, 0, 400);
-    border_fade_texels = std::clamp(border, 0, 64);
+    detail_clamp_percent = std::clamp(border, 0, 100);
     save_settings();
-    log("setting edge_fade=%d edge_stretch=%d border_fade=%d", edge_fade_percent.load(), edge_stretch_percent.load(), border_fade_texels.load());
+    log("setting edge_fade=%d edge_stretch=%d detail_clamp=%d", edge_fade_percent.load(), edge_stretch_percent.load(), detail_clamp_percent.load());
 }
 void set_glass_strength(int percent) { glass_percent = std::clamp(percent, 0, 100); save_settings(); log("setting glass_strength=%d", glass_percent.load()); }
 }

@@ -22,7 +22,7 @@ cbuffer Constants : register(b0)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
     float edge_fade;         // fade into the upscaler's picture over this many render pixels at display edges (0-12)
     float edge_stretch;      // test: extend displays outwards by up to this many render pixels
-    float border_fade;       // test: fade into the upscaler's picture over the outer this many texels of the screen texture
+    float detail_clamp;      // test: 0..1, keep the redrawn screen within the sim's own local brightness range this frame
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -310,16 +310,6 @@ void composite(uint3 id : SV_DispatchThreadID)
         edge = saturate(inside_pixels / edge_fade);
     }
     float blend = edge;
-    // Border fade: some screen textures have a dark bezel band around the picture with a thin light line where the
-    // picture starts. The sim shows that line soft (render resolution + upscaler); redrawn sharp it stands out as a
-    // dashed line. Fade over the outer border_fade texels of the texture instead of the screen surface.
-    if (border_fade > 0 && (flags & 4))
-    {
-        uint texture_width, texture_height;
-        displays[NonUniformResourceIndex(slot)].GetDimensions(texture_width, texture_height);
-        float2 texels = min(uv, 1 - uv) * float2(texture_width, texture_height);
-        blend = min(blend, saturate(min(texels.x, texels.y) / border_fade));
-    }
     if (blend <= 0) return;
     float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
     if (gain.w <= 0) return;
@@ -327,7 +317,7 @@ void composite(uint3 id : SV_DispatchThreadID)
 
     // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder: bilinear value at this pixel and its
     // spread over the 3x3 render pixels around it (same display only).
-    float3 smooth = 0, m1 = 0, m2 = 0;
+    float3 smooth = 0, m1 = 0, m2 = 0, scene_low = 1e9, scene_high = -1e9;
     float smooth_weight = 0, count = 0;
     int2 centre = int2(round(location));
     [unroll] for (int j = 0; j < 9; ++j)
@@ -337,6 +327,11 @@ void composite(uint3 id : SV_DispatchThreadID)
         float4 rv = residual[q];
         if (uint(rv.w + 0.5) != slot + 1) continue;
         m1 += rv.rgb; m2 += rv.rgb * rv.rgb; count += 1;
+        if (detail_clamp > 0)
+        {
+            float3 y = scene.Load(int3(q, 0)).rgb;
+            if (all(isfinite(y))) { scene_low = min(scene_low, y); scene_high = max(scene_high, y); }
+        }
     }
     [unroll] for (uint k = 0; k < 4; ++k)
     {
@@ -361,6 +356,14 @@ void composite(uint3 id : SV_DispatchThreadID)
     }
     if (glass_strength < 1) glass = lerp(offset.rgb, glass, glass_strength);
     float3 colour = content + glass;
+    // Detail clamp: the redrawn screen may not be brighter or darker than what the sim itself drew in the 3x3 render
+    // pixels around this one this frame. Content the sim shows survives; texture detail too thin for the sim to show
+    // (e.g. a one-texel line where a screen's picture meets its bezel band) is held to the sim's level.
+    if (detail_clamp > 0 && count > 0 && all(scene_high >= scene_low))
+    {
+        float3 margin = (scene_high - scene_low) * 0.1 + 0.002;
+        colour = lerp(colour, clamp(colour, scene_low - margin, scene_high + margin), detail_clamp);
+    }
     if (flags & 2) colour = colour * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0);
     if (blend < 1) colour = lerp(output[id.xy].rgb, colour, blend * blend * (3 - 2 * blend));
     if (all(isfinite(colour))) output[id.xy] = float4(max(colour, 0), 1);
