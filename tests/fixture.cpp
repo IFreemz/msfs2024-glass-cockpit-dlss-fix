@@ -242,22 +242,29 @@ int main(int argc, char** argv) {
     try {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
-        bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false;
+        bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
+            nested |= !std::strcmp(argv[i], "--nested");
         }
         if (hotpatch) redirect_evaluate_like_mfg_unlock();
         if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
         const UINT views = vr ? 2 : 1;
         if (vr) std::printf("display: VR (instanced stereo, %u eyes)\n", views);
         FfxDispatch ffx_dispatch = nullptr;
+        void (*ffx_run_dlss_inside)(NgxEvaluate, const NVSDK_NGX_Parameter*) = nullptr;
         if (fsr) {
             const auto ffx = LoadLibraryW((here / L"amd_fidelityfx_dx12.dll").c_str());
             require(ffx != nullptr, "fake amd_fidelityfx_dx12.dll missing");
             ffx_dispatch = reinterpret_cast<FfxDispatch>(GetProcAddress(ffx, "ffxDispatch"));
             require(ffx_dispatch != nullptr, "ffxDispatch missing");
             std::printf("upscaler: FSR (fake ffxDispatch)\n");
+            if (nested) {
+                ffx_run_dlss_inside = reinterpret_cast<decltype(ffx_run_dlss_inside)>(GetProcAddress(ffx, "FakeFfxRunDlssInside"));
+                require(ffx_run_dlss_inside != nullptr, "FakeFfxRunDlssInside missing");
+                std::printf("upscaler: FSR answered with DLSS inside its dispatch (like OptiScaler)\n");
+            }
         }
         if (!LoadLibraryW((here / L"ReShade64.asi").c_str())) { std::printf("LoadLibrary(ReShade64.asi) failed, error %lu\n", GetLastError()); return 2; }
         const auto vs = load(here / (vr ? "fixture_vr_vs.cso" : "fixture_vs.cso"));
@@ -586,6 +593,7 @@ int main(int argc, char** argv) {
 
         ID3D12Resource* const colour = vr ? eye_colour.Get() : scene.Get();
         Params ngx; ngx.colour = colour; ngx.output = output.Get();
+        if (ffx_run_dlss_inside) ffx_run_dlss_inside(evaluate, &ngx);
         auto out_rb = readback(device.Get(), output.Get());
         auto prefill_upload = buffer(device.Get(), out_rb.bytes, D3D12_HEAP_TYPE_UPLOAD);
         std::array<std::vector<std::array<float, 4>>, 2> previous_refs;

@@ -1445,24 +1445,39 @@ using Evaluate = NgxEvaluate;
 using EvaluateC = NgxEvaluateC;
 Evaluate original_evaluate = nullptr;
 EvaluateC original_evaluate_c = nullptr;
+// Upscaler calls running on this thread. A mod can run one upscaler inside another (OptiScaler answers the sim's FSR
+// call with DLSS): only the outermost call, the one the sim made, draws the fix, once, on its final output. The inner
+// call would take a view meant for the outer one (VR: screens of the other eye drawn all over the picture).
+thread_local int upscaler_depth = 0;
+bool nested_upscaler() {
+    if (upscaler_depth == 0) return false;
+    LOG_ONCE("note an upscaler ran inside another one (e.g. OptiScaler answering the sim's FSR with DLSS): the fix is drawn once, after the outer one");
+    return true;
+}
 NVSDK_NGX_Result evaluate_hook(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, PFN_NVSDK_NGX_ProgressCallback callback) {
+    ++upscaler_depth;
     const auto result = original_evaluate(list, handle, params, callback);
+    --upscaler_depth;
     ++stats.evaluations;
-    if (result == NVSDK_NGX_Result_Success) composite_dlss(list, params);
+    if (result == NVSDK_NGX_Result_Success) { if (!nested_upscaler()) composite_dlss(list, params); }
     else LOG_ONCE("note DLSS evaluate returned 0x%x (not success)", unsigned(result));
     return result;
 }
 NVSDK_NGX_Result evaluate_c_hook(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, PFN_NVSDK_NGX_ProgressCallback_C callback) {
+    ++upscaler_depth;
     const auto result = original_evaluate_c(list, handle, params, callback);
+    --upscaler_depth;
     ++stats.evaluations;
-    if (result == NVSDK_NGX_Result_Success) composite_dlss(list, params);
+    if (result == NVSDK_NGX_Result_Success) { if (!nested_upscaler()) composite_dlss(list, params); }
     else LOG_ONCE("note DLSS evaluate returned 0x%x (not success)", unsigned(result));
     return result;
 }
 // FSR (FidelityFX API, amd_fidelityfx_dx12.dll next to the game): ffxDispatch with an upscale description.
 FfxDispatch original_ffx_dispatch = nullptr;
 ffxReturnCode_t ffx_dispatch_hook(ffxContext* context, const ffxApiHeader* desc) {
+    ++upscaler_depth;
     const auto result = original_ffx_dispatch(context, desc);
+    --upscaler_depth;
     if (desc && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
         ++stats.fsr_dispatches;
         if (result == FFX_API_RETURN_OK) composite_fsr(*reinterpret_cast<const ffxDispatchDescUpscale*>(desc));
