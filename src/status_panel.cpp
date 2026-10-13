@@ -69,12 +69,14 @@ void draw(reshade::api::effect_runtime*) {
         "Ctrl+click to type a value.");
     if (ImGui::Checkbox("Green tint on fixed screens  (Ctrl+Shift+F11)", &tint)) glass::set_tint(tint);
     ImGui::TextColored(yellow, "Test build: edge sliders");
-    int edge[2]{s.edge_fade, s.edge_stretch};
-    bool changed = ImGui::SliderInt("Edge fade", &edge[0], 0, 400, "%d", ImGuiSliderFlags_AlwaysClamp);
+    int edge[3]{s.edge_fade, s.edge_stretch, s.border_fade};
+    bool changed = ImGui::SliderInt("Edge fade", &edge[0], 0, 1200, "%d", ImGuiSliderFlags_AlwaysClamp);
     ImGui::SetItemTooltip("Fades screen edges into the sim's own picture over this many hundredths of a render pixel (100 = 1 pixel, 0 = off).");
     changed |= ImGui::SliderInt("Edge stretcher", &edge[1], 0, 400, "%d", ImGuiSliderFlags_AlwaysClamp);
     ImGui::SetItemTooltip("Extends every screen outwards by up to this many hundredths of a render pixel (100 = 1 pixel, 0 = off), continuing its picture.");
-    if (changed) glass::set_edge_test(edge[0], edge[1]);
+    changed |= ImGui::SliderInt("Border fade (texels)", &edge[2], 0, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SetItemTooltip("Fades the outer texels of each screen's picture into the sim's own picture (0 = off). For screens with a bezel band and a thin line around the picture.");
+    if (changed) glass::set_edge_test(edge[0], edge[1], edge[2]);
     if (!s.jitter_positive || s.glass_strength != 100) ImGui::TextColored(yellow, "Advanced settings changed (see Troubleshooting below)");
 
     ImGui::SeparatorText("Checks");

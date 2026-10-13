@@ -20,8 +20,9 @@ cbuffer Constants : register(b0)
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
-    float edge_fade;         // fade into the upscaler's picture over this many render pixels at display edges (0-4)
+    float edge_fade;         // fade into the upscaler's picture over this many render pixels at display edges (0-12)
     float edge_stretch;      // test: extend displays outwards by up to this many render pixels
+    float border_fade;       // test: fade into the upscaler's picture over the outer this many texels of the screen texture
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -299,8 +300,9 @@ void composite(uint3 id : SV_DispatchThreadID)
         {
             static const float2 directions[8] = { float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
                 float2(0.7071, 0.7071), float2(-0.7071, 0.7071), float2(0.7071, -0.7071), float2(-0.7071, -0.7071) };
-            float nearest = 5;
-            [unroll] for (int r = 3; r <= 5; ++r)
+            float nearest = 13;
+            int reach = min(int(ceil(edge_fade)) + 1, 13);
+            [loop] for (int r = 3; r <= reach && nearest > 12; ++r)
                 [unroll] for (int k = 0; k < 8; ++k)
                     if (load_map(int2(round(location + directions[k] * r))).w != a.w) nearest = min(nearest, r - 0.5);
             inside_pixels = nearest;
@@ -308,6 +310,16 @@ void composite(uint3 id : SV_DispatchThreadID)
         edge = saturate(inside_pixels / edge_fade);
     }
     float blend = edge;
+    // Border fade: some screen textures have a dark bezel band around the picture with a thin light line where the
+    // picture starts. The sim shows that line soft (render resolution + upscaler); redrawn sharp it stands out as a
+    // dashed line. Fade over the outer border_fade texels of the texture instead of the screen surface.
+    if (border_fade > 0 && (flags & 4))
+    {
+        uint texture_width, texture_height;
+        displays[NonUniformResourceIndex(slot)].GetDimensions(texture_width, texture_height);
+        float2 texels = min(uv, 1 - uv) * float2(texture_width, texture_height);
+        blend = min(blend, saturate(min(texels.x, texels.y) / border_fade));
+    }
     if (blend <= 0) return;
     float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
     if (gain.w <= 0) return;
