@@ -3,7 +3,7 @@
 #define GLASS_VERSION_MAJOR 0
 #define GLASS_VERSION_MINOR 8
 #define GLASS_VERSION_PATCH 1
-#define GLASS_VERSION_STRING "0.8.1-test11"
+#define GLASS_VERSION_STRING "0.8.1-test13"
 #define GLASS_NAME "Glass Cockpit DLSS Fix"
 #define GLASS_AUTHOR "IFreemz"
 #define GLASS_WEBSITE "https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix"

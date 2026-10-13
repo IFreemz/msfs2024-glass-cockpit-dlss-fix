@@ -84,10 +84,9 @@ DeviceState* main_state = nullptr; // the main device's state (the offline test 
 uint64_t init_tick = 0;
 
 std::atomic<bool> enabled{true}, jitter_positive{true}, tint{false};
-// Test build: fade the redrawn screen into the upscaler's picture at screen edges (Ctrl+Shift+F8).
-std::atomic<bool> edge_blend{true};
-// Test build: leave screen pixels that point outside the screen texture to the sim (Ctrl+Shift+F7).
-std::atomic<bool> skip_outside{true};
+// Test build edge sliders: softener (percent of the line smoothing scale, 0-400), gap closer, stretcher and fade
+// (hundredths of a render pixel, 0-400).
+std::atomic<int> edge_smoothing_percent{0}, gap_closer_percent{0}, edge_stretch_percent{0}, edge_fade_percent{0};
 // Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like (softest).
 constexpr int max_smoothing = 50, default_smoothing = 35;
 std::atomic<int> smoothing_percent{default_smoothing};
@@ -1170,7 +1169,7 @@ bool create_composite(DeviceState& d) {
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 5, 0, uav_base + 4}}; // u4 is the root UAV (fit sums)
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 13};
+    params[0].Constants = {0, 0, 17};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {3, ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -1478,17 +1477,18 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     d.native->CreateUnorderedAccessView(map->residual.Get(), nullptr, &uav, at(uav_base + 4));
 
-    struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; } constants{
+    struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_smoothing, gap_closer, edge_stretch, edge_fade; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
-        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (edge_blend ? 16u : 0u) | (skip_outside ? 32u : 0u),
-        smoothing_percent / 50.0f, layer, glass_percent / 100.0f};
+        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) ,
+        smoothing_percent / 50.0f, layer, glass_percent / 100.0f, edge_smoothing_percent / 100.0f,
+        gap_closer_percent / 100.0f, edge_stretch_percent / 100.0f, edge_fade_percent / 100.0f};
 
     api::command_list* api_list = list;
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(api_list->get_native());
     ID3D12DescriptorHeap* heaps[]{d.heap.Get()};
     native->SetDescriptorHeaps(1, heaps);
     native->SetComputeRootSignature(d.root.Get());
-    native->SetComputeRoot32BitConstants(0, 13, &constants, 0);
+    native->SetComputeRoot32BitConstants(0, 17, &constants, 0);
     native->SetComputeRootDescriptorTable(1, gpu);
     native->SetComputeRootUnorderedAccessView(2, d.sums->GetGPUVirtualAddress());
     // DLSS leaves its colour input compute-readable and the output as UAV; FSR reports the states it restores.
@@ -1505,7 +1505,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         uav_barrier(native);
         d.accumulators_zeroed = true;
         constants.flags |= 1;
-        native->SetComputeRoot32BitConstants(0, 13, &constants, 0);
+        native->SetComputeRoot32BitConstants(0, 17, &constants, 0);
     }
     native->SetPipelineState(d.passes[1].Get());
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
@@ -1783,6 +1783,10 @@ void load_settings() {
     jitter_positive = GetPrivateProfileIntW(L"overlay", L"jitter_positive", 1, settings_path().c_str()) != 0;
     smoothing_percent = std::clamp(int(GetPrivateProfileIntW(L"overlay", L"line_smoothing", default_smoothing, settings_path().c_str())), 0, max_smoothing);
     glass_percent = std::clamp(int(GetPrivateProfileIntW(L"advanced", L"glass_strength", 100, settings_path().c_str())), 0, 100);
+    edge_smoothing_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"edge_smoothing", 0, settings_path().c_str())), 0, 400);
+    gap_closer_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"gap_closer", 0, settings_path().c_str())), 0, 400);
+    edge_stretch_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"edge_stretch", 0, settings_path().c_str())), 0, 400);
+    edge_fade_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"edge_fade", 0, settings_path().c_str())), 0, 400);
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
@@ -1794,6 +1798,10 @@ void save_settings() {
     WritePrivateProfileStringW(L"overlay", L"jitter_positive", jitter_positive ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"overlay", L"line_smoothing", std::to_wstring(smoothing_percent.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"advanced", L"glass_strength", std::to_wstring(glass_percent.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"test", L"edge_smoothing", std::to_wstring(edge_smoothing_percent.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"test", L"gap_closer", std::to_wstring(gap_closer_percent.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"test", L"edge_stretch", std::to_wstring(edge_stretch_percent.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"test", L"edge_fade", std::to_wstring(edge_fade_percent.load()).c_str(), settings_path().c_str());
 }
 
 // One measurement window every 10 s: 120 frames, reported ~30 frames later (the GPU has finished them by then).
@@ -1863,8 +1871,6 @@ void on_present(api::effect_runtime* runtime) {
     measure_cost(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr, runtime->get_device()->get_private_data<DeviceState>(),
         present_count.load(std::memory_order_relaxed));
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
-    if (chord && runtime->is_key_pressed(VK_F7)) { skip_outside = !skip_outside; log("setting skip_outside=%d", int(skip_outside.load())); }
-    if (chord && runtime->is_key_pressed(VK_F8)) { edge_blend = !edge_blend; log("setting edge_blend=%d", int(edge_blend.load())); }
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
     if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
     if (chord && runtime->is_key_pressed(VK_F12)) {
@@ -1935,7 +1941,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.edge_blend = edge_blend; s.skip_outside = skip_outside; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.glass_strength = glass_percent;
+    s.enabled = enabled; s.tint = tint; s.edge_smoothing = edge_smoothing_percent; s.gap_closer = gap_closer_percent; s.edge_stretch = edge_stretch_percent; s.edge_fade = edge_fade_percent; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
@@ -1954,6 +1960,13 @@ void set_enabled(bool on) {
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
 void set_line_smoothing(int percent) { smoothing_percent = std::clamp(percent, 0, max_smoothing); save_settings(); log("setting line_smoothing=%d", smoothing_percent.load()); }
 void set_jitter_positive(bool on) { jitter_positive = on; save_settings(); log("setting jitter_positive=%d", int(on)); }
+void set_edge_test(int smoothing, int gap, int stretch, int fade) {
+    edge_smoothing_percent = std::clamp(smoothing, 0, 400); gap_closer_percent = std::clamp(gap, 0, 400);
+    edge_stretch_percent = std::clamp(stretch, 0, 400); edge_fade_percent = std::clamp(fade, 0, 400);
+    save_settings();
+    log("setting edge_smoothing=%d gap_closer=%d edge_stretch=%d edge_fade=%d", edge_smoothing_percent.load(), gap_closer_percent.load(),
+        edge_stretch_percent.load(), edge_fade_percent.load());
+}
 void set_glass_strength(int percent) { glass_percent = std::clamp(percent, 0, 100); save_settings(); log("setting glass_strength=%d", glass_percent.load()); }
 }
 

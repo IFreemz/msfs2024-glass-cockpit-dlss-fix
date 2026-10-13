@@ -16,10 +16,14 @@ cbuffer Constants : register(b0)
     float2 jitter;           // offset added to map coordinates to undo this frame's camera jitter
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
-                             // bit 3: smooth lines, bit 4: edge blend, bit 5: skip outside the picture
+                             // bit 3: smooth lines, bits 4-6: unused
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
+    float edge_smoothing;    // test: extra line smoothing at display edges, in line_width units (0 = off)
+    float gap_closer;        // test: fill seams between displays up to this many render pixels wide
+    float edge_stretch;      // test: extend displays outwards by up to this many render pixels
+    float edge_fade;         // test: fade into the upscaler's picture over this many render pixels at edges
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -56,9 +60,9 @@ float3 sample_display(uint slot, float2 uv, float2 dx, float2 dy)
 // Smooth lines: what DLSS converges to on a still screen, without its history. DLSS averages each pixel over the area of
 // one jittered render pixel across frames; this averages a 4x4 grid over that area (at least 1.25 output pixels) in one
 // frame, so stair steps on thin slanted lines in the screen texture are smoothed instead of shown texel-sharp.
-float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy)
+float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy, float scale)
 {
-    float2 width = max(1.0 / map_per_output, 1.25) * line_width;
+    float2 width = max(1.0 / map_per_output, 1.25) * scale;
     float2 fx = dx * width.x, fy = dy * width.y;
     float3 sum = 0;
     [unroll] for (uint i = 0; i < 16; ++i)
@@ -117,7 +121,7 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     uint slot = map_slot(m);
     if (slot < slot_count) InterlockedMin(tile_slot, slot);
 
-    bool active = slot < slot_count && (!(flags & 32) || (all(m.xy >= 0) && all(m.xy <= 1))); // outside the picture: see composite
+    bool active = slot < slot_count;
     float3 x = 0, y = 0, detail = 0;
     if (active)
     {
@@ -231,17 +235,70 @@ void composite(uint3 id : SV_DispatchThreadID)
     uint2 tile_size = (map_size + 7) / 8;
     if (!tiles[uint2(cell) / 8] && !tiles[min(uint2(cell + 1) / 8, tile_size - 1)]) return;
     float4 a, b, c, d;
-    if (!tap(cell, a) || !tap(cell + int2(1, 0), b) || !tap(cell + int2(0, 1), c) || !tap(cell + int2(1, 1), d)) return;
-    // Never blend across a display edge.
-    if (a.w != b.w || a.w != c.w || a.w != d.w) return;
+    bool covered = tap(cell, a) & tap(cell + int2(1, 0), b) & tap(cell + int2(0, 1), c) & tap(cell + int2(1, 1), d);
+    float2 f = location - cell;
+    float2 uv, dx, dy;
+    bool filled = false;
+    if (covered && a.w == b.w && a.w == c.w && a.w == d.w)
+    {
+        uv = lerp(lerp(a.xy, b.xy, f.x), lerp(c.xy, d.xy, f.x), f.y);
+        dx = lerp(b.xy - a.xy, d.xy - c.xy, f.y) * map_per_output.x;
+        dy = lerp(c.xy - a.xy, d.xy - b.xy, f.x) * map_per_output.y;
+    }
+    else
+    {
+        // Test build: pixels at a display's edge or between two displays are normally left to the upscaler.
+        //   gap closer:     fill them when displays lie on opposite sides within gap_closer render pixels (seams)
+        //   edge stretcher: fill them when any display lies within edge_stretch render pixels (pushes edges outwards)
+        // Filled from the nearest display render pixel, its texture coordinates continued along its gradients.
+        float reach = max(gap_closer, edge_stretch);
+        if (reach <= 0) return;
+        int radius = min(int(ceil(reach + 0.5)), 4);
+        float nearest = 1e9;
+        int2 nearest_q = 0;
+        [loop] for (int y = -radius; y <= radius + 1; ++y)
+            [loop] for (int x = -radius; x <= radius + 1; ++x)
+            {
+                int2 q = cell + int2(x, y);
+                float4 v = load_map(q);
+                if (map_slot(v) >= slot_count) continue;
+                float dist = length(float2(q) - location);
+                if (dist < nearest) { nearest = dist; nearest_q = q; }
+            }
+        if (nearest > reach + 0.5) return;
+        float4 m = load_map(nearest_q);
+        bool fill = edge_stretch > 0 && nearest <= edge_stretch;
+        if (!fill && gap_closer > 0)
+        {
+            // Another display pixel on the far side of this one (any slot): this pixel sits in a seam.
+            float2 away = location - float2(nearest_q);
+            [loop] for (int y = -radius; y <= radius + 1 && !fill; ++y)
+                [loop] for (int x = -radius; x <= radius + 1 && !fill; ++x)
+                {
+                    int2 q = cell + int2(x, y);
+                    float2 to = float2(q) - location;
+                    if (dot(to, away) <= 0 || length(to) > gap_closer + 0.5) continue;
+                    if (map_slot(load_map(q)) < slot_count) fill = true;
+                }
+        }
+        if (!fill) return;
+        float4 r = load_map(nearest_q + int2(1, 0)), l = load_map(nearest_q - int2(1, 0));
+        float4 down = load_map(nearest_q + int2(0, 1)), up = load_map(nearest_q - int2(0, 1));
+        float2 gx = r.w == m.w ? r.xy - m.xy : l.w == m.w ? m.xy - l.xy : 0;
+        float2 gy = down.w == m.w ? down.xy - m.xy : up.w == m.w ? m.xy - up.xy : 0;
+        float2 o = location - float2(nearest_q);
+        uv = m.xy + o.x * gx + o.y * gy;
+        dx = gx * map_per_output.x;
+        dy = gy * map_per_output.y;
+        a = m;
+        filled = true;
+    }
     uint slot = map_slot(a);
 
-    // Edge blend: share of a tent (radius 3 render pixels) around this pixel that lies on this display. The display's
-    // edge in the map moves with the camera jitter every frame; a hard cut there crawls. Fading from the upscaler's
-    // (temporally smoothed) edge to the redrawn screen over the outer 2 render pixels hides the jitter. Needs the
-    // upscaler output readable.
-    float edge = 1;
-    if ((flags & 16) && (flags & 4))
+    // Share of a tent (radius 3 render pixels) around this pixel that lies on this display: about 2/3 at the outermost
+    // redrawn pixel, 1 from two render pixels in. Used by the edge softener and edge fade.
+    float edge = filled ? 0 : 1;
+    if (!filled && (edge_fade > 0 || edge_smoothing > 0))
     {
         float inside = 0;
         [unroll] for (int t = 0; t < 36; ++t)
@@ -250,20 +307,17 @@ void composite(uint3 id : SV_DispatchThreadID)
             float2 dist = abs(float2(q) - location);
             if (load_map(q).w == a.w) inside += max(3 - dist.x, 0) * max(3 - dist.y, 0);
         }
-        // The outermost redrawn pixel scores about 2/3, two render pixels further in 1.
-        edge = saturate((inside / 81 - 2.0 / 3) * 3);
-        if (edge <= 0) return;
+        edge = saturate((inside / 81 - 2.0 / 3) * 3); // ~ render pixels inside / 2
     }
+    // Edge softener: wider line smoothing towards the display's edges.
+    float smoothing_width = ((flags & 8) ? line_width : 0) + edge_smoothing * (1 - edge);
+    // Edge fade: fade from the upscaler's (temporally smoothed) edge to the redrawn screen over edge_fade render pixels.
+    // Needs the upscaler output readable.
+    float blend = (edge_fade > 0 && (flags & 4) && !filled) ? saturate(edge * 2 / edge_fade) : 1;
+    if (blend <= 0) return;
     float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
     if (gain.w <= 0) return;
-    float2 f = location - cell;
-    float2 uv = lerp(lerp(a.xy, b.xy, f.x), lerp(c.xy, d.xy, f.x), f.y);
-    // Some screens are modelled a little larger than their picture: the outer band points outside the texture and the
-    // sim draws it black (a thin bezel). Clamped sampling would smear the texture's edge pixels over it; leave it to the sim.
-    if ((flags & 32) && (any(uv < 0) || any(uv > 1))) return;
-    float2 dx = lerp(b.xy - a.xy, d.xy - c.xy, f.y) * map_per_output.x;
-    float2 dy = lerp(c.xy - a.xy, d.xy - b.xy, f.x) * map_per_output.y;
-    float3 content = ((flags & 8) ? sample_display_smooth(slot, uv, dx, dy) : sample_display(slot, uv, dx, dy)) * gain.rgb;
+    float3 content = (smoothing_width > 0 ? sample_display_smooth(slot, uv, dx, dy, smoothing_width) : sample_display(slot, uv, dx, dy)) * gain.rgb;
 
     // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder: bilinear value at this pixel and its
     // spread over the 3x3 render pixels around it (same display only).
@@ -302,7 +356,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     if (glass_strength < 1) glass = lerp(offset.rgb, glass, glass_strength);
     float3 colour = content + glass;
     if (flags & 2) colour = colour * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0);
-    if (edge < 1) colour = lerp(output[id.xy].rgb, colour, edge * edge * (3 - 2 * edge));
+    if (blend < 1) colour = lerp(output[id.xy].rgb, colour, blend * blend * (3 - 2 * blend));
     if (all(isfinite(colour))) output[id.xy] = float4(max(colour, 0), 1);
 }
 
