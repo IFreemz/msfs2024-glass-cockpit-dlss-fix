@@ -36,9 +36,11 @@ cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headse
 ## Installation
 
 1. Install ReShade **with full add-on support** for MSFS 2024 (DirectX 10/11/12). You don't need any effects.
-   In the ReShade setup, pick **`FlightSimulator2024.exe`** (use **Browse...**), not `gamelaunchhelper.exe`.
+   In the ReShade setup, use **Browse...** and pick `FlightSimulator2024.exe`.
    Microsoft Store / Xbox app: the game folder is usually `C:\XboxGames\Microsoft Flight Simulator 2024\Content\`. To
-   find it, open the Xbox app, right-click the game, then **Manage → Files → Browse**. If setup says `dxgi.dll` already
+   find it, open the Xbox app, right-click the game, then **Manage → Files → Browse**. Try `FlightSimulator2024.exe`
+   first; if Windows refuses ("You don't have permission to open this file"), pick **`gamelaunchhelper.exe`** in the
+   same folder instead: ReShade lands in the same place and loads with the sim. If setup says `dxgi.dll` already
    exists and doesn't belong to ReShade, another mod (e.g. OptiScaler or DLSS Enabler) is installed as `dxgi.dll`; see
    [Other mods](#other-mods) to load ReShade alongside it.
 2. Download `glass-cockpit-dlss-fix.addon64` from the [latest release](../../releases/latest).
