@@ -74,6 +74,18 @@ puts them back):
 | Flip jitter direction | Only needed if the screen text shimmers when the camera is still |
 | Glass layer (0-100 %, default 100 %) | How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens. Lower values can help if quickly changing numbers leave a milky trail |
 
+Under **Troubleshooting → Experimental fixes** (collapsed, **all off by default**; for problems that only some
+aircraft have, "Reset experimental fixes" turns them all off again):
+
+| Setting | What it does |
+|---|---|
+| Detail clamp (0-100 %) | Keeps the fixed screens within the brightness the sim itself draws around each pixel. Hides texture detail too thin for the sim to show, e.g. a **dashed light line where a screen's picture meets its bezel** (FSS E-Jets: try 100 %). **Can make screens flicker**, the more the lower the DLSS render resolution: almost none with DLAA and Quality, more with Balanced and Performance. Lower it if that bothers you, or if small text looks duller than with the fix off |
+| Edge fade (0-250) | Fades screen edges into the sim's own picture, in hundredths of a render pixel (100 = 1 pixel). Can calm jaggy or crawling screen edges. Above about 200 it can flicker |
+| Angle softening (0-100 %) | Draws screens seen at a steep angle softer, like the sim does. Screens seen straight on are unchanged |
+| Edge stretcher (0-400) | Extends screens outwards over their frame, in hundredths of a render pixel, continuing their picture. For screens that don't quite reach their frame |
+
+The tab shows "Experimental fixes changed" while any of them is on.
+
 ReShade presets and effects keep working as usual on top of the fix.
 
 ## Compatibility
@@ -94,6 +106,8 @@ ReShade presets and effects keep working as usual on top of the fix.
 | FlightFX C750 | Tested by the community (0.7.6 or newer) |
 | Default DA62 | Tested |
 | Default Cessna Longitude | Tested by the community (in VR) |
+| FSS E-Jets (ERJ-170/175/190/195) | Tested (a dashed line at the screens' edges: set Detail clamp to 100 %, see [Settings](#settings)) |
+| Default F/A-18E Super Hornet | Tested (0.8.2 or newer keeps its dark screens fixed in strong sun) |
 
 Other glass cockpits should work too. If some screens of an aircraft don't turn green with Ctrl+Shift+F11, please
 report it (see [Troubleshooting](#troubleshooting)).
@@ -178,6 +192,8 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Tab says "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
 | Screen lines look jagged / too soft | Adjust Line smoothing |
+| Dashed light line along the edge of a screen's picture (e.g. FSS E-Jets) | Set **Detail clamp** under Troubleshooting → Experimental fixes to 100 % (can add some flicker on DLSS Balanced/Performance) |
+| Dark screens drop out of the fix (green tint goes away) in strong sun | Update to 0.8.2 or newer |
 | Screen text shimmers when the camera is still | Tick **Flip jitter direction** in the Advanced section under Troubleshooting. If it's already ticked (the tab says "Advanced settings changed"), click **Reset to defaults** |
 | Screens flicker in brightness (G-Sync / FreeSync monitor) | VRR flicker from a changing frame rate, most visible on dark screens. Turn on V-Sync, or cap the frame rate a few fps below your refresh rate |
 | Crash at startup | Remove the add-on, start once, put it back, then send both logs |
@@ -211,7 +227,8 @@ no measurable FPS difference with the fix on or off in testing.
 
 - A screen whose picture the add-on can't redraw (e.g. the iFly 737 MAX EFB tablet) is left to DLSS/FSR, so it looks
   like stock.
-- A thin band at each screen's edge (about one render pixel) still comes from the upscaler.
+- A thin band at each screen's edge (about one render pixel) still comes from the upscaler (Edge fade and Edge
+  stretcher under Experimental fixes can help on some aircraft).
 - Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) would be covered by it.
 - Sim updates that change the cockpit display shader stop the fix (the sim then just looks like stock DLSS/FSR)
   until the add-on is updated.
