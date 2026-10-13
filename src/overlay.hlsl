@@ -16,7 +16,7 @@ cbuffer Constants : register(b0)
     float2 jitter;           // offset added to map coordinates to undo this frame's camera jitter
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
-                             // bit 3: smooth lines
+                             // bit 3: smooth lines, bit 4: edge blend
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -216,6 +216,25 @@ void composite(uint3 id : SV_DispatchThreadID)
     // Never blend across a display edge.
     if (a.w != b.w || a.w != c.w || a.w != d.w) return;
     uint slot = map_slot(a);
+
+    // Edge blend: share of a tent (radius 3 render pixels) around this pixel that lies on this display. The display's
+    // edge in the map moves with the camera jitter every frame; a hard cut there crawls. Fading from the upscaler's
+    // (temporally smoothed) edge to the redrawn screen over the outer 2 render pixels hides the jitter. Needs the
+    // upscaler output readable.
+    float edge = 1;
+    if ((flags & 16) && (flags & 4))
+    {
+        float inside = 0;
+        [unroll] for (int t = 0; t < 36; ++t)
+        {
+            int2 q = cell + int2(t % 6 - 2, t / 6 - 2);
+            float2 dist = abs(float2(q) - location);
+            if (load_map(q).w == a.w) inside += max(3 - dist.x, 0) * max(3 - dist.y, 0);
+        }
+        // The outermost redrawn pixel scores about 2/3, two render pixels further in 1.
+        edge = saturate((inside / 81 - 2.0 / 3) * 3);
+        if (edge <= 0) return;
+    }
     float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
     if (gain.w <= 0) return;
     float2 f = location - cell;
@@ -261,6 +280,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     if (glass_strength < 1) glass = lerp(offset.rgb, glass, glass_strength);
     float3 colour = content + glass;
     if (flags & 2) colour = colour * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0);
+    if (edge < 1) colour = lerp(output[id.xy].rgb, colour, edge * edge * (3 - 2 * edge));
     if (all(isfinite(colour))) output[id.xy] = float4(max(colour, 0), 1);
 }
 
