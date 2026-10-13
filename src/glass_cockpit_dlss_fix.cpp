@@ -185,6 +185,23 @@ std::string file_version(const wchar_t* path) {
     return text;
 }
 
+// Company name from the file's version resource ("" if none).
+std::wstring file_company(const wchar_t* path) {
+    DWORD handle = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path, &handle);
+    if (!size) return {};
+    std::vector<uint8_t> data(size);
+    struct Translation { WORD language, codepage; }* translations = nullptr; UINT length = 0;
+    if (!GetFileVersionInfoW(path, 0, size, data.data()) ||
+        !VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<void**>(&translations), &length) || length < sizeof(Translation))
+        return {};
+    wchar_t key[64];
+    swprintf(key, 64, L"\\StringFileInfo\\%04x%04x\\CompanyName", translations[0].language, translations[0].codepage);
+    wchar_t* company = nullptr;
+    if (!VerQueryValueW(data.data(), key, reinterpret_cast<void**>(&company), &length) || !company) return {};
+    return company;
+}
+
 // Logs DLSS/Streamline/ReShade-related modules once each, with version and path (helps spot missing DLSS or conflicts).
 void scan_modules() {
     static std::set<std::wstring> seen;
@@ -1691,8 +1708,20 @@ void install_ngx() {
 // DLSS answered by another mod: OptiScaler (and similar DLSS proxies) export the same evaluate function as the driver's
 // _nvngx.dll and the sim's DLSS calls go to theirs. They may answer with FSR, XeSS or (on AMD/Intel GPUs) anything but
 // real DLSS, which the hooks above never see. Hooking their evaluate catches the sim's call itself; when they run real
-// DLSS inside, that inner call is skipped (drawn once, after the outer one). NVIDIA's own nvngx_*.dll feature files
-// export a function of the same name that the driver calls internally: left alone.
+// DLSS inside, that inner call is skipped (drawn once, after the outer one). NVIDIA's own feature files export a
+// function of the same name that the driver calls internally, Frame Generation's among them: left alone. They are
+// nvngx_*.dll next to the game, or files the driver downloads by itself (C:\ProgramData\NVIDIA\NGX\models\...\*.bin),
+// so they are recognised by name, folder and the company in their version resource.
+bool nvidia_feature_file(const wchar_t* path) {
+    std::wstring lower = path;
+    for (auto& c : lower) c = wchar_t(towlower(c));
+    const std::wstring name = std::filesystem::path(lower).filename().wstring();
+    if (name == L"_nvngx.dll" || name.starts_with(L"nvngx_") || name.ends_with(L".bin") || lower.find(L"\\nvidia\\ngx\\") != std::wstring::npos)
+        return true;
+    std::wstring company = file_company(path);
+    for (auto& c : company) c = wchar_t(towlower(c));
+    return company.find(L"nvidia") != std::wstring::npos;
+}
 constexpr int max_ngx_proxies = 4;
 std::array<Evaluate, max_ngx_proxies> original_proxy_evaluate{};
 std::array<HMODULE, max_ngx_proxies> ngx_proxies{};
@@ -1718,13 +1747,19 @@ void install_ngx_proxies() {
     for (DWORD i = 0; i < std::min<DWORD>(needed / sizeof(HMODULE), 1024) && ngx_proxy_count < max_ngx_proxies; ++i) {
         const HMODULE module = modules[i];
         if (module == self || std::find(ngx_proxies.begin(), ngx_proxies.begin() + ngx_proxy_count, module) != ngx_proxies.begin() + ngx_proxy_count) continue;
+        auto evaluate = GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature");
+        if (!evaluate) continue;
+        static std::set<HMODULE> nvidia_files;
+        if (nvidia_files.contains(module)) continue;
         wchar_t path[MAX_PATH]{};
         if (!GetModuleFileNameW(module, path, MAX_PATH)) continue;
         std::wstring name = std::filesystem::path(path).filename().wstring();
         for (auto& c : name) c = wchar_t(towlower(c));
-        if (name == L"_nvngx.dll" || name.starts_with(L"nvngx_")) continue;
-        auto evaluate = GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature");
-        if (!evaluate) continue;
+        if (nvidia_feature_file(path)) {
+            nvidia_files.insert(module);
+            log("NVIDIA DLSS feature file left alone: %ls %s path=%ls", name.c_str(), file_version(path).c_str(), path);
+            continue;
+        }
         const int index = ngx_proxy_count++;
         ngx_proxies[index] = module;
         HMODULE pinned = nullptr;
