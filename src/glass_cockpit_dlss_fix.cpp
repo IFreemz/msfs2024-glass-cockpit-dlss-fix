@@ -1171,7 +1171,7 @@ bool create_composite(DeviceState& d) {
     D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ring_size * descriptors_per_frame, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(d.native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&d.heap)))) return false;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slot_count * 16 * 8, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+    D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slot_count * 20 * 8, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
         D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.sums)))) return false;
     buffer.Width = slot_count * 3 * 16;
@@ -1197,8 +1197,10 @@ void log_brightness(DeviceState& d) {
     float* data = nullptr;
     const D3D12_RANGE range{0, slot_count * 3 * 16};
     if (FAILED(d.params_readback->Map(0, &range, reinterpret_cast<void**>(&data)))) return;
+    // Every dump for the first ~10 minutes, then about once a minute.
     static std::atomic<int> dumps{0};
-    if (dumps++ < 60) {
+    const int dump = dumps++;
+    if (dump < 60 || dump % 6 == 0) {
         for (unsigned slot = 0; slot < slot_count; ++slot) {
             const float* a = data + slot * 12;
             const float* b = a + 4;

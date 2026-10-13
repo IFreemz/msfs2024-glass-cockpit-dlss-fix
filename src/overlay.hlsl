@@ -29,12 +29,12 @@ RWTexture2D<float4> output : register(u0);  // DLSS output, R11G11B10_FLOAT
 RWTexture2D<uint> tiles : register(u1);     // per 8x8 map tile: display slot + 1 this frame (0 = none)
 RWStructuredBuffer<float4> params : register(u2); // per slot: [3s] = a.rgb, valid; [3s+1] = b.rgb, samples; [3s+2] = mean screen.rgb, fit quality
 RWTexture2DArray<float4> map_rw : register(u3);
-RWByteAddressBuffer sums : register(u4);    // per slot 16 x uint64 fixed point
+RWByteAddressBuffer sums : register(u4);    // per slot 20 x uint64 fixed point
 RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * display, w = slot + 1 (0 = none)
 SamplerState display_sampler : register(s0);
 
 static const uint slot_count = 32;
-static const uint terms = 16;
+static const uint terms = 20;
 static const float fixed_scale = 16777216.0;
 
 float3 srgb_to_linear(float3 c)
@@ -85,16 +85,19 @@ void zero(uint3 id : SV_DispatchThreadID)
 
 groupshared uint tile_slot;
 
-void accumulate(uint slot, float3 x, float3 y)
+// detail: pooled products of neighbour differences (screen x, scene y): xx, yy, xy (fine detail only, see solve).
+void accumulate(uint slot, float3 x, float3 y, float3 detail)
 {
     uint base = slot * terms * 8;
     uint count = WaveActiveCountBits(true);
     float3 sx = WaveActiveSum(x), sy = WaveActiveSum(y), sxx = WaveActiveSum(x * x), sxy = WaveActiveSum(x * y), syy = WaveActiveSum(y * y);
+    float3 sd = WaveActiveSum(float3(detail.x, detail.y, max(detail.z, 0))), sd_negative = WaveActiveSum(max(-detail.z, 0));
     if (WaveIsFirstLane())
     {
         sums.InterlockedAdd64(base, uint64_t(count));
-        float values[15] = { sx.r, sx.g, sx.b, sy.r, sy.g, sy.b, sxx.r, sxx.g, sxx.b, sxy.r, sxy.g, sxy.b, syy.r / 1024, syy.g / 1024, syy.b / 1024 }; // y*y scaled: fixed point headroom
-        [unroll] for (uint i = 0; i < 15; ++i)
+        float values[19] = { sx.r, sx.g, sx.b, sy.r, sy.g, sy.b, sxx.r, sxx.g, sxx.b, sxy.r, sxy.g, sxy.b, syy.r / 1024, syy.g / 1024, syy.b / 1024, // y*y scaled: fixed point headroom
+            sd.x, sd.y / 1024, sd.z, sd_negative.x };
+        [unroll] for (uint i = 0; i < 19; ++i)
             sums.InterlockedAdd64(base + (i + 1) * 8, uint64_t(max(values[i], 0.0) * fixed_scale));
     }
 }
@@ -115,7 +118,7 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     if (slot < slot_count) InterlockedMin(tile_slot, slot);
 
     bool active = slot < slot_count;
-    float3 x = 0, y = 0;
+    float3 x = 0, y = 0, detail = 0;
     if (active)
     {
         // UV footprint of this render pixel from neighbours on the same display.
@@ -127,6 +130,17 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
         y = scene.Load(int3(p, 0)).rgb;
         active = all(isfinite(y));
         y = clamp(y, 0, 1024);
+        // Fine detail: differences to the right and lower neighbour on the same display. Sun glare and other smooth
+        // light on the glass hardly changes these, so dark screens with thin symbols still score well in the sun.
+        [unroll] for (uint k = 0; k < 2; ++k)
+        {
+            float4 n = k ? d : r;
+            int2 np = p + int2(1 - k, k);
+            if (map_slot(n) != slot) continue;
+            float3 hy = clamp(scene.Load(int3(np, 0)).rgb, 0, 1024) - y;
+            float3 hx = sample_display(slot, n.xy, dx, dy) - x;
+            if (all(isfinite(hy))) detail += float3(dot(hx, hx), dot(hy, hy), dot(hx, hy));
+        }
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -144,7 +158,7 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
             uint first = WaveReadLaneFirst(slot);
             if (slot == first)
             {
-                accumulate(slot, x, y);
+                accumulate(slot, x, y, detail);
                 done = true;
             }
         }
@@ -188,6 +202,11 @@ void solve(uint3 id : SV_DispatchThreadID)
     // content to keep sharp, so it is left to the upscaler too.
     double quality = pooled_variance > 3e-6 && pooled_scene_variance > 1e-9 && pooled_covariance > 0
         ? pooled_covariance * pooled_covariance / (pooled_variance * pooled_scene_variance) : 0.0;
+    // The same on fine detail only. Sun glare across a mostly dark screen dwarfs its thin symbols and drags the score
+    // above down, but barely touches the detail; a picture the texture doesn't hold still scores low on both.
+    double detail_xx = v[16], detail_yy = v[17] * 1024, detail_xy = v[18] - v[19];
+    if (pooled_variance > 3e-6 && detail_xx > 0 && detail_yy > 0 && detail_xy > 0)
+        quality = max(quality, detail_xy * detail_xy / (detail_xx * detail_yy));
     float w = previous_a.w > 0 ? smoothing : 1;
     float q = previous_a.w != 0 ? lerp(previous_q.w, float(quality), smoothing) : float(quality);
     bool keep = previous_a.w < 0 ? q > 0.25 : q > 0.15; // hysteresis: no flicker near the limit
