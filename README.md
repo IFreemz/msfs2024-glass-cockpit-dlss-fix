@@ -58,7 +58,14 @@ All settings are in the add-on's tab in the ReShade menu (**Home**) and are reme
 | Fix enabled (Ctrl+Shift+F9) | Fix on/off, for comparison |
 | Line smoothing (0-50 %, default 35 %) | Smooths stair steps on thin slanted lines in the screens, like the upscaler did. 0 = sharpest, 50 = softest. Ctrl+click to type a value |
 | Green tint (Ctrl+Shift+F11) | Tints every screen the fix covers (for checking, not remembered) |
+
+Under **Troubleshooting → Advanced** (collapsed; only change these if asked to in a bug report, "Reset to defaults"
+puts them back):
+
+| Setting | What it does |
+|---|---|
 | Flip jitter direction (Ctrl+Shift+F10) | Only needed if the screen text shimmers when the camera is still |
+| Glass layer (0-100 %, default 100 %) | How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens. Lower values can help if quickly changing numbers leave a milky trail |
 
 ReShade presets and effects keep working as usual on top of the fix.
 
@@ -101,6 +108,7 @@ Other headsets and runtimes should work the same; reports welcome.
 | NVIDIA, FSR | Tested |
 | AMD, FSR | Tested by the community on an RX 6800 XT and an RX 7800 XT (0.7.6 or newer runs much lighter on AMD and Intel) |
 | Intel, FSR | Untested, reports welcome |
+| Any GPU, upscaler chosen in OptiScaler | Tested on NVIDIA with DLSS, FSR 2/3 and XeSS (0.8.0 or newer), see [Other mods](#other-mods) |
 
 ### Game versions
 
@@ -118,11 +126,13 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
     newer follows that redirect; older versions log "could not hook DLSS evaluate". Its Backspace menu doesn't show up
     when ReShade is loaded, with or without this fix, so set the multiplier in the sim's frame generation setting or
     in its `RTXMFG-Universal.json`.
-- **OptiScaler:** works when OptiScaler's upscaler is set to DLSS, including OptiScaler's DLSS 5 Neural Rendering. With
-  FSR 3.1 or XeSS selected in OptiScaler, the screens aren't fixed yet. If ReShade says "There were errors loading
-  some add-ons", update to 0.7.4 or newer. If another mod also needs to be `dxgi.dll`, load ReShade through an ASI
-  loader or through OptiScaler's `LoadReshade` option instead.
-- **DLSS Enabler:** built on OptiScaler, so the same applies. Not tested yet, reports welcome.
+- **OptiScaler:** works with any upscaler selected in OptiScaler (DLSS, FSR 2/3/4, XeSS; 0.8.0 or newer for anything
+  but DLSS), including OptiScaler's DLSS 5 Neural Rendering. On AMD and Intel GPUs this also lets you select DLSS in
+  the sim and have OptiScaler run FSR or XeSS (0.8.0 or newer; tested on NVIDIA, reports from AMD welcome). If ReShade
+  says "There were errors loading some add-ons", update to 0.7.4 or newer. If another mod also needs to be
+  `dxgi.dll`, load ReShade through an ASI loader or through OptiScaler's `LoadReshade` option instead.
+- **DLSS Enabler:** built on OptiScaler, so it should work the same way (0.8.0 or newer). Not tested yet, reports
+  welcome.
 
 ## Troubleshooting
 
@@ -152,6 +162,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 |---|---|
 | No "Glass Cockpit DLSS Fix" tab in the ReShade menu | The add-on isn't loaded. If the ReShade menu has no **Add-ons** tab, reinstall ReShade with the *full add-on support* download. Check that the file is next to the ReShade DLL. |
 | Nothing changes, no green tint | Check that ReShade is the *full add-on support* build, the file is next to the ReShade DLL and DLSS or FSR is selected. Then read the tab and the log. |
+| Tab says "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
 | Screen lines look jagged / too soft | Adjust Line smoothing |
 | Screen text shimmers when the camera is still | Press Ctrl+Shift+F10 once |

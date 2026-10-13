@@ -43,11 +43,11 @@ std::string summary(const glass::Status& s) {
 
 std::string report(const glass::Status& s) {
     return format("Glass Cockpit DLSS Fix %s\nstatus: %s\ngpu: %s (driver %s)\ndlss: %s, calls=%llu upscales=%llu\nfsr: %s, calls=%llu\nshader_found=%d screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu\n"
-        "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d\n",
+        "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d glass_strength=%d\n",
         GLASS_VERSION_STRING, summary(s).c_str(), s.gpu.empty() ? "unknown" : s.gpu.c_str(), s.driver.c_str(),
         s.dlss_loaded ? (s.dlss_version.empty() ? "loaded" : s.dlss_version.c_str()) : "not loaded", s.dlss_calls, s.dlss_upscales,
         s.fsr_loaded ? (s.fsr_version.empty() ? "loaded" : s.fsr_version.c_str()) : "not loaded", s.fsr_calls, s.shader_found, s.screen_draws,
-        s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing);
+        s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing, s.glass_strength);
 }
 
 void draw(reshade::api::effect_runtime*) {
@@ -60,7 +60,7 @@ void draw(reshade::api::effect_runtime*) {
     ImGui::TextColored(s.active ? green : (!s.enabled || !s.problem) ? yellow : red, "%s", summary(s).c_str());
 
     ImGui::SeparatorText("Settings");
-    bool enabled = s.enabled, tint = s.tint, flipped = !s.jitter_positive;
+    bool enabled = s.enabled, tint = s.tint;
     int smoothing = s.line_smoothing;
     if (ImGui::Checkbox("Fix enabled  (Ctrl+Shift+F9)", &enabled)) glass::set_enabled(enabled);
     if (ImGui::SliderInt("Line smoothing", &smoothing, 0, 50, smoothing ? "%d%%" : "off (sharpest)", ImGuiSliderFlags_AlwaysClamp))
@@ -68,8 +68,7 @@ void draw(reshade::api::effect_runtime*) {
     ImGui::SetItemTooltip("Smooths stair steps on thin slanted lines, like DLSS did. 0 = sharpest, 35 = default, 50 = softest.\n"
         "Ctrl+click to type a value.");
     if (ImGui::Checkbox("Green tint on fixed screens  (Ctrl+Shift+F11)", &tint)) glass::set_tint(tint);
-    if (ImGui::Checkbox("Flip jitter direction  (Ctrl+Shift+F10)", &flipped)) glass::set_jitter_positive(!flipped);
-    ImGui::SetItemTooltip("Only needed if the screen text shimmers while the camera is still.");
+    if (!s.jitter_positive || s.glass_strength != 100) ImGui::TextColored(yellow, "Advanced settings changed (see Troubleshooting below)");
 
     ImGui::SeparatorText("Checks");
     if (ImGui::BeginTable("checks", 3, ImGuiTableFlags_SizingFixedFit)) {
@@ -98,6 +97,19 @@ void draw(reshade::api::effect_runtime*) {
     ImGui::SameLine();
     if (ImGui::Button("Copy report")) ImGui::SetClipboardText(report(s).c_str());
     ImGui::TextColored(grey, "For bug reports, attach glass-cockpit-dlss-fix.log and .old.log from the log folder.");
+
+    // Settings that only help in specific cases; collapsed so they aren't mistaken for quality settings.
+    if (ImGui::TreeNode("Advanced (only change these if asked to in a bug report)")) {
+        bool flipped = !s.jitter_positive;
+        int glass_strength = s.glass_strength;
+        if (ImGui::Checkbox("Flip jitter direction  (Ctrl+Shift+F10)", &flipped)) glass::set_jitter_positive(!flipped);
+        ImGui::SetItemTooltip("Only needed if the screen text shimmers while the camera is still.");
+        if (ImGui::SliderInt("Glass layer", &glass_strength, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) glass::set_glass_strength(glass_strength);
+        ImGui::SetItemTooltip("How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens.\n"
+            "100 = all (default). Lower values can help if quickly changing numbers leave a milky trail.");
+        if (ImGui::Button("Reset to defaults")) { glass::set_jitter_positive(true); glass::set_glass_strength(100); }
+        ImGui::TreePop();
+    }
 }
 }
 

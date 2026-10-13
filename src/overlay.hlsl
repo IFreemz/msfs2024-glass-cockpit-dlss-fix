@@ -19,6 +19,7 @@ cbuffer Constants : register(b0)
                              // bit 3: smooth lines
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
+    float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -257,6 +258,7 @@ void composite(uint3 id : SV_DispatchThreadID)
             glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread);
         }
     }
+    if (glass_strength < 1) glass = lerp(offset.rgb, glass, glass_strength);
     float3 colour = content + glass;
     if (flags & 2) colour = colour * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0);
     if (all(isfinite(colour))) output[id.xy] = float4(max(colour, 0), 1);
