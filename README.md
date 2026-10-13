@@ -93,6 +93,10 @@ report it (see [Troubleshooting](#troubleshooting)).
 
 ### VR
 
+No special install for VR: install ReShade for MSFS 2024 exactly as for a monitor (DirectX 12, full add-on support).
+The fix works inside the sim's own rendering, so it covers the headset views automatically. ReShade's OpenXR / VR
+option is only for showing ReShade's own effects and menu in the headset and isn't needed.
+
 | Headset | Status |
 |---|---|
 | Meta Quest 3 through Virtual Desktop | Tested with DLSS and FSR, foveated rendering on and off |
