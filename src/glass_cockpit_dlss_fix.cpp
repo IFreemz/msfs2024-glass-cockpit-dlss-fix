@@ -86,6 +86,8 @@ uint64_t init_tick = 0;
 std::atomic<bool> enabled{true}, jitter_positive{true}, tint{false};
 // Test build: fade the redrawn screen into the upscaler's picture at screen edges (Ctrl+Shift+F8).
 std::atomic<bool> edge_blend{true};
+// Test build: leave screen pixels that point outside the screen texture to the sim (Ctrl+Shift+F7).
+std::atomic<bool> skip_outside{true};
 // Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like (softest).
 constexpr int max_smoothing = 50, default_smoothing = 35;
 std::atomic<int> smoothing_percent{default_smoothing};
@@ -1478,7 +1480,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
 
     struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
-        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (edge_blend ? 16u : 0u),
+        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (edge_blend ? 16u : 0u) | (skip_outside ? 32u : 0u),
         smoothing_percent / 50.0f, layer, glass_percent / 100.0f};
 
     api::command_list* api_list = list;
@@ -1861,6 +1863,7 @@ void on_present(api::effect_runtime* runtime) {
     measure_cost(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr, runtime->get_device()->get_private_data<DeviceState>(),
         present_count.load(std::memory_order_relaxed));
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
+    if (chord && runtime->is_key_pressed(VK_F7)) { skip_outside = !skip_outside; log("setting skip_outside=%d", int(skip_outside.load())); }
     if (chord && runtime->is_key_pressed(VK_F8)) { edge_blend = !edge_blend; log("setting edge_blend=%d", int(edge_blend.load())); }
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
     if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
@@ -1932,7 +1935,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.edge_blend = edge_blend; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.glass_strength = glass_percent;
+    s.enabled = enabled; s.tint = tint; s.edge_blend = edge_blend; s.skip_outside = skip_outside; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);

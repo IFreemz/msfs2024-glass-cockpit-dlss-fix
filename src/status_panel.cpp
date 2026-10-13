@@ -69,6 +69,7 @@ void draw(reshade::api::effect_runtime*) {
         "Ctrl+click to type a value.");
     if (ImGui::Checkbox("Green tint on fixed screens  (Ctrl+Shift+F11)", &tint)) glass::set_tint(tint);
     ImGui::TextColored(yellow, "Test build: soft screen edges %s  (Ctrl+Shift+F8 to compare)", s.edge_blend ? "ON" : "OFF");
+    ImGui::TextColored(yellow, "Test build: skip screen border outside the picture %s  (Ctrl+Shift+F7)", s.skip_outside ? "ON" : "OFF");
     if (!s.jitter_positive || s.glass_strength != 100) ImGui::TextColored(yellow, "Advanced settings changed (see Troubleshooting below)");
 
     ImGui::SeparatorText("Checks");

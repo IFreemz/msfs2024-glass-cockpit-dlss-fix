@@ -16,7 +16,7 @@ cbuffer Constants : register(b0)
     float2 jitter;           // offset added to map coordinates to undo this frame's camera jitter
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
-                             // bit 3: smooth lines, bit 4: edge blend
+                             // bit 3: smooth lines, bit 4: edge blend, bit 5: skip outside the picture
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -117,7 +117,7 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     uint slot = map_slot(m);
     if (slot < slot_count) InterlockedMin(tile_slot, slot);
 
-    bool active = slot < slot_count;
+    bool active = slot < slot_count && (!(flags & 32) || (all(m.xy >= 0) && all(m.xy <= 1))); // outside the picture: see composite
     float3 x = 0, y = 0, detail = 0;
     if (active)
     {
@@ -258,6 +258,9 @@ void composite(uint3 id : SV_DispatchThreadID)
     if (gain.w <= 0) return;
     float2 f = location - cell;
     float2 uv = lerp(lerp(a.xy, b.xy, f.x), lerp(c.xy, d.xy, f.x), f.y);
+    // Some screens are modelled a little larger than their picture: the outer band points outside the texture and the
+    // sim draws it black (a thin bezel). Clamped sampling would smear the texture's edge pixels over it; leave it to the sim.
+    if ((flags & 32) && (any(uv < 0) || any(uv > 1))) return;
     float2 dx = lerp(b.xy - a.xy, d.xy - c.xy, f.y) * map_per_output.x;
     float2 dy = lerp(c.xy - a.xy, d.xy - b.xy, f.x) * map_per_output.y;
     float3 content = ((flags & 8) ? sample_display_smooth(slot, uv, dx, dy) : sample_display(slot, uv, dx, dy)) * gain.rgb;
