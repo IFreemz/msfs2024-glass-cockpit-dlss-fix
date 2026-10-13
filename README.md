@@ -112,7 +112,7 @@ Other headsets and runtimes should work the same; reports welcome.
 | NVIDIA, FSR | Tested |
 | AMD, FSR | Tested by the community on an RX 6800 XT and an RX 7800 XT (0.7.6 or newer runs much lighter on AMD and Intel) |
 | Intel, FSR | Untested, reports welcome |
-| Any GPU, upscaler chosen in OptiScaler | Tested on NVIDIA with DLSS, FSR 2/3 and XeSS (0.8.0 or newer), see [Other mods](#other-mods) |
+| Any GPU, upscaler chosen in OptiScaler | Tested on NVIDIA with DLSS, FSR 2/3 and XeSS, and by the community on an AMD RX 9070 XT with DLSS selected and FSR 4 underneath (0.8.0 or newer), see [Other mods](#other-mods) |
 
 ### Game versions
 
@@ -132,7 +132,8 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
     in its `RTXMFG-Universal.json`.
 - **OptiScaler:** works with any upscaler selected in OptiScaler (DLSS, FSR 2/3/4, XeSS; 0.8.0 or newer for anything
   but DLSS), including OptiScaler's DLSS 5 Neural Rendering. On AMD and Intel GPUs this also lets you select DLSS in
-  the sim and have OptiScaler run FSR or XeSS (0.8.0 or newer; tested on NVIDIA, reports from AMD welcome). If ReShade
+  the sim and have OptiScaler run FSR or XeSS (0.8.0 or newer; tested on NVIDIA, and by the community on an AMD RX 9070 XT
+  with FSR 4). If ReShade
   says "There were errors loading some add-ons", update to 0.7.4 or newer. If another mod also needs to be
   `dxgi.dll`, load ReShade through an ASI loader or through OptiScaler's `LoadReshade` option instead.
 - **DLSS Enabler:** built on OptiScaler, so it should work the same way (0.8.0 or newer). Not tested yet, reports
