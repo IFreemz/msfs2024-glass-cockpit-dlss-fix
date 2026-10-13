@@ -36,9 +36,11 @@ cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headse
 ## Installation
 
 1. Install ReShade **with full add-on support** for MSFS 2024 (DirectX 10/11/12). You don't need any effects.
-   In the ReShade setup, pick **`FlightSimulator2024.exe`** (use **Browse...**), not `gamelaunchhelper.exe`.
+   In the ReShade setup, use **Browse...** and pick `FlightSimulator2024.exe`.
    Microsoft Store / Xbox app: the game folder is usually `C:\XboxGames\Microsoft Flight Simulator 2024\Content\`. To
-   find it, open the Xbox app, right-click the game, then **Manage → Files → Browse**. If setup says `dxgi.dll` already
+   find it, open the Xbox app, right-click the game, then **Manage → Files → Browse**. Try `FlightSimulator2024.exe`
+   first; if Windows refuses ("You don't have permission to open this file"), pick **`gamelaunchhelper.exe`** in the
+   same folder instead: ReShade lands in the same place and loads with the sim. If setup says `dxgi.dll` already
    exists and doesn't belong to ReShade, another mod (e.g. OptiScaler or DLSS Enabler) is installed as `dxgi.dll`; see
    [Other mods](#other-mods) to load ReShade alongside it.
 2. Download `glass-cockpit-dlss-fix.addon64` from the [latest release](../../releases/latest).
@@ -69,7 +71,7 @@ puts them back):
 
 | Setting | What it does |
 |---|---|
-| Flip jitter direction (Ctrl+Shift+F10) | Only needed if the screen text shimmers when the camera is still |
+| Flip jitter direction | Only needed if the screen text shimmers when the camera is still |
 | Glass layer (0-100 %, default 100 %) | How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens. Lower values can help if quickly changing numbers leave a milky trail |
 
 ReShade presets and effects keep working as usual on top of the fix.
@@ -172,10 +174,11 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 |---|---|
 | No "Glass Cockpit DLSS Fix" tab in the ReShade menu | The add-on isn't loaded. If the ReShade menu has no **Add-ons** tab, reinstall ReShade with the *full add-on support* download. Check that the file is next to the ReShade DLL, and that **Settings → Add-on search path** in the ReShade menu points to that folder. |
 | Nothing changes, no green tint | Check that ReShade is the *full add-on support* build, the file is next to the ReShade DLL and DLSS or FSR is selected. Then read the tab and the log. |
+| Picture freezes or turns black with Frame Generation on (fine when alt-tabbed) | Update to 0.8.1 or newer (0.8.0 only) |
 | Tab says "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
 | Screen lines look jagged / too soft | Adjust Line smoothing |
-| Screen text shimmers when the camera is still | Press Ctrl+Shift+F10 once |
+| Screen text shimmers when the camera is still | Tick **Flip jitter direction** in the Advanced section under Troubleshooting. If it's already ticked (the tab says "Advanced settings changed"), click **Reset to defaults** |
 | Screens flicker in brightness (G-Sync / FreeSync monitor) | VRR flicker from a changing frame rate, most visible on dark screens. Turn on V-Sync, or cap the frame rate a few fps below your refresh rate |
 | Crash at startup | Remove the add-on, start once, put it back, then send both logs |
 
