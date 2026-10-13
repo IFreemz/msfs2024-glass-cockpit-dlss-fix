@@ -9,7 +9,8 @@
 //    DLSS input colour, sample the clean display texture at output resolution (jitter removed) and write it over the
 //    DLSS output. Dirt, glare and shadows on the glass come from the DLSS output itself, clamped to this frame's
 //    local range so that trails of old screen content are removed.
-// Hotkeys: Ctrl+Shift+F9 on/off, Ctrl+Shift+F10 flip jitter direction, Ctrl+Shift+F11 green tint (shows coverage).
+// Hotkeys: Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint (shows coverage). Flip jitter direction is in the panel only
+// (a hotkey between those two was too easy to hit by accident).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -1822,7 +1823,6 @@ void on_present(api::effect_runtime* runtime) {
         present_count.load(std::memory_order_relaxed));
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
-    if (chord && runtime->is_key_pressed(VK_F10)) glass::set_jitter_positive(!jitter_positive);
     if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
     if (chord && runtime->is_key_pressed(VK_F12)) {
         screen_probe_until = present_count.load() + 600;
@@ -1918,7 +1918,7 @@ extern "C" __declspec(dllexport) const char* NAME = GLASS_NAME;
 extern "C" __declspec(dllexport) const char* AUTHOR = GLASS_AUTHOR;
 extern "C" __declspec(dllexport) const char* WEBSITE = GLASS_WEBSITE;
 extern "C" __declspec(dllexport) const char* ISSUES = GLASS_ISSUES;
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghosting from MSFS 2024 glass cockpit displays. Ctrl+Shift+F9 on/off, Ctrl+Shift+F10 flip jitter direction, Ctrl+Shift+F11 green tint.";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghosting from MSFS 2024 glass cockpit displays. Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint.";
 
 #define OVERLAY_EVENTS(X) \
     X(init_device, on_init_device) X(destroy_device, on_destroy_device) X(init_pipeline_layout, on_init_layout) \
@@ -1989,7 +1989,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
     log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d glass_strength=%d", module, fixture, enabled.load(), jitter_positive.load(),
         smoothing_percent.load(), glass_percent.load());
-    log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F10 flip jitter direction, Ctrl+Shift+F11 green tint");
+    log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint");
     scan_modules();
     std::thread(worker).detach();
 #define REGISTER(event, callback) reshade::register_event<reshade::addon_event::event>(callback);

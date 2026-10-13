@@ -71,7 +71,7 @@ puts them back):
 
 | Setting | What it does |
 |---|---|
-| Flip jitter direction (Ctrl+Shift+F10) | Only needed if the screen text shimmers when the camera is still |
+| Flip jitter direction | Only needed if the screen text shimmers when the camera is still |
 | Glass layer (0-100 %, default 100 %) | How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens. Lower values can help if quickly changing numbers leave a milky trail |
 
 ReShade presets and effects keep working as usual on top of the fix.
@@ -177,7 +177,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Tab says "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
 | Screen lines look jagged / too soft | Adjust Line smoothing |
-| Screen text shimmers when the camera is still | Press Ctrl+Shift+F10 once |
+| Screen text shimmers when the camera is still | Tick **Flip jitter direction** in the Advanced section under Troubleshooting. If it's already ticked (the tab says "Advanced settings changed"), click **Reset to defaults** |
 | Screens flicker in brightness (G-Sync / FreeSync monitor) | VRR flicker from a changing frame rate, most visible on dark screens. Turn on V-Sync, or cap the frame rate a few fps below your refresh rate |
 | Crash at startup | Remove the add-on, start once, put it back, then send both logs |
 

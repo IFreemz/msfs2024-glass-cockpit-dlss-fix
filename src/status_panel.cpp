@@ -102,7 +102,7 @@ void draw(reshade::api::effect_runtime*) {
     if (ImGui::TreeNode("Advanced (only change these if asked to in a bug report)")) {
         bool flipped = !s.jitter_positive;
         int glass_strength = s.glass_strength;
-        if (ImGui::Checkbox("Flip jitter direction  (Ctrl+Shift+F10)", &flipped)) glass::set_jitter_positive(!flipped);
+        if (ImGui::Checkbox("Flip jitter direction", &flipped)) glass::set_jitter_positive(!flipped);
         ImGui::SetItemTooltip("Only needed if the screen text shimmers while the camera is still.");
         if (ImGui::SliderInt("Glass layer", &glass_strength, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) glass::set_glass_strength(glass_strength);
         ImGui::SetItemTooltip("How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens.\n"
