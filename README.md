@@ -155,6 +155,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
 | Screen lines look jagged / too soft | Adjust Line smoothing |
 | Screen text shimmers when the camera is still | Press Ctrl+Shift+F10 once |
+| Screens flicker in brightness (G-Sync / FreeSync monitor) | VRR flicker from a changing frame rate, most visible on dark screens. Turn on V-Sync, or cap the frame rate a few fps below your refresh rate |
 | Crash at startup | Remove the add-on, start once, put it back, then send both logs |
 
 ## How the fix works
