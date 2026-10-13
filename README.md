@@ -99,7 +99,7 @@ Other headsets and runtimes should work the same; reports welcome.
 |---|---|
 | NVIDIA RTX, DLSS Super Resolution | Tested, including DLSS Frame Generation up to 6x Multi Frame Generation |
 | NVIDIA, FSR | Tested |
-| AMD, FSR | Tested by the community on an RX 6800 XT (0.7.1 or newer) |
+| AMD, FSR | Tested by the community on an RX 6800 XT and an RX 7800 XT (0.7.6 or newer runs much lighter on AMD and Intel) |
 | Intel, FSR | Untested, reports welcome |
 
 ### Game versions
