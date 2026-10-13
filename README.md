@@ -77,6 +77,7 @@ ReShade presets and effects keep working as usual on top of the fix.
 | iniBuilds A380 | Tested |
 | PMDG 737 | Tested by the community (also in VR) |
 | PMDG 777 | Tested by the community (also in VR) |
+| FlightFX C750 | Tested by the community (0.7.6 or newer) |
 | Default DA62 | Tested |
 | Default Cessna Longitude | Tested by the community (in VR) |
 
@@ -110,11 +111,18 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
 - **ReShade presets and effects:** work as usual.
 - **DLSS 5 / Neural Rendering add-ons:** tested alongside the RenoDX DLSS 5 add-on.
 - **OptiShade:** the OptiShade developer is building this fix into OptiShade.
-- **RTX 40 Multi Frame Generation unlock** (`VERSION.dll` mod): 0.7.5 or newer attaches to DLSS with it installed.
-  Older versions log "could not hook DLSS evaluate" with it. Reports welcome.
-- **OptiScaler:** works when OptiScaler's upscaler is set to DLSS, including OptiScaler's DLSS 5 Neural Rendering. If
-  ReShade says "There were errors loading some add-ons", update to 0.7.4 or newer. If another mod also needs to be
-  `dxgi.dll`, load ReShade through an ASI loader or through OptiScaler's `LoadReshade` option instead.
+- **Multi Frame Generation unlocks for RTX 40:**
+  - **RenoDX MFG unlock add-on:** tested, works together with this fix.
+  - **[RTX40MFG-Unlock](https://github.com/dashdogy/RTX40MFG-Unlock) by dashdogy:** tested with v1.4.2 (installed as
+    `winmm.dll` next to an ASI loader's `version.dll`; `version.dll` alone works too). It redirects DLSS, and 0.7.5 or
+    newer follows that redirect; older versions log "could not hook DLSS evaluate". Its Backspace menu doesn't show up
+    when ReShade is loaded, with or without this fix, so set the multiplier in the sim's frame generation setting or
+    in its `RTXMFG-Universal.json`.
+- **OptiScaler:** works when OptiScaler's upscaler is set to DLSS, including OptiScaler's DLSS 5 Neural Rendering. With
+  FSR 3.1 or XeSS selected in OptiScaler, the screens aren't fixed yet. If ReShade says "There were errors loading
+  some add-ons", update to 0.7.4 or newer. If another mod also needs to be `dxgi.dll`, load ReShade through an ASI
+  loader or through OptiScaler's `LoadReshade` option instead.
+- **DLSS Enabler:** built on OptiScaler, so the same applies. Not tested yet, reports welcome.
 
 ## Troubleshooting
 
