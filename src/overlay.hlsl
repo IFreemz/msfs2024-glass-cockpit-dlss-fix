@@ -20,10 +20,8 @@ cbuffer Constants : register(b0)
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
-    float edge_smoothing;    // test: extra line smoothing at display edges, in line_width units (0 = off)
-    float gap_closer;        // test: fill seams between displays up to this many render pixels wide
+    float edge_fade;         // fade into the upscaler's picture over this many render pixels at display edges (0-4)
     float edge_stretch;      // test: extend displays outwards by up to this many render pixels
-    float edge_fade;         // test: fade into the upscaler's picture over this many render pixels at edges
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -60,9 +58,9 @@ float3 sample_display(uint slot, float2 uv, float2 dx, float2 dy)
 // Smooth lines: what DLSS converges to on a still screen, without its history. DLSS averages each pixel over the area of
 // one jittered render pixel across frames; this averages a 4x4 grid over that area (at least 1.25 output pixels) in one
 // frame, so stair steps on thin slanted lines in the screen texture are smoothed instead of shown texel-sharp.
-float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy, float scale)
+float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy)
 {
-    float2 width = max(1.0 / map_per_output, 1.25) * scale;
+    float2 width = max(1.0 / map_per_output, 1.25) * line_width;
     float2 fx = dx * width.x, fy = dy * width.y;
     float3 sum = 0;
     [unroll] for (uint i = 0; i < 16; ++i)
@@ -247,11 +245,10 @@ void composite(uint3 id : SV_DispatchThreadID)
     }
     else
     {
-        // Test build: pixels at a display's edge or between two displays are normally left to the upscaler.
-        //   gap closer:     fill them when displays lie on opposite sides within gap_closer render pixels (seams)
-        //   edge stretcher: fill them when any display lies within edge_stretch render pixels (pushes edges outwards)
-        // Filled from the nearest display render pixel, its texture coordinates continued along its gradients.
-        float reach = max(gap_closer, edge_stretch);
+        // Test build, edge stretcher: pixels at a display's edge are normally left to the upscaler. Fill them when a
+        // display lies within edge_stretch render pixels (pushes edges outwards), from the nearest display render
+        // pixel, its texture coordinates continued along its gradients.
+        float reach = edge_stretch;
         if (reach <= 0) return;
         int radius = min(int(ceil(reach + 0.5)), 4);
         float nearest = 1e9;
@@ -267,21 +264,7 @@ void composite(uint3 id : SV_DispatchThreadID)
             }
         if (nearest > reach + 0.5) return;
         float4 m = load_map(nearest_q);
-        bool fill = edge_stretch > 0 && nearest <= edge_stretch;
-        if (!fill && gap_closer > 0)
-        {
-            // Another display pixel on the far side of this one (any slot): this pixel sits in a seam.
-            float2 away = location - float2(nearest_q);
-            [loop] for (int y = -radius; y <= radius + 1 && !fill; ++y)
-                [loop] for (int x = -radius; x <= radius + 1 && !fill; ++x)
-                {
-                    int2 q = cell + int2(x, y);
-                    float2 to = float2(q) - location;
-                    if (dot(to, away) <= 0 || length(to) > gap_closer + 0.5) continue;
-                    if (map_slot(load_map(q)) < slot_count) fill = true;
-                }
-        }
-        if (!fill) return;
+        if (nearest > edge_stretch) return;
         float4 r = load_map(nearest_q + int2(1, 0)), l = load_map(nearest_q - int2(1, 0));
         float4 down = load_map(nearest_q + int2(0, 1)), up = load_map(nearest_q - int2(0, 1));
         float2 gx = r.w == m.w ? r.xy - m.xy : l.w == m.w ? m.xy - l.xy : 0;
@@ -295,10 +278,13 @@ void composite(uint3 id : SV_DispatchThreadID)
     }
     uint slot = map_slot(a);
 
-    // Share of a tent (radius 3 render pixels) around this pixel that lies on this display: about 2/3 at the outermost
-    // redrawn pixel, 1 from two render pixels in. Used by the edge softener and edge fade.
-    float edge = filled ? 0 : 1;
-    if (!filled && (edge_fade > 0 || edge_smoothing > 0))
+    // Edge fade: the display's edge in the map moves with the camera jitter every frame, and a hard cut there crawls
+    // (and shows thin lines some aircraft have at the edge of their screen picture sharper than the sim does). Fade
+    // from the upscaler's (temporally smoothed) picture to the redrawn screen over the outer edge_fade render pixels.
+    // Distance to the edge from the share of a tent (radius 3 render pixels) around this pixel that lies on this
+    // display: about 2/3 at the outermost redrawn pixel, 1 from two render pixels in. Needs the upscaler output readable.
+    float edge = 1;
+    if (!filled && edge_fade > 0 && (flags & 4))
     {
         float inside = 0;
         [unroll] for (int t = 0; t < 36; ++t)
@@ -307,17 +293,25 @@ void composite(uint3 id : SV_DispatchThreadID)
             float2 dist = abs(float2(q) - location);
             if (load_map(q).w == a.w) inside += max(3 - dist.x, 0) * max(3 - dist.y, 0);
         }
-        edge = saturate((inside / 81 - 2.0 / 3) * 3); // ~ render pixels inside / 2
+        float inside_pixels = saturate((inside / 81 - 2.0 / 3) * 3) * 2;
+        // Wider fades: the tent only measures up to 2 render pixels; further in, look for the edge along 8 directions.
+        if (inside_pixels >= 2 && edge_fade > 2)
+        {
+            static const float2 directions[8] = { float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
+                float2(0.7071, 0.7071), float2(-0.7071, 0.7071), float2(0.7071, -0.7071), float2(-0.7071, -0.7071) };
+            float nearest = 5;
+            [unroll] for (int r = 3; r <= 5; ++r)
+                [unroll] for (int k = 0; k < 8; ++k)
+                    if (load_map(int2(round(location + directions[k] * r))).w != a.w) nearest = min(nearest, r - 0.5);
+            inside_pixels = nearest;
+        }
+        edge = saturate(inside_pixels / edge_fade);
     }
-    // Edge softener: wider line smoothing towards the display's edges.
-    float smoothing_width = ((flags & 8) ? line_width : 0) + edge_smoothing * (1 - edge);
-    // Edge fade: fade from the upscaler's (temporally smoothed) edge to the redrawn screen over edge_fade render pixels.
-    // Needs the upscaler output readable.
-    float blend = (edge_fade > 0 && (flags & 4) && !filled) ? saturate(edge * 2 / edge_fade) : 1;
+    float blend = edge;
     if (blend <= 0) return;
     float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
     if (gain.w <= 0) return;
-    float3 content = (smoothing_width > 0 ? sample_display_smooth(slot, uv, dx, dy, smoothing_width) : sample_display(slot, uv, dx, dy)) * gain.rgb;
+    float3 content = ((flags & 8) ? sample_display_smooth(slot, uv, dx, dy) : sample_display(slot, uv, dx, dy)) * gain.rgb;
 
     // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder: bilinear value at this pixel and its
     // spread over the 3x3 render pixels around it (same display only).

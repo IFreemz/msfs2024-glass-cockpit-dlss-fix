@@ -68,17 +68,13 @@ void draw(reshade::api::effect_runtime*) {
     ImGui::SetItemTooltip("Smooths stair steps on thin slanted lines, like DLSS did. 0 = sharpest, 35 = default, 50 = softest.\n"
         "Ctrl+click to type a value.");
     if (ImGui::Checkbox("Green tint on fixed screens  (Ctrl+Shift+F11)", &tint)) glass::set_tint(tint);
-    ImGui::TextColored(yellow, "Test build: experimental edge sliders (0 = off)");
-    int edge[4]{s.edge_smoothing, s.gap_closer, s.edge_stretch, s.edge_fade};
-    bool changed = ImGui::SliderInt("Edge softener", &edge[0], 0, 400, "%d%%", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::SetItemTooltip("Extra line smoothing towards screen edges.");
-    changed |= ImGui::SliderInt("Gap closer", &edge[1], 0, 400, "%d", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::SetItemTooltip("Fills seams between two screen parts, up to this many hundredths of a render pixel wide (100 = 1 pixel).");
-    changed |= ImGui::SliderInt("Edge stretcher", &edge[2], 0, 400, "%d", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::SetItemTooltip("Extends every screen outwards by up to this many hundredths of a render pixel (100 = 1 pixel), continuing its picture.");
-    changed |= ImGui::SliderInt("Edge fade", &edge[3], 0, 400, "%d", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::SetItemTooltip("Fades screen edges into the sim's own picture over this many hundredths of a render pixel (100 = 1 pixel).");
-    if (changed) glass::set_edge_test(edge[0], edge[1], edge[2], edge[3]);
+    ImGui::TextColored(yellow, "Test build: edge sliders");
+    int edge[2]{s.edge_fade, s.edge_stretch};
+    bool changed = ImGui::SliderInt("Edge fade", &edge[0], 0, 400, "%d", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SetItemTooltip("Fades screen edges into the sim's own picture over this many hundredths of a render pixel (100 = 1 pixel, 0 = off).");
+    changed |= ImGui::SliderInt("Edge stretcher", &edge[1], 0, 400, "%d", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SetItemTooltip("Extends every screen outwards by up to this many hundredths of a render pixel (100 = 1 pixel, 0 = off), continuing its picture.");
+    if (changed) glass::set_edge_test(edge[0], edge[1]);
     if (!s.jitter_positive || s.glass_strength != 100) ImGui::TextColored(yellow, "Advanced settings changed (see Troubleshooting below)");
 
     ImGui::SeparatorText("Checks");
