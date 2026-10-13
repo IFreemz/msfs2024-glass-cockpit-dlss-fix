@@ -131,6 +131,18 @@ std::array<std::atomic<uint64_t>, cpu_slots> cpu_ticks{}, cpu_calls{};
 // The frequent events (hundreds of thousands per second) are sampled, 1 in 64 per thread, and scaled: timing every call
 // would cost more than the work measured. The rare ones are timed every time.
 constexpr uint32_t cpu_sample_rate[cpu_slots]{64, 64, 64, 64, 1, 1, 64, 1};
+// What reading the clock twice costs by itself (it is part of every sample): measured once, subtracted from each sample.
+int64_t clock_overhead() {
+    static const int64_t overhead = [] {
+        int64_t best = INT64_MAX;
+        for (int i = 0; i < 2000; ++i) {
+            LARGE_INTEGER a, b; QueryPerformanceCounter(&a); QueryPerformanceCounter(&b);
+            best = std::min<int64_t>(best, b.QuadPart - a.QuadPart);
+        }
+        return best == INT64_MAX ? 0 : best;
+    }();
+    return overhead;
+}
 struct CpuScope {
     int slot; bool on = false; LARGE_INTEGER start{};
     explicit CpuScope(int s) : slot(s) {
@@ -143,7 +155,8 @@ struct CpuScope {
     ~CpuScope() {
         if (!on) return;
         LARGE_INTEGER end; QueryPerformanceCounter(&end);
-        cpu_ticks[slot].fetch_add(uint64_t(end.QuadPart - start.QuadPart) * cpu_sample_rate[slot], std::memory_order_relaxed);
+        const int64_t ticks = std::max<int64_t>(end.QuadPart - start.QuadPart - clock_overhead(), 0);
+        cpu_ticks[slot].fetch_add(uint64_t(ticks) * cpu_sample_rate[slot], std::memory_order_relaxed);
         cpu_calls[slot].fetch_add(cpu_sample_rate[slot], std::memory_order_relaxed);
     }
 };
@@ -504,12 +517,14 @@ Copy original_copy = nullptr;
 void STDMETHODCALLTYPE copy_simple_hook(ID3D12Device* device, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE dest, D3D12_CPU_DESCRIPTOR_HANDLE source,
     D3D12_DESCRIPTOR_HEAP_TYPE type) {
     original_copy_simple(device, count, dest, source, type);
+    if (!track_descriptors.load(std::memory_order_relaxed)) return; // NVIDIA: screens are identified without tracking
     CpuScope scope(cpu_descriptors);
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device == main_device) track_copy(dest.ptr, source.ptr, count);
 }
 void STDMETHODCALLTYPE copy_hook(ID3D12Device* device, UINT dest_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts, const UINT* dest_sizes,
     UINT source_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* source_starts, const UINT* source_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     original_copy(device, dest_ranges, dest_starts, dest_sizes, source_ranges, source_starts, source_sizes, type);
+    if (!track_descriptors.load(std::memory_order_relaxed)) return; // NVIDIA: screens are identified without tracking
     CpuScope scope(cpu_descriptors);
     if (type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || device != main_device || !dest_starts || !source_starts) return;
     // Both sides are lists of ranges with the same total length; walk them together.
@@ -1753,6 +1768,7 @@ void measure_cost(ID3D12CommandQueue* queue, DeviceState* d, uint64_t now) {
         if (d) { std::lock_guard lock(d->composite_mutex); d->timed_calls = 0; }
         window_start = now;
         QueryPerformanceCounter(&started);
+        clock_overhead(); // calibrated here, not inside a hot event
         measuring = true;
     } else if (measuring && now - window_start >= cost_window) {
         measuring = false;
