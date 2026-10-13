@@ -25,6 +25,11 @@ try {
     # Another mod (the RTX 40 MFG unlock) has redirected DLSS evaluate in a way that can't be hooked directly.
     & .\FlightSimulator2024.exe --hotpatch
     if ($LASTEXITCODE) { throw "Offline redirected DLSS test failed ($LASTEXITCODE)" }
+    # OptiScaler answers the sim's DLSS (or FSR) with FSR from its own FidelityFX files (AMD GPUs, or FSR chosen in OptiScaler).
+    & .\FlightSimulator2024.exe --fsr --optiscaler-fsr
+    if ($LASTEXITCODE) { throw "Offline OptiScaler FSR test failed ($LASTEXITCODE)" }
+    & .\FlightSimulator2024.exe --fsr --optiscaler-fsr --vr
+    if ($LASTEXITCODE) { throw "Offline OptiScaler FSR VR test failed ($LASTEXITCODE)" }
     # OptiScaler answers the sim's FSR with DLSS inside the FSR dispatch: the fix must be drawn once per view.
     & .\FlightSimulator2024.exe --fsr --vr --nested
     if ($LASTEXITCODE) { throw "Offline nested upscaler VR test failed ($LASTEXITCODE)" }

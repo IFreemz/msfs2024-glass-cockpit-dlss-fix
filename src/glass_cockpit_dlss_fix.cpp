@@ -1531,33 +1531,53 @@ NVSDK_NGX_Result evaluate_c_hook(ID3D12GraphicsCommandList* list, const NVSDK_NG
     else LOG_ONCE("note DLSS evaluate returned 0x%x (not success)", unsigned(result));
     return result;
 }
-// FSR (FidelityFX API, amd_fidelityfx_dx12.dll next to the game): ffxDispatch with an upscale description.
-FfxDispatch original_ffx_dispatch = nullptr;
-ffxReturnCode_t ffx_dispatch_hook(ffxContext* context, const ffxApiHeader* desc) {
+// FSR (FidelityFX API): ffxDispatch with an upscale description. The sim's own amd_fidelityfx_dx12.dll, and the
+// FidelityFX files other mods bring (OptiScaler: amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_upscaler_dx12.dll in its
+// folder, used when it answers the sim's DLSS or FSR with FSR). They all export the same ffxDispatch; each gets its own
+// hook. Other dispatch kinds (frame generation) pass through untouched.
+constexpr int max_ffx_modules = 8;
+std::array<FfxDispatch, max_ffx_modules> original_ffx_dispatch{};
+std::array<HMODULE, max_ffx_modules> ffx_modules{};
+int ffx_module_count = 0;
+ffxReturnCode_t ffx_dispatch(FfxDispatch original, ffxContext* context, const ffxApiHeader* desc) {
     ++upscaler_depth;
-    const auto result = original_ffx_dispatch(context, desc);
+    const auto result = original(context, desc);
     --upscaler_depth;
     if (desc && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
-        ++stats.fsr_dispatches;
-        if (result == FFX_API_RETURN_OK) composite_fsr(*reinterpret_cast<const ffxDispatchDescUpscale*>(desc));
-        else LOG_ONCE("note FSR dispatch returned 0x%x (not success)", unsigned(result));
+        if (result != FFX_API_RETURN_OK) LOG_ONCE("note FSR dispatch returned 0x%x (not success)", unsigned(result));
+        else if (!nested_upscaler()) { ++stats.fsr_dispatches; composite_fsr(*reinterpret_cast<const ffxDispatchDescUpscale*>(desc)); }
     }
     return result;
 }
-bool ffx_hooked = false;
+template <int I> ffxReturnCode_t ffx_dispatch_hook(ffxContext* context, const ffxApiHeader* desc) { return ffx_dispatch(original_ffx_dispatch[I], context, desc); }
+template <int... I> constexpr std::array<FfxDispatch, sizeof...(I)> ffx_hooks(std::integer_sequence<int, I...>) { return {&ffx_dispatch_hook<I>...}; }
+constexpr auto ffx_dispatch_hooks = ffx_hooks(std::make_integer_sequence<int, max_ffx_modules>{});
+bool ffx_hooked = false; // at least one FidelityFX module hooked
 void install_ffx() {
-    if (ffx_hooked) return;
-    HMODULE module = GetModuleHandleW(L"amd_fidelityfx_dx12.dll");
-    if (!module) return;
-    auto dispatch = GetProcAddress(module, "ffxDispatch");
-    HMODULE pinned = nullptr;
-    if (dispatch) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(dispatch), &pinned);
-    const bool hooked = dispatch && hook(reinterpret_cast<void*>(dispatch), reinterpret_cast<void*>(&ffx_dispatch_hook), original_ffx_dispatch);
-    ffx_hooked = true;
-    wchar_t path[MAX_PATH]{};
-    GetModuleFileNameW(module, path, MAX_PATH);
-    log("FSR runtime found: amd_fidelityfx_dx12.dll %s path=%ls hook=%d", file_version(path).c_str(), path, hooked);
-    { std::lock_guard lock(info_mutex); fsr_version = file_version(path); }
+    HMODULE modules[1024]; DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) return;
+    for (DWORD i = 0; i < std::min<DWORD>(needed / sizeof(HMODULE), 1024) && ffx_module_count < max_ffx_modules; ++i) {
+        const HMODULE module = modules[i];
+        if (std::find(ffx_modules.begin(), ffx_modules.begin() + ffx_module_count, module) != ffx_modules.begin() + ffx_module_count) continue;
+        wchar_t path[MAX_PATH]{};
+        if (!GetModuleFileNameW(module, path, MAX_PATH)) continue;
+        std::wstring name = std::filesystem::path(path).filename().wstring();
+        for (auto& c : name) c = wchar_t(towlower(c));
+        if (!name.starts_with(L"amd_fidelityfx_") || !name.ends_with(L"dx12.dll")) continue;
+        const int index = ffx_module_count++;
+        ffx_modules[index] = module;
+        auto dispatch = GetProcAddress(module, "ffxDispatch");
+        HMODULE pinned = nullptr;
+        if (dispatch) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(dispatch), &pinned);
+        const bool hooked = dispatch && hook(reinterpret_cast<void*>(dispatch), reinterpret_cast<void*>(ffx_dispatch_hooks[index]), original_ffx_dispatch[index]);
+        const auto version = file_version(path);
+        log("FSR runtime found: %ls %s path=%ls hook=%d", name.c_str(), version.c_str(), path, hooked);
+        if (!hooked) continue;
+        // The panel shows the sim's own FSR, or the upscaler another mod runs.
+        const bool sims_own = name == L"amd_fidelityfx_dx12.dll";
+        if (!ffx_hooked || sims_own || name.find(L"upscaler") != std::wstring::npos) { std::lock_guard lock(info_mutex); fsr_version = version; }
+        ffx_hooked = true;
+    }
 }
 
 // Which module a code address belongs to, and its first bytes (diagnostics for a failed hook).

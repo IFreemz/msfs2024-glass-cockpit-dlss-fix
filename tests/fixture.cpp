@@ -242,11 +242,12 @@ int main(int argc, char** argv) {
     try {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
-        bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false;
+        bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
             nested |= !std::strcmp(argv[i], "--nested");
+            optiscaler_fsr |= !std::strcmp(argv[i], "--optiscaler-fsr");
         }
         if (hotpatch) redirect_evaluate_like_mfg_unlock();
         if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
@@ -255,8 +256,10 @@ int main(int argc, char** argv) {
         FfxDispatch ffx_dispatch = nullptr;
         void (*ffx_run_dlss_inside)(NgxEvaluate, const NVSDK_NGX_Parameter*) = nullptr;
         if (fsr) {
-            const auto ffx = LoadLibraryW((here / L"amd_fidelityfx_dx12.dll").c_str());
+            // --optiscaler-fsr: FSR from another mod's FidelityFX upscaler file in its own folder (OptiScaler), not the sim's.
+            const auto ffx = LoadLibraryW((optiscaler_fsr ? here / L"OptiScaler" / L"amd_fidelityfx_upscaler_dx12.dll" : here / L"amd_fidelityfx_dx12.dll").c_str());
             require(ffx != nullptr, "fake amd_fidelityfx_dx12.dll missing");
+            if (optiscaler_fsr) std::printf("upscaler: FSR from OptiScaler\\amd_fidelityfx_upscaler_dx12.dll\n");
             ffx_dispatch = reinterpret_cast<FfxDispatch>(GetProcAddress(ffx, "ffxDispatch"));
             require(ffx_dispatch != nullptr, "ffxDispatch missing");
             std::printf("upscaler: FSR (fake ffxDispatch)\n");

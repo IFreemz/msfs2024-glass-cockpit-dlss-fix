@@ -89,6 +89,9 @@ try {
         & $compiler /nologo /W4 /WX /MD /O2 /LD /hotpatch (Join-Path $root 'tests\fake_nvngx.cpp') /link /OPT:NOICF /FUNCTIONPADMIN:16 /DEF:"$root\tests\fake_nvngx.def" /OUT:"$testHost\_nvngx.dll"
         if ($LASTEXITCODE) { throw 'Fake NGX compilation failed' }
         & $compiler /nologo /W4 /WX /MD /O2 /LD (Join-Path $root 'tests\fake_ffx.cpp') /link /OUT:"$testHost\amd_fidelityfx_dx12.dll"
+        # The same fake FSR under the name and folder OptiScaler uses for its own FidelityFX upscaler (--optiscaler-fsr).
+        New-Item -ItemType Directory -Force (Join-Path $testHost 'OptiScaler') | Out-Null
+        Copy-Item "$testHost\amd_fidelityfx_dx12.dll" (Join-Path $testHost 'OptiScaler\amd_fidelityfx_upscaler_dx12.dll') -Force
         if ($LASTEXITCODE) { throw 'Fake FidelityFX compilation failed' }
         & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /Fe:"$testHost\FlightSimulator2024.exe" (Join-Path $root 'tests\fixture.cpp') /link d3d12.lib dxgi.lib ole32.lib windowscodecs.lib
         if ($LASTEXITCODE) { throw 'Test host compilation failed' }
