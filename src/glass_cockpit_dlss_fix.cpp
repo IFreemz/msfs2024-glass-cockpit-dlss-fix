@@ -84,13 +84,10 @@ DeviceState* main_state = nullptr; // the main device's state (the offline test 
 uint64_t init_tick = 0;
 
 std::atomic<bool> enabled{true}, jitter_positive{true}, tint{false};
-// Edge fade (hundredths of a render pixel, 0-1200) and the test build's edge stretcher (0-400).
-constexpr int default_edge_fade = 100, max_edge_fade = 1200;
-std::atomic<int> edge_fade_percent{default_edge_fade}, edge_stretch_percent{0};
-// Test build: detail clamp, percent (0-100).
-std::atomic<int> detail_clamp_percent{0};
-// Test build: angle softening, percent (0-100).
-std::atomic<int> angle_soften_percent{0};
+// Experimental fixes (panel section of the same name): detail clamp and angle softening in percent, edge fade and edge
+// stretcher in hundredths of a render pixel.
+constexpr int default_detail_clamp = 0, max_edge_fade = 250, max_edge_stretch = 400;
+std::atomic<int> detail_clamp_percent{default_detail_clamp}, edge_fade_percent{0}, angle_soften_percent{0}, edge_stretch_percent{0};
 // Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like (softest).
 constexpr int max_smoothing = 50, default_smoothing = 35;
 std::atomic<int> smoothing_percent{default_smoothing};
@@ -1788,10 +1785,10 @@ void load_settings() {
     jitter_positive = GetPrivateProfileIntW(L"overlay", L"jitter_positive", 1, settings_path().c_str()) != 0;
     smoothing_percent = std::clamp(int(GetPrivateProfileIntW(L"overlay", L"line_smoothing", default_smoothing, settings_path().c_str())), 0, max_smoothing);
     glass_percent = std::clamp(int(GetPrivateProfileIntW(L"advanced", L"glass_strength", 100, settings_path().c_str())), 0, 100);
-    edge_fade_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"edge_fade", default_edge_fade, settings_path().c_str())), 0, max_edge_fade);
-    edge_stretch_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"edge_stretch", 0, settings_path().c_str())), 0, 400);
-    detail_clamp_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"detail_clamp", 0, settings_path().c_str())), 0, 100);
-    angle_soften_percent = std::clamp(int(GetPrivateProfileIntW(L"test", L"angle_soften", 0, settings_path().c_str())), 0, 100);
+    detail_clamp_percent = std::clamp(int(GetPrivateProfileIntW(L"experimental", L"detail_clamp", default_detail_clamp, settings_path().c_str())), 0, 100);
+    edge_fade_percent = std::clamp(int(GetPrivateProfileIntW(L"experimental", L"edge_fade", 0, settings_path().c_str())), 0, max_edge_fade);
+    angle_soften_percent = std::clamp(int(GetPrivateProfileIntW(L"experimental", L"angle_softening", 0, settings_path().c_str())), 0, 100);
+    edge_stretch_percent = std::clamp(int(GetPrivateProfileIntW(L"experimental", L"edge_stretch", 0, settings_path().c_str())), 0, max_edge_stretch);
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
@@ -1803,10 +1800,10 @@ void save_settings() {
     WritePrivateProfileStringW(L"overlay", L"jitter_positive", jitter_positive ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"overlay", L"line_smoothing", std::to_wstring(smoothing_percent.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"advanced", L"glass_strength", std::to_wstring(glass_percent.load()).c_str(), settings_path().c_str());
-    WritePrivateProfileStringW(L"test", L"edge_fade", std::to_wstring(edge_fade_percent.load()).c_str(), settings_path().c_str());
-    WritePrivateProfileStringW(L"test", L"edge_stretch", std::to_wstring(edge_stretch_percent.load()).c_str(), settings_path().c_str());
-    WritePrivateProfileStringW(L"test", L"detail_clamp", std::to_wstring(detail_clamp_percent.load()).c_str(), settings_path().c_str());
-    WritePrivateProfileStringW(L"test", L"angle_soften", std::to_wstring(angle_soften_percent.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"detail_clamp", std::to_wstring(detail_clamp_percent.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"edge_fade", std::to_wstring(edge_fade_percent.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"angle_softening", std::to_wstring(angle_soften_percent.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"edge_stretch", std::to_wstring(edge_stretch_percent.load()).c_str(), settings_path().c_str());
 }
 
 // One measurement window every 10 s: 120 frames, reported ~30 frames later (the GPU has finished them by then).
@@ -1946,7 +1943,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.edge_fade = edge_fade_percent; s.edge_stretch = edge_stretch_percent; s.detail_clamp = detail_clamp_percent; s.angle_soften = angle_soften_percent; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.glass_strength = glass_percent;
+    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
@@ -1965,12 +1962,12 @@ void set_enabled(bool on) {
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
 void set_line_smoothing(int percent) { smoothing_percent = std::clamp(percent, 0, max_smoothing); save_settings(); log("setting line_smoothing=%d", smoothing_percent.load()); }
 void set_jitter_positive(bool on) { jitter_positive = on; save_settings(); log("setting jitter_positive=%d", int(on)); }
-void set_angle_soften(int percent) { angle_soften_percent = std::clamp(percent, 0, 100); save_settings(); log("setting angle_soften=%d", angle_soften_percent.load()); }
-void set_edge_test(int fade, int stretch, int border) {
-    edge_fade_percent = std::clamp(fade, 0, max_edge_fade); edge_stretch_percent = std::clamp(stretch, 0, 400);
-    detail_clamp_percent = std::clamp(border, 0, 100);
+void set_experimental(const Experimental& e) {
+    detail_clamp_percent = std::clamp(e.detail_clamp, 0, 100); edge_fade_percent = std::clamp(e.edge_fade, 0, max_edge_fade);
+    angle_soften_percent = std::clamp(e.angle_softening, 0, 100); edge_stretch_percent = std::clamp(e.edge_stretch, 0, max_edge_stretch);
     save_settings();
-    log("setting edge_fade=%d edge_stretch=%d detail_clamp=%d", edge_fade_percent.load(), edge_stretch_percent.load(), detail_clamp_percent.load());
+    log("setting detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d", detail_clamp_percent.load(), edge_fade_percent.load(),
+        angle_soften_percent.load(), edge_stretch_percent.load());
 }
 void set_glass_strength(int percent) { glass_percent = std::clamp(percent, 0, 100); save_settings(); log("setting glass_strength=%d", glass_percent.load()); }
 }
@@ -2048,8 +2045,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     log("Glass Cockpit DLSS Fix %s (built " __DATE__ " " __TIME__ ")", overlay_version);
     log("windows %lu.%lu.%lu  game=%ls", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, executable);
     log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
-    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d glass_strength=%d", module, fixture, enabled.load(), jitter_positive.load(),
-        smoothing_percent.load(), glass_percent.load());
+    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d",
+        module, fixture, enabled.load(), jitter_positive.load(), smoothing_percent.load(), glass_percent.load(), detail_clamp_percent.load(),
+        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load());
     log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint");
     scan_modules();
     std::thread(worker).detach();

@@ -4,11 +4,17 @@
 #include <string>
 
 namespace glass {
+// Experimental fixes (panel section of the same name).
+struct Experimental {
+    int detail_clamp = 0, edge_fade = 0, angle_softening = 0, edge_stretch = 0; // percent / hundredths of a render pixel
+    bool operator==(const Experimental&) const = default;
+};
+
 struct Status {
     std::string gpu, driver, dlss_version, fsr_version;
     bool gpu_known = false, nvidia = false, dlss_loaded = false, fsr_loaded = false, shader_found = false;
     bool enabled = false, tint = false, jitter_positive = false, active = false;
-    int edge_fade = 0, edge_stretch = 0, detail_clamp = 0, angle_soften = 0;
+    Experimental experimental;
     int line_smoothing = 0, glass_strength = 100;
     uint64_t dlss_calls = 0, dlss_upscales = 0, fsr_calls = 0, screen_draws = 0, recorded = 0, overlay_frames = 0, skipped = 0;
     unsigned screens = 0, render_w = 0, render_h = 0, out_w = 0, out_h = 0;
@@ -22,8 +28,7 @@ void set_tint(bool on);
 void set_jitter_positive(bool on);
 void set_line_smoothing(int percent);
 void set_glass_strength(int percent);
-void set_edge_test(int fade, int stretch, int border);
-void set_angle_soften(int percent);
+void set_experimental(const Experimental& e);
 
 // The panel only needs ReShade's Dear ImGui; if this ReShade build has no compatible ImGui, the fix still runs.
 bool init_status_panel(void* reshade_module);

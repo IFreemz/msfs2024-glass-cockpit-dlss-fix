@@ -43,11 +43,13 @@ std::string summary(const glass::Status& s) {
 
 std::string report(const glass::Status& s) {
     return format("Glass Cockpit DLSS Fix %s\nstatus: %s\ngpu: %s (driver %s)\ndlss: %s, calls=%llu upscales=%llu\nfsr: %s, calls=%llu\nshader_found=%d screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu\n"
-        "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d glass_strength=%d\n",
+        "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d glass_strength=%d\n"
+        "detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d\n",
         GLASS_VERSION_STRING, summary(s).c_str(), s.gpu.empty() ? "unknown" : s.gpu.c_str(), s.driver.c_str(),
         s.dlss_loaded ? (s.dlss_version.empty() ? "loaded" : s.dlss_version.c_str()) : "not loaded", s.dlss_calls, s.dlss_upscales,
         s.fsr_loaded ? (s.fsr_version.empty() ? "loaded" : s.fsr_version.c_str()) : "not loaded", s.fsr_calls, s.shader_found, s.screen_draws,
-        s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing, s.glass_strength);
+        s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing, s.glass_strength,
+        s.experimental.detail_clamp, s.experimental.edge_fade, s.experimental.angle_softening, s.experimental.edge_stretch);
 }
 
 void draw(reshade::api::effect_runtime*) {
@@ -68,18 +70,7 @@ void draw(reshade::api::effect_runtime*) {
     ImGui::SetItemTooltip("Smooths stair steps on thin slanted lines, like DLSS did. 0 = sharpest, 35 = default, 50 = softest.\n"
         "Ctrl+click to type a value.");
     if (ImGui::Checkbox("Green tint on fixed screens  (Ctrl+Shift+F11)", &tint)) glass::set_tint(tint);
-    ImGui::TextColored(yellow, "Test build: edge sliders");
-    int edge[3]{s.edge_fade, s.edge_stretch, s.detail_clamp};
-    bool changed = ImGui::SliderInt("Edge fade", &edge[0], 0, 1200, "%d", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::SetItemTooltip("Fades screen edges into the sim's own picture over this many hundredths of a render pixel (100 = 1 pixel, 0 = off).");
-    changed |= ImGui::SliderInt("Edge stretcher", &edge[1], 0, 400, "%d", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::SetItemTooltip("Extends every screen outwards by up to this many hundredths of a render pixel (100 = 1 pixel, 0 = off), continuing its picture.");
-    changed |= ImGui::SliderInt("Detail clamp", &edge[2], 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::SetItemTooltip("Keeps the redrawn screens within the brightness the sim itself drew around each pixel this frame (0 = off). Holds down texture detail too thin for the sim to show.");
-    if (changed) glass::set_edge_test(edge[0], edge[1], edge[2]);
-    int angle = s.angle_soften;
-    if (ImGui::SliderInt("Angle softening", &angle, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) glass::set_angle_soften(angle);
-    ImGui::SetItemTooltip("Screens seen at a steep angle are drawn softer, like the sim does (0 = off). Screens seen straight on are unchanged.");
+    if (!(s.experimental == glass::Experimental{})) ImGui::TextColored(yellow, "Experimental fixes changed (see Troubleshooting below)");
     if (!s.jitter_positive || s.glass_strength != 100) ImGui::TextColored(yellow, "Advanced settings changed (see Troubleshooting below)");
 
     ImGui::SeparatorText("Checks");
@@ -109,6 +100,26 @@ void draw(reshade::api::effect_runtime*) {
     ImGui::SameLine();
     if (ImGui::Button("Copy report")) ImGui::SetClipboardText(report(s).c_str());
     ImGui::TextColored(grey, "For bug reports, attach glass-cockpit-dlss-fix.log and .old.log from the log folder.");
+
+    // Fixes for problems only some aircraft have; collapsed, and each can be undone with Reset to defaults.
+    if (ImGui::TreeNode("Experimental fixes (for problems on some aircraft)")) {
+        glass::Experimental e = s.experimental;
+        bool changed = ImGui::SliderInt("Detail clamp", &e.detail_clamp, 0, 100, e.detail_clamp ? "%d%%" : "off", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::SetItemTooltip("Keeps the fixed screens within the brightness the sim itself draws around each pixel.\n"
+            "Hides texture detail too thin for the sim to show, e.g. a dashed line where a screen's picture meets its bezel.\n"
+            "Try 100 if you see such lines. Lower it if small text looks duller than with the fix off.");
+        changed |= ImGui::SliderInt("Edge fade", &e.edge_fade, 0, 250, e.edge_fade ? "%d" : "off", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::SetItemTooltip("Fades screen edges into the sim's own picture, in hundredths of a render pixel (100 = 1 pixel).\n"
+            "Can calm jaggy or crawling screen edges. Higher values can flicker.");
+        changed |= ImGui::SliderInt("Angle softening", &e.angle_softening, 0, 100, e.angle_softening ? "%d%%" : "off", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::SetItemTooltip("Draws screens seen at a steep angle softer, like the sim does. Screens seen straight on are unchanged.");
+        changed |= ImGui::SliderInt("Edge stretcher", &e.edge_stretch, 0, 400, e.edge_stretch ? "%d" : "off", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::SetItemTooltip("Extends screens outwards over their frame, in hundredths of a render pixel (100 = 1 pixel),\n"
+            "continuing their picture. For screens that don't quite reach their frame.");
+        if (ImGui::Button("Reset experimental fixes")) { e = {}; changed = true; }
+        if (changed) glass::set_experimental(e);
+        ImGui::TreePop();
+    }
 
     // Settings that only help in specific cases; collapsed so they aren't mistaken for quality settings.
     if (ImGui::TreeNode("Advanced (only change these if asked to in a bug report)")) {

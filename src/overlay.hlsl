@@ -20,10 +20,10 @@ cbuffer Constants : register(b0)
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
-    float edge_fade;         // fade into the upscaler's picture over this many render pixels at display edges (0-12)
-    float edge_stretch;      // test: extend displays outwards by up to this many render pixels
-    float detail_clamp;      // test: 0..1, keep the redrawn screen within the sim's own local brightness range this frame
-    float angle_soften;      // test: 0..1, sample screens seen at a steep angle like the sim does (softer)
+    float edge_fade;         // experimental: fade into the upscaler's picture over this many render pixels at display edges
+    float edge_stretch;      // experimental: extend displays outwards by up to this many render pixels
+    float detail_clamp;      // experimental: 0..1, keep the redrawn screen within the sim's own local brightness range this frame
+    float angle_soften;      // experimental: 0..1, sample screens seen at a steep angle like the sim does (softer)
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -247,7 +247,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     }
     else
     {
-        // Test build, edge stretcher: pixels at a display's edge are normally left to the upscaler. Fill them when a
+        // Edge stretcher (experimental): pixels at a display's edge are normally left to the upscaler. Fill them when a
         // display lies within edge_stretch render pixels (pushes edges outwards), from the nearest display render
         // pixel, its texture coordinates continued along its gradients.
         float reach = edge_stretch;
@@ -378,16 +378,17 @@ void composite(uint3 id : SV_DispatchThreadID)
             glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread);
         }
     }
-    if (glass_strength < 1) glass = lerp(offset.rgb, glass, glass_strength);
     float3 colour = content + glass;
-    // Detail clamp: the redrawn screen may not be brighter or darker than what the sim itself drew in the 3x3 render
+    // Detail clamp: the redrawn screen may not be brighter or darker than what the sim itself drew in the 5x5 render
     // pixels around this one this frame. Content the sim shows survives; texture detail too thin for the sim to show
-    // (e.g. a one-texel line where a screen's picture meets its bezel band) is held to the sim's level.
+    // (e.g. a one-texel line where a screen's picture meets its bezel band) is held to the sim's level. Done with the
+    // full glass layer, which the sim's picture contains, before the glass layer setting takes its share away.
     if (detail_clamp > 0 && count > 0 && all(scene_high >= scene_low))
     {
         float3 margin = (scene_high - scene_low) * 0.1 + 0.002;
         colour = lerp(colour, clamp(colour, scene_low - margin, scene_high + margin), detail_clamp);
     }
+    if (glass_strength < 1) colour -= (1 - glass_strength) * (glass - offset.rgb);
     if (flags & 2) colour = colour * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0);
     if (blend < 1) colour = lerp(output[id.xy].rgb, colour, blend * blend * (3 - 2 * blend));
     if (all(isfinite(colour))) output[id.xy] = float4(max(colour, 0), 1);
