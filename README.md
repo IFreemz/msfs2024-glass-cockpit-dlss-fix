@@ -36,6 +36,11 @@ cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headse
 ## Installation
 
 1. Install ReShade **with full add-on support** for MSFS 2024 (DirectX 10/11/12). You don't need any effects.
+   In the ReShade setup, pick **`FlightSimulator2024.exe`** (use **Browse...**), not `gamelaunchhelper.exe`.
+   Microsoft Store / Xbox app: the game folder is usually `C:\XboxGames\Microsoft Flight Simulator 2024\Content\`. To
+   find it, open the Xbox app, right-click the game, then **Manage → Files → Browse**. If setup says `dxgi.dll` already
+   exists and doesn't belong to ReShade, another mod (e.g. OptiScaler or DLSS Enabler) is installed as `dxgi.dll`; see
+   [Other mods](#other-mods) to load ReShade alongside it.
 2. Download `glass-cockpit-dlss-fix.addon64` from the [latest release](../../releases/latest).
 3. Copy it into the same folder as ReShade's DLL (the folder containing `FlightSimulator2024.exe`):
    - Steam: `...\steamapps\common\Microsoft Flight Simulator 2024\`
@@ -165,7 +170,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 
 | Problem | Try |
 |---|---|
-| No "Glass Cockpit DLSS Fix" tab in the ReShade menu | The add-on isn't loaded. If the ReShade menu has no **Add-ons** tab, reinstall ReShade with the *full add-on support* download. Check that the file is next to the ReShade DLL. |
+| No "Glass Cockpit DLSS Fix" tab in the ReShade menu | The add-on isn't loaded. If the ReShade menu has no **Add-ons** tab, reinstall ReShade with the *full add-on support* download. Check that the file is next to the ReShade DLL, and that **Settings → Add-on search path** in the ReShade menu points to that folder. |
 | Nothing changes, no green tint | Check that ReShade is the *full add-on support* build, the file is next to the ReShade DLL and DLSS or FSR is selected. Then read the tab and the log. |
 | Tab says "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
