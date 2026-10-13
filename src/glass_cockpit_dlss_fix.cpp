@@ -60,6 +60,9 @@ size_t create_descriptor_heap_slot();
 namespace {
 // MSFS 2024 cockpit display shader pair (replaced by the stand-in shaders' hashes in the offline test host).
 uint64_t display_vs = 0xf102f1e3f5d9f66fULL, display_ps = 0x37e87c938bc76310ULL;
+// Other pixel shaders used with the display vertex shader that bind like display_ps (screen texture in t1, material in b3).
+// They shade the screen differently; the map shader only needs the bindings. FlightFX C750 main screens.
+constexpr uint64_t display_ps_alike[] = {0x36cc0d164f99b984ULL};
 // Display shader variant with the screen texture in t0 and the material constants in b4 (iniBuilds A340 main screens).
 uint64_t display_ps_t0 = 0xd3646ba0fd9007e9ULL, vr_display_ps_t0 = 0xf24aebba0272f765ULL; // flat and VR
 // The same display drawn in VR: instanced stereo, one instance per view into a layered render target.
@@ -259,7 +262,8 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     if (views.ViewInstanceCount > 1) return; // view-instanced pipelines: not how MSFS draws its displays
     const bool vr = vs == vr_display_vs && (ps == vr_display_ps || ps == vr_display_ps_t0);
     const bool screen_t0 = (ps == display_ps_t0 && vs == display_vs) || (ps == vr_display_ps_t0 && vs == vr_display_vs);
-    if (!vr && !screen_t0 && (ps != display_ps || vs != display_vs)) return;
+    const bool alike = vs == display_vs && std::find(std::begin(display_ps_alike), std::end(display_ps_alike), ps) != std::end(display_ps_alike);
+    if (!vr && !screen_t0 && !alike && (ps != display_ps || vs != display_vs)) return;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC probe{};
     const auto& shader = map_shader(vr, screen_t0, 0);
     if (!glass::clone_pipeline(desc, {shader.first, shader.second}, probe)) {
@@ -289,6 +293,7 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
             unsigned(desc.DSVFormat), vr, screen_t0);
         if (vr) LOG_ONCE("milestone VR cockpit display shader found");
         if (screen_t0) LOG_ONCE("milestone cockpit display shader variant found (screen texture in t0, e.g. iniBuilds A340)");
+        if (alike) log("display shader variant ps=%016llx found (binds like the standard one, e.g. FlightFX C750)", ps);
         return;
     }
     log("display_pipeline_overflow");
