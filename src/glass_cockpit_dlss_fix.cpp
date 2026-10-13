@@ -128,14 +128,23 @@ enum CpuSlot { cpu_draws, cpu_binds, cpu_targets, cpu_passes, cpu_views, cpu_cop
 constexpr const char* cpu_slot_names[cpu_slots]{"draws", "binds", "targets", "passes", "views", "copies", "descriptors", "composite"};
 std::atomic<bool> measuring{false};
 std::array<std::atomic<uint64_t>, cpu_slots> cpu_ticks{}, cpu_calls{};
+// The frequent events (hundreds of thousands per second) are sampled, 1 in 64 per thread, and scaled: timing every call
+// would cost more than the work measured. The rare ones are timed every time.
+constexpr uint32_t cpu_sample_rate[cpu_slots]{64, 64, 64, 64, 1, 1, 64, 1};
 struct CpuScope {
-    int slot; bool on; LARGE_INTEGER start{};
-    explicit CpuScope(int s) : slot(s), on(measuring.load(std::memory_order_relaxed)) { if (on) QueryPerformanceCounter(&start); }
+    int slot; bool on = false; LARGE_INTEGER start{};
+    explicit CpuScope(int s) : slot(s) {
+        if (!measuring.load(std::memory_order_relaxed)) return;
+        thread_local std::array<uint32_t, cpu_slots> counter{};
+        if (counter[slot]++ % cpu_sample_rate[slot]) return;
+        on = true;
+        QueryPerformanceCounter(&start);
+    }
     ~CpuScope() {
         if (!on) return;
         LARGE_INTEGER end; QueryPerformanceCounter(&end);
-        cpu_ticks[slot].fetch_add(uint64_t(end.QuadPart - start.QuadPart), std::memory_order_relaxed);
-        cpu_calls[slot].fetch_add(1, std::memory_order_relaxed);
+        cpu_ticks[slot].fetch_add(uint64_t(end.QuadPart - start.QuadPart) * cpu_sample_rate[slot], std::memory_order_relaxed);
+        cpu_calls[slot].fetch_add(cpu_sample_rate[slot], std::memory_order_relaxed);
     }
 };
 std::atomic<uint64_t> timestamp_frequency{0}; // of the queue the sim presents on (the upscaler runs on it too)
@@ -637,6 +646,7 @@ void uav_barrier(ID3D12GraphicsCommandList* list) {
 }
 
 void install_ngx();
+void install_ngx_proxies();
 void install_ffx();
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -694,6 +704,7 @@ void on_init_device(api::device* device) {
     }
     log("device native=%p pso_hooks=%d descriptor_size=%u", state->native, hooked, descriptor_size);
     install_ngx();
+    install_ngx_proxies();
     install_ffx();
 }
 std::shared_mutex hashes_mutex;
@@ -1517,7 +1528,7 @@ NVSDK_NGX_Result evaluate_hook(ID3D12GraphicsCommandList* list, const NVSDK_NGX_
     ++upscaler_depth;
     const auto result = original_evaluate(list, handle, params, callback);
     --upscaler_depth;
-    count_evaluation(params);
+    if (!upscaler_depth) count_evaluation(params);
     if (result == NVSDK_NGX_Result_Success) { if (!nested_upscaler()) composite_dlss(list, params); }
     else LOG_ONCE("note DLSS evaluate returned 0x%x (not success)", unsigned(result));
     return result;
@@ -1526,7 +1537,7 @@ NVSDK_NGX_Result evaluate_c_hook(ID3D12GraphicsCommandList* list, const NVSDK_NG
     ++upscaler_depth;
     const auto result = original_evaluate_c(list, handle, params, callback);
     --upscaler_depth;
-    count_evaluation(params);
+    if (!upscaler_depth) count_evaluation(params);
     if (result == NVSDK_NGX_Result_Success) { if (!nested_upscaler()) composite_dlss(list, params); }
     else LOG_ONCE("note DLSS evaluate returned 0x%x (not success)", unsigned(result));
     return result;
@@ -1659,6 +1670,53 @@ void install_ngx() {
     if (!a && !b) log("ERROR could not hook DLSS evaluate - the fix cannot run with DLSS. Another mod that hooks DLSS (e.g. a DLSS 5 add-on) may be blocking it: try without it, and send the log");
 }
 
+// DLSS answered by another mod: OptiScaler (and similar DLSS proxies) export the same evaluate function as the driver's
+// _nvngx.dll and the sim's DLSS calls go to theirs. They may answer with FSR, XeSS or (on AMD/Intel GPUs) anything but
+// real DLSS, which the hooks above never see. Hooking their evaluate catches the sim's call itself; when they run real
+// DLSS inside, that inner call is skipped (drawn once, after the outer one). NVIDIA's own nvngx_*.dll feature files
+// export a function of the same name that the driver calls internally: left alone.
+constexpr int max_ngx_proxies = 4;
+std::array<Evaluate, max_ngx_proxies> original_proxy_evaluate{};
+std::array<HMODULE, max_ngx_proxies> ngx_proxies{};
+int ngx_proxy_count = 0;
+bool ngx_proxy_hooked = false;
+template <int I> NVSDK_NGX_Result proxy_evaluate_hook(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params,
+    PFN_NVSDK_NGX_ProgressCallback callback) {
+    ++upscaler_depth;
+    const auto result = original_proxy_evaluate[I](list, handle, params, callback);
+    --upscaler_depth;
+    if (!upscaler_depth) count_evaluation(params);
+    if (result == NVSDK_NGX_Result_Success) { if (!nested_upscaler()) composite_dlss(list, params); }
+    else LOG_ONCE("note DLSS evaluate (another mod's) returned 0x%x (not success)", unsigned(result));
+    return result;
+}
+template <int... I> constexpr std::array<Evaluate, sizeof...(I)> proxy_hooks(std::integer_sequence<int, I...>) { return {&proxy_evaluate_hook<I>...}; }
+constexpr auto proxy_evaluate_hooks = proxy_hooks(std::make_integer_sequence<int, max_ngx_proxies>{});
+void install_ngx_proxies() {
+    HMODULE modules[1024]; DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) return;
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&install_ngx_proxies), &self);
+    for (DWORD i = 0; i < std::min<DWORD>(needed / sizeof(HMODULE), 1024) && ngx_proxy_count < max_ngx_proxies; ++i) {
+        const HMODULE module = modules[i];
+        if (module == self || std::find(ngx_proxies.begin(), ngx_proxies.begin() + ngx_proxy_count, module) != ngx_proxies.begin() + ngx_proxy_count) continue;
+        wchar_t path[MAX_PATH]{};
+        if (!GetModuleFileNameW(module, path, MAX_PATH)) continue;
+        std::wstring name = std::filesystem::path(path).filename().wstring();
+        for (auto& c : name) c = wchar_t(towlower(c));
+        if (name == L"_nvngx.dll" || name.starts_with(L"nvngx_")) continue;
+        auto evaluate = GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature");
+        if (!evaluate) continue;
+        const int index = ngx_proxy_count++;
+        ngx_proxies[index] = module;
+        HMODULE pinned = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(evaluate), &pinned);
+        const bool hooked = hook_ngx(reinterpret_cast<void*>(evaluate), reinterpret_cast<void*>(proxy_evaluate_hooks[index]), original_proxy_evaluate[index], "evaluate (another mod's)");
+        log("DLSS answered by another mod: %ls %s path=%ls hook=%d", name.c_str(), file_version(path).c_str(), path, hooked);
+        ngx_proxy_hooked |= hooked;
+    }
+}
+
 // Settings live in an .ini next to the add-on (not in ReShade.ini).
 std::wstring settings_path() { return (addon_directory / L"glass-cockpit-dlss-fix.ini").wstring(); }
 void load_settings() {
@@ -1755,6 +1813,7 @@ void on_present(api::effect_runtime* runtime) {
     if (now < next) return;
     next = now + 10000;
     install_ngx();
+    install_ngx_proxies();
     install_ffx();
     scan_modules();
     if (main_device) {
@@ -1763,7 +1822,7 @@ void on_present(api::effect_runtime* runtime) {
     }
     const auto minutes = (now - init_tick) / 60000.0;
     const char* found = nullptr;
-    if (!ngx_hooked && !ffx_hooked && minutes > 2) {
+    if (!ngx_hooked && !ngx_proxy_hooked && !ffx_hooked && minutes > 2) {
         LOG_ONCE("WARNING neither DLSS (_nvngx.dll) nor FSR (amd_fidelityfx_dx12.dll) loaded after 2 minutes: is DLSS or FSR selected in the sim's graphics settings?");
         found = "No upscaler loaded. Select DLSS or FSR in the sim's graphics settings.";
     }
@@ -1812,7 +1871,7 @@ Status status() {
         std::lock_guard lock(info_mutex);
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
-    s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
+    s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
     s.enabled = enabled; s.tint = tint; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;

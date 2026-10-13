@@ -30,6 +30,11 @@ try {
     if ($LASTEXITCODE) { throw "Offline OptiScaler FSR test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --fsr --optiscaler-fsr --vr
     if ($LASTEXITCODE) { throw "Offline OptiScaler FSR VR test failed ($LASTEXITCODE)" }
+    # DLSS selected in the sim, OptiScaler answers it with FSR (AMD GPUs, or FSR chosen in OptiScaler on NVIDIA).
+    & .\FlightSimulator2024.exe --ngx-proxy
+    if ($LASTEXITCODE) { throw "Offline DLSS answered by OptiScaler test failed ($LASTEXITCODE)" }
+    & .\FlightSimulator2024.exe --ngx-proxy --vr
+    if ($LASTEXITCODE) { throw "Offline DLSS answered by OptiScaler VR test failed ($LASTEXITCODE)" }
     # OptiScaler answers the sim's FSR with DLSS inside the FSR dispatch: the fix must be drawn once per view.
     & .\FlightSimulator2024.exe --fsr --vr --nested
     if ($LASTEXITCODE) { throw "Offline nested upscaler VR test failed ($LASTEXITCODE)" }

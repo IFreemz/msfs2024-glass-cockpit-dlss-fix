@@ -242,18 +242,35 @@ int main(int argc, char** argv) {
     try {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
-        bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false;
+        bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false,
+            ngx_proxy = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
             nested |= !std::strcmp(argv[i], "--nested");
             optiscaler_fsr |= !std::strcmp(argv[i], "--optiscaler-fsr");
+            ngx_proxy |= !std::strcmp(argv[i], "--ngx-proxy");
         }
         if (hotpatch) redirect_evaluate_like_mfg_unlock();
         if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
         const UINT views = vr ? 2 : 1;
         if (vr) std::printf("display: VR (instanced stereo, %u eyes)\n", views);
         FfxDispatch ffx_dispatch = nullptr;
+        // --ngx-proxy: the sim's DLSS goes to "OptiScaler", which answers with FSR from its own FidelityFX file.
+        NgxEvaluate proxy_evaluate = nullptr;
+        void (*proxy_answer_with_fsr)(FfxDispatch, ffxDispatchDescUpscale*) = nullptr;
+        if (ngx_proxy) {
+            const auto proxy = LoadLibraryW((here / L"OptiScaler.asi").c_str());
+            const auto upscaler = LoadLibraryW((here / L"OptiScaler" / L"amd_fidelityfx_upscaler_dx12.dll").c_str());
+            require(proxy && upscaler, "fake OptiScaler missing");
+            proxy_evaluate = reinterpret_cast<NgxEvaluate>(GetProcAddress(proxy, "NVSDK_NGX_D3D12_EvaluateFeature"));
+            proxy_answer_with_fsr = reinterpret_cast<decltype(proxy_answer_with_fsr)>(GetProcAddress(proxy, "FakeProxyAnswerWithFsr"));
+            // Like OptiScaler: its FSR runs through its own trampoline to the original code, past the add-on's ffxDispatch hooks.
+            const auto upscaler_dispatch = reinterpret_cast<FfxDispatch>(GetProcAddress(upscaler, "FakeFfxDispatchBody"));
+            require(proxy_evaluate && proxy_answer_with_fsr && upscaler_dispatch, "fake OptiScaler exports missing");
+            ffx_dispatch = upscaler_dispatch;
+            std::printf("upscaler: DLSS answered by OptiScaler with FSR from its own files\n");
+        }
         void (*ffx_run_dlss_inside)(NgxEvaluate, const NVSDK_NGX_Parameter*) = nullptr;
         if (fsr) {
             // --optiscaler-fsr: FSR from another mod's FidelityFX upscaler file in its own folder (OptiScaler), not the sim's.
@@ -599,6 +616,16 @@ int main(int argc, char** argv) {
 
         ID3D12Resource* const colour = vr ? eye_colour.Get() : scene.Get();
         Params ngx; ngx.colour = colour; ngx.output = output.Get();
+        ffxDispatchDescUpscale proxy_fsr{};
+        if (proxy_answer_with_fsr) {
+            proxy_fsr.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+            proxy_fsr.color = {colour, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ};
+            proxy_fsr.output = {output.Get(), {}, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS};
+            proxy_fsr.renderSize = {render_w, render_h};
+            proxy_fsr.upscaleSize = {output_w, output_h};
+            proxy_fsr.preExposure = 1;
+            proxy_answer_with_fsr(ffx_dispatch, &proxy_fsr);
+        }
         if (ffx_run_dlss_inside) ffx_run_dlss_inside(evaluate, &ngx);
         auto out_rb = readback(device.Get(), output.Get());
         auto prefill_upload = buffer(device.Get(), out_rb.bytes, D3D12_HEAP_TYPE_UPLOAD);
@@ -668,6 +695,9 @@ int main(int argc, char** argv) {
                 desc.preExposure = 1;
                 require(ffx_dispatch(nullptr, &desc.header) == FFX_API_RETURN_OK, "ffxDispatch failed");
                 transition(list.Get(), colour, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            } else if (proxy_evaluate) {
+                proxy_fsr.jitterOffset = {f.jx, f.jy};
+                require(proxy_evaluate(list.Get(), nullptr, &ngx, nullptr) == NVSDK_NGX_Result_Success, "evaluate (OptiScaler) failed");
             } else {
                 require(evaluate(list.Get(), nullptr, &ngx, nullptr) == NVSDK_NGX_Result_Success, "evaluate failed");
             }

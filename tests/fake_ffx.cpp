@@ -16,8 +16,9 @@ extern "C" __declspec(dllexport) ffxReturnCode_t ffxCreateContext(ffxContext*, f
 extern "C" __declspec(dllexport) ffxReturnCode_t ffxDestroyContext(ffxContext*, const void*) { return FFX_API_RETURN_OK; }
 extern "C" __declspec(dllexport) ffxReturnCode_t ffxConfigure(ffxContext*, const ffxApiHeader*) { return FFX_API_RETURN_OK; }
 extern "C" __declspec(dllexport) ffxReturnCode_t ffxQuery(ffxContext*, ffxApiHeader*) { return FFX_API_RETURN_OK; }
-// Not __declspec(noinline)-trivial: MinHook needs a few bytes of real code to patch.
-extern "C" __declspec(dllexport) __declspec(noinline) ffxReturnCode_t ffxDispatch(ffxContext*, const ffxApiHeader* desc) {
+// The work itself, separate from the export: OptiScaler hooks the sim's ffxDispatch before the add-on and calls the
+// original code through its own trampoline, past any later hook (--ngx-proxy calls this directly to do the same).
+extern "C" __declspec(dllexport) __declspec(noinline) ffxReturnCode_t FakeFfxDispatchBody(ffxContext*, const ffxApiHeader* desc) {
     static volatile unsigned calls = 0;
     if (desc && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
         calls = calls + 1;
@@ -27,4 +28,10 @@ extern "C" __declspec(dllexport) __declspec(noinline) ffxReturnCode_t ffxDispatc
         }
     }
     return FFX_API_RETURN_OK;
+}
+// Not __declspec(noinline)-trivial: MinHook needs a few bytes of real code to patch.
+extern "C" __declspec(dllexport) __declspec(noinline) ffxReturnCode_t ffxDispatch(ffxContext* context, const ffxApiHeader* desc) {
+    static volatile unsigned dispatches = 0;
+    dispatches = dispatches + 1;
+    return FakeFfxDispatchBody(context, desc);
 }
