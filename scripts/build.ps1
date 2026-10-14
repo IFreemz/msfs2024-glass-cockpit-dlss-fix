@@ -52,7 +52,7 @@ try {
     # Version resource: ReShade's add-on list shows its name, author and version.
     & $rc /nologo /I (Join-Path $root 'src') /I (Join-Path $sdk.FullName 'um') /I (Join-Path $sdk.FullName 'shared') /fo version.res (Join-Path $root 'src\version.rc')
     if ($LASTEXITCODE) { throw 'Version resource failed' }
-    & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /LD /I $build /I $reshadeInclude /I $imgui /I (Join-Path $minhook 'include') (Join-Path $root 'src\glass_cockpit_dlss_fix.cpp') (Join-Path $root 'src\status_panel.cpp') (Join-Path $root 'src\vtable_slots.cpp') buffer.obj hook.obj trampoline.obj hde64.obj version.res /link d3d12.lib dxgi.lib version.lib user32.lib shell32.lib /OUT:glass-cockpit-dlss-fix.addon64
+    & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /LD /I $build /I $reshadeInclude /I $imgui /I (Join-Path $minhook 'include') (Join-Path $root 'src\glass_cockpit_dlss_fix.cpp') (Join-Path $root 'src\status_panel.cpp') (Join-Path $root 'src\vtable_slots.cpp') buffer.obj hook.obj trampoline.obj hde64.obj version.res /link d3d12.lib dxgi.lib version.lib user32.lib shell32.lib ole32.lib windowscodecs.lib /OUT:glass-cockpit-dlss-fix.addon64
     if ($LASTEXITCODE) { throw 'Add-on compilation failed' }
 
     if ($Test) {

@@ -22,6 +22,8 @@
 #include "ngx_interface.hpp"
 #include "ffx_interface.hpp"
 #include <wrl/client.h>
+#include <wincodec.h>
+#include <cmath>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -90,8 +92,11 @@ constexpr int default_detail_clamp = 0, max_edge_fade = 250, max_edge_stretch = 
 std::atomic<int> detail_clamp_percent{default_detail_clamp}, edge_fade_percent{0}, angle_soften_percent{0}, edge_stretch_percent{0};
 // Dark screen fix (experimental, on/off): also judge the screen match on fine detail (keeps dark screens fixed in sun glare).
 std::atomic<int> dark_screen_fix{0};
-// Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like (softest).
-constexpr int max_smoothing = 50, default_smoothing = 35;
+// Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like.
+// With Extra smoothing on it goes to 100 % (twice the DLSS-like footprint: softer than DLSS, for stubborn shimmer).
+constexpr int max_smoothing = 50, max_extra_smoothing = 100, default_smoothing = 35;
+std::atomic<bool> extra_smoothing{false};
+int smoothing_limit() { return extra_smoothing.load() ? max_extra_smoothing : max_smoothing; }
 std::atomic<int> smoothing_percent{default_smoothing};
 // Advanced setting: share of the glass layer kept on fixed screens, 0-100 %.
 std::atomic<int> glass_percent{100};
@@ -1381,6 +1386,219 @@ void composite_fsr(const ffxDispatchDescUpscale& desc) noexcept try {
     composite(static_cast<ID3D12GraphicsCommandList*>(desc.commandList), u);
 } catch (...) { ++stats.composite_skipped; }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Screen capture for bug reports (Troubleshooting -> Capture screens). For a few consecutive fixed frames it saves the
+// sim's raw frame (the upscaler's input), the upscaler's output before and after the fix and the screen map as PNG
+// files in a folder next to the log, plus a short summary. Shows what each stage drew, pixel by pixel. Costs nothing
+// until requested; the copies are made on the upscaler's command list and written to disk on a background thread.
+struct CaptureImage {
+    ComPtr<ID3D12Resource> buffer;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT rows = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    std::string name;
+};
+struct CaptureFrame {
+    std::vector<CaptureImage> images;
+    std::string upscaler;
+    UINT render_w = 0, render_h = 0, out_w = 0, out_h = 0, layer = 0;
+    float jitter_x = 0, jitter_y = 0;
+};
+constexpr int capture_frame_count = 3;
+std::mutex capture_mutex;
+std::atomic<int> capture_requested{0};
+std::vector<CaptureFrame> capture_frames;
+uint64_t capture_ready_at = 0; // present count by which the GPU has surely finished the copies
+std::filesystem::path capture_folder;
+std::string capture_message;
+
+void capture_copy(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* resource, UINT subresource,
+    D3D12_RESOURCE_STATES state, DXGI_FORMAT format, const char* name, CaptureFrame& frame) {
+    if (!resource) return;
+    const auto desc = resource->GetDesc();
+    CaptureImage image;
+    image.format = format; image.name = name;
+    UINT64 row_bytes = 0, total = 0;
+    device->GetCopyableFootprints(&desc, subresource, 1, 0, &image.footprint, &image.rows, &row_bytes, &total);
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, total, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+        D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&image.buffer)))) return;
+    transition(list, resource, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION to{image.buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT}, from{resource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    to.PlacedFootprint = image.footprint;
+    from.SubresourceIndex = subresource;
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    transition(list, resource, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+    frame.images.push_back(std::move(image));
+}
+
+float half_to_float(uint16_t h) {
+    const uint32_t exponent = (h >> 10) & 31, mantissa = h & 1023;
+    float value = exponent == 0 ? std::ldexp(float(mantissa), -24) : exponent == 31 ? (mantissa ? NAN : INFINITY) : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+    return (h & 0x8000) ? -value : value;
+}
+float small_float(uint32_t bits, int mantissa_bits) {
+    const uint32_t exponent = bits >> mantissa_bits, mantissa = bits & ((1u << mantissa_bits) - 1);
+    if (exponent == 0) return std::ldexp(float(mantissa), -14 - mantissa_bits);
+    if (exponent == 31) return INFINITY;
+    return std::ldexp(1.0f + float(mantissa) / float(1u << mantissa_bits), int(exponent) - 15);
+}
+float srgb_decode(uint8_t v) { const float c = v / 255.0f; return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
+// Linear RGBA of one texel, or false for an unsupported format.
+bool decode_texel(DXGI_FORMAT format, const uint8_t* p, std::array<float, 4>& c) {
+    switch (format) {
+    case DXGI_FORMAT_R11G11B10_FLOAT: { uint32_t v; std::memcpy(&v, p, 4); c = {small_float(v & 0x7ff, 6), small_float((v >> 11) & 0x7ff, 6), small_float(v >> 22, 5), 1}; return true; }
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: { uint16_t v[4]; std::memcpy(v, p, 8); c = {half_to_float(v[0]), half_to_float(v[1]), half_to_float(v[2]), half_to_float(v[3])}; return true; }
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: std::memcpy(c.data(), p, 16); return true;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: c = {p[0] / 255.0f, p[1] / 255.0f, p[2] / 255.0f, p[3] / 255.0f}; return true;
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: c = {srgb_decode(p[0]), srgb_decode(p[1]), srgb_decode(p[2]), p[3] / 255.0f}; return true;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: c = {p[2] / 255.0f, p[1] / 255.0f, p[0] / 255.0f, p[3] / 255.0f}; return true;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: { uint32_t v; std::memcpy(&v, p, 4); c = {(v & 1023) / 1023.0f, ((v >> 10) & 1023) / 1023.0f, ((v >> 20) & 1023) / 1023.0f, 1}; return true; }
+    default: return false;
+    }
+}
+UINT texel_bytes(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
+    default: return 4;
+    }
+}
+
+HRESULT save_png(const std::filesystem::path& path, UINT width, UINT height, const std::vector<uint8_t>& rgba) {
+    const auto initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    HRESULT result = S_OK;
+    {
+        ComPtr<IWICImagingFactory> factory;
+        ComPtr<IWICStream> stream;
+        ComPtr<IWICBitmapEncoder> encoder;
+        ComPtr<IWICBitmapFrameEncode> frame;
+        ComPtr<IWICBitmap> bitmap;
+        ComPtr<IWICFormatConverter> converter;
+        WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+        result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+        if (SUCCEEDED(result)) result = factory->CreateStream(&stream);
+        if (SUCCEEDED(result)) result = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+        if (SUCCEEDED(result)) result = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+        if (SUCCEEDED(result)) result = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+        if (SUCCEEDED(result)) result = encoder->CreateNewFrame(&frame, nullptr);
+        if (SUCCEEDED(result)) result = frame->Initialize(nullptr);
+        if (SUCCEEDED(result)) result = frame->SetSize(width, height);
+        if (SUCCEEDED(result)) result = frame->SetPixelFormat(&format);
+        if (SUCCEEDED(result)) result = factory->CreateBitmapFromMemory(width, height, GUID_WICPixelFormat32bppRGBA, width * 4, UINT(rgba.size()),
+            const_cast<BYTE*>(rgba.data()), &bitmap);
+        if (SUCCEEDED(result)) result = factory->CreateFormatConverter(&converter);
+        if (SUCCEEDED(result)) result = converter->Initialize(bitmap.Get(), format, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom);
+        if (SUCCEEDED(result)) result = frame->WriteSource(converter.Get(), nullptr);
+        if (SUCCEEDED(result)) result = frame->Commit();
+        if (SUCCEEDED(result)) result = encoder->Commit();
+    }
+    if (SUCCEEDED(initialized)) CoUninitialize();
+    return result;
+}
+
+struct CapturedPixels { std::string name; DXGI_FORMAT format; UINT width = 0, height = 0, pitch = 0; std::vector<uint8_t> bytes; };
+struct CapturedFrame { CaptureFrame info; std::vector<CapturedPixels> images; };
+
+// Writes the frames: colour images share one exposure (from the upscaler output) so they compare 1:1; the map shows
+// u in red, v in green and the screen slot in blue.
+void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path folder) {
+    std::error_code error;
+    std::filesystem::create_directories(folder, error);
+    std::ofstream summary(folder / L"summary.txt");
+    summary << "Glass Cockpit DLSS Fix " << GLASS_VERSION_STRING << " screen capture\n";
+    float scale = 1;
+    for (const auto& frame : frames) for (const auto& image : frame.images) if (image.name == "2-upscaler-output") {
+        std::vector<float> peaks;
+        for (UINT y = 0; y < image.height; y += 2) for (UINT x = 0; x < image.width; x += 2) {
+            std::array<float, 4> c{};
+            if (decode_texel(image.format, image.bytes.data() + size_t(y) * image.pitch + size_t(x) * texel_bytes(image.format), c)) {
+                const float peak = std::max({c[0], c[1], c[2]});
+                if (peak > 0 && std::isfinite(peak)) peaks.push_back(peak);
+            }
+        }
+        if (!peaks.empty()) {
+            auto at = peaks.begin() + std::ptrdiff_t(peaks.size() * 995 / 1000);
+            std::nth_element(peaks.begin(), at, peaks.end());
+            if (*at > 0) scale = 1 / *at;
+        }
+        break;
+    }
+    summary << "exposure scale (all colour images): " << scale << "\n";
+    for (size_t f = 0; f < frames.size(); ++f) {
+        const auto& info = frames[f].info;
+        summary << "\nframe " << f << ": " << info.upscaler << " render " << info.render_w << "x" << info.render_h << " output " << info.out_w << "x" << info.out_h
+            << " jitter " << info.jitter_x << "," << info.jitter_y << " map layer " << info.layer << "\n";
+        for (const auto& image : frames[f].images) {
+            const bool map_image = image.name == "map";
+            std::vector<uint8_t> rgba(size_t(image.width) * image.height * 4, 0);
+            std::map<int, std::array<UINT, 5>> slots; // slot -> min x, min y, max x, max y, pixels
+            bool decoded = true;
+            for (UINT y = 0; y < image.height && decoded; ++y) for (UINT x = 0; x < image.width; ++x) {
+                std::array<float, 4> c{};
+                if (!decode_texel(image.format, image.bytes.data() + size_t(y) * image.pitch + size_t(x) * texel_bytes(image.format), c)) { decoded = false; break; }
+                uint8_t* out = &rgba[(size_t(y) * image.width + x) * 4];
+                if (map_image) {
+                    const int slot = int(c[3] + 0.5f) - 1;
+                    if (slot >= 0) {
+                        out[0] = uint8_t(std::clamp(c[0], 0.0f, 1.0f) * 255); out[1] = uint8_t(std::clamp(c[1], 0.0f, 1.0f) * 255);
+                        out[2] = uint8_t(64 + (slot * 37) % 192);
+                        auto [it, added] = slots.try_emplace(slot, std::array<UINT, 5>{x, y, x, y, 0});
+                        auto& box = it->second;
+                        box[0] = std::min(box[0], x); box[1] = std::min(box[1], y); box[2] = std::max(box[2], x); box[3] = std::max(box[3], y); ++box[4];
+                    }
+                } else for (int i = 0; i < 3; ++i) {
+                    const float v = std::clamp(std::isfinite(c[i]) ? c[i] * scale : 0.0f, 0.0f, 1.0f);
+                    out[i] = uint8_t(std::lround((v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1 / 2.4f) - 0.055f) * 255));
+                }
+                out[3] = 255;
+            }
+            const auto file = folder / (L"frame" + std::to_wstring(f) + L"-" + std::wstring(image.name.begin(), image.name.end()) + L".png");
+            const HRESULT result = decoded ? save_png(file, image.width, image.height, rgba) : E_NOTIMPL;
+            summary << "  " << image.name << ": " << image.width << "x" << image.height << " format " << unsigned(image.format)
+                << (decoded ? (SUCCEEDED(result) ? " saved" : " save failed") : " format not supported") << "\n";
+            for (const auto& [slot, box] : slots)
+                summary << "    screen slot " << slot << ": map pixels " << box[0] << "," << box[1] << " to " << box[2] << "," << box[3] << " (" << box[4] << " pixels)\n";
+        }
+    }
+    summary.close();
+    log("capture saved: %ls", folder.c_str());
+    std::lock_guard lock(capture_mutex);
+    capture_message = "Saved to " + folder.filename().string() + " (next to the log)";
+}
+
+// Called once per present: hands finished captures to the writer thread.
+void capture_flush(uint64_t now) {
+    std::vector<CaptureFrame> frames;
+    std::filesystem::path folder;
+    {
+        std::lock_guard lock(capture_mutex);
+        if (!capture_ready_at || now < capture_ready_at) return;
+        capture_ready_at = 0;
+        frames.swap(capture_frames);
+        folder = capture_folder;
+    }
+    std::vector<CapturedFrame> copies;
+    for (auto& frame : frames) {
+        CapturedFrame copy{frame, {}};
+        copy.info.images.clear();
+        for (auto& image : frame.images) {
+            CapturedPixels pixels{image.name, image.format, image.footprint.Footprint.Width, image.footprint.Footprint.Height, image.footprint.Footprint.RowPitch, {}};
+            void* data = nullptr;
+            const D3D12_RANGE range{0, SIZE_T(image.footprint.Footprint.RowPitch) * image.rows};
+            if (SUCCEEDED(image.buffer->Map(0, &range, &data))) {
+                pixels.bytes.assign(static_cast<uint8_t*>(data), static_cast<uint8_t*>(data) + range.End);
+                const D3D12_RANGE none{0, 0};
+                image.buffer->Unmap(0, &none);
+                copy.images.push_back(std::move(pixels));
+            }
+        }
+        copies.push_back(std::move(copy));
+    }
+    std::thread(write_capture, std::move(copies), folder).detach();
+}
+
 void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept try {
     CpuScope scope(cpu_composite);
     api::command_list* list = nullptr; UINT size = sizeof(list);
@@ -1526,6 +1744,15 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     if (colour_moved) transition(native, colour, u.colour_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (output_moved) transition(native, output, u.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     uav_barrier(native); // the upscaler just wrote the output
+    // Screen capture: the sim's raw frame, the upscaler's output and the screen map, before the fix.
+    CaptureFrame capture;
+    const bool capturing = capture_requested.load(std::memory_order_relaxed) > 0;
+    if (capturing) {
+        capture = {{}, u.name, render_w, render_h, out_w, out_h, layer, jitter_x, jitter_y};
+        capture_copy(d.native, native, colour, 0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, in_format, "1-sim-raw-frame", capture);
+        capture_copy(d.native, native, output, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out_format, "2-upscaler-output", capture);
+        capture_copy(d.native, native, map->texture.Get(), layer /* one mip: subresource = layer */, map_resting, glass::map_format, "map", capture);
+    }
     const UINT timed = measuring.load(std::memory_order_relaxed) && d.timestamps && d.timed_calls < max_timed_calls ? ++d.timed_calls : 0;
     if (timed) native->EndQuery(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2);
     if (!d.accumulators_zeroed) {
@@ -1564,6 +1791,12 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     if (timed) {
         native->EndQuery(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2 + 1);
         native->ResolveQueryData(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2, 2, d.timestamps_readback.Get(), uint64_t(timed - 1) * 2 * sizeof(uint64_t));
+    }
+    if (capturing) {
+        capture_copy(d.native, native, output, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out_format, "3-after-fix", capture);
+        std::lock_guard capture_lock(capture_mutex);
+        capture_frames.push_back(std::move(capture));
+        if (capture_requested.fetch_sub(1) == 1) capture_ready_at = present_count.load() + 10;
     }
     if (colour_moved) transition(native, colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, u.colour_state);
     if (output_moved) transition(native, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, u.output_state);
@@ -1810,7 +2043,8 @@ std::wstring settings_path() { return (addon_directory / L"glass-cockpit-dlss-fi
 void load_settings() {
     enabled = GetPrivateProfileIntW(L"overlay", L"enabled", 1, settings_path().c_str()) != 0;
     jitter_positive = GetPrivateProfileIntW(L"overlay", L"jitter_positive", 1, settings_path().c_str()) != 0;
-    smoothing_percent = std::clamp(int(GetPrivateProfileIntW(L"overlay", L"line_smoothing", default_smoothing, settings_path().c_str())), 0, max_smoothing);
+    extra_smoothing = GetPrivateProfileIntW(L"overlay", L"extra_smoothing", 0, settings_path().c_str()) != 0;
+    smoothing_percent = std::clamp(int(GetPrivateProfileIntW(L"overlay", L"line_smoothing", default_smoothing, settings_path().c_str())), 0, smoothing_limit());
     glass_percent = std::clamp(int(GetPrivateProfileIntW(L"advanced", L"glass_strength", 100, settings_path().c_str())), 0, 100);
     detail_clamp_percent = std::clamp(int(GetPrivateProfileIntW(L"experimental", L"detail_clamp", default_detail_clamp, settings_path().c_str())), 0, 100);
     edge_fade_percent = std::clamp(int(GetPrivateProfileIntW(L"experimental", L"edge_fade", 0, settings_path().c_str())), 0, max_edge_fade);
@@ -1827,6 +2061,7 @@ void save_settings() {
     WritePrivateProfileStringW(L"overlay", L"enabled", enabled ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"overlay", L"jitter_positive", jitter_positive ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"overlay", L"line_smoothing", std::to_wstring(smoothing_percent.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"overlay", L"extra_smoothing", extra_smoothing.load() ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"advanced", L"glass_strength", std::to_wstring(glass_percent.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"detail_clamp", std::to_wstring(detail_clamp_percent.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"edge_fade", std::to_wstring(edge_fade_percent.load()).c_str(), settings_path().c_str());
@@ -1898,6 +2133,7 @@ void measure_cost(ID3D12CommandQueue* queue, DeviceState* d, uint64_t now) {
 
 void on_present(api::effect_runtime* runtime) {
     ++present_count;
+    capture_flush(present_count.load(std::memory_order_relaxed));
     const auto queue = runtime->get_command_queue();
     measure_cost(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr, runtime->get_device()->get_private_data<DeviceState>(),
         present_count.load(std::memory_order_relaxed));
@@ -1972,7 +2208,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.glass_strength = glass_percent;
+    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
@@ -1981,6 +2217,7 @@ Status status() {
     s.render_w = last_render_w; s.render_h = last_render_h; s.out_w = last_out_w; s.out_h = last_out_h;
     s.problem = problem;
     s.log_path = (addon_directory / L"glass-cockpit-dlss-fix.log").wstring();
+    { std::lock_guard lock(capture_mutex); s.capture = capture_message; }
     return s;
 }
 void set_enabled(bool on) {
@@ -1989,7 +2226,25 @@ void set_enabled(bool on) {
     enabled = on; save_settings(); log("setting overlay=%d", int(on));
 }
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
-void set_line_smoothing(int percent) { smoothing_percent = std::clamp(percent, 0, max_smoothing); save_settings(); log("setting line_smoothing=%d", smoothing_percent.load()); }
+void request_capture() {
+    std::lock_guard lock(capture_mutex);
+    if (capture_requested.load() || capture_ready_at) return;
+    SYSTEMTIME t; GetLocalTime(&t);
+    wchar_t name[64];
+    swprintf(name, 64, L"glass-capture-%04u%02u%02u-%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    capture_folder = addon_directory / name;
+    capture_frames.clear();
+    capture_message = "Capturing... (fly with the screens in view)";
+    capture_requested = capture_frame_count;
+    log("capture requested: %ls", capture_folder.c_str());
+}
+void set_line_smoothing(int percent) { smoothing_percent = std::clamp(percent, 0, smoothing_limit()); save_settings(); log("setting line_smoothing=%d", smoothing_percent.load()); }
+void set_extra_smoothing(bool on) {
+    extra_smoothing = on;
+    smoothing_percent = std::min(smoothing_percent.load(), smoothing_limit());
+    save_settings();
+    log("setting extra_smoothing=%d line_smoothing=%d", int(on), smoothing_percent.load());
+}
 void set_jitter_positive(bool on) { jitter_positive = on; save_settings(); log("setting jitter_positive=%d", int(on)); }
 void set_experimental(const Experimental& e) {
     detail_clamp_percent = std::clamp(e.detail_clamp, 0, 100); edge_fade_percent = std::clamp(e.edge_fade, 0, max_edge_fade);
@@ -2065,7 +2320,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     const auto log_path = addon_directory / L"glass-cockpit-dlss-fix.log";
     std::filesystem::rename(log_path, addon_directory / L"glass-cockpit-dlss-fix.old.log", error);
     logfile = _wfsopen(log_path.c_str(), L"w", _SH_DENYWR);
-    if (!fixture) load_settings();
+    // The offline test runs with default settings unless asked to read the .ini (GLASS_FIXTURE_SETTINGS=1).
+    wchar_t fixture_settings[8]{};
+    if (!fixture || (GetEnvironmentVariableW(L"GLASS_FIXTURE_SETTINGS", fixture_settings, 8) && fixture_settings[0] == L'1')) load_settings();
     init_tick = GetTickCount64();
     OSVERSIONINFOEXW os{sizeof(os)};
     using RtlGetVersion = LONG(WINAPI*)(OSVERSIONINFOEXW*);
@@ -2075,8 +2332,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     log("Glass Cockpit DLSS Fix %s (built " __DATE__ " " __TIME__ ")", overlay_version);
     log("windows %lu.%lu.%lu  game=%ls", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, executable);
     log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
-    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d",
-        module, fixture, enabled.load(), jitter_positive.load(), smoothing_percent.load(), glass_percent.load(), detail_clamp_percent.load(),
+    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d",
+        module, fixture, enabled.load(), jitter_positive.load(), smoothing_percent.load(), int(extra_smoothing.load()), glass_percent.load(), detail_clamp_percent.load(),
         edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), dark_screen_fix.load());
     log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint");
     scan_modules();

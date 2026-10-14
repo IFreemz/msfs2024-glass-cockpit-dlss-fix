@@ -43,12 +43,12 @@ std::string summary(const glass::Status& s) {
 
 std::string report(const glass::Status& s) {
     return format("Glass Cockpit DLSS Fix %s\nstatus: %s\ngpu: %s (driver %s)\ndlss: %s, calls=%llu upscales=%llu\nfsr: %s, calls=%llu\nshader_found=%d screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu\n"
-        "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d glass_strength=%d\n"
+        "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d\n"
         "detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d\n",
         GLASS_VERSION_STRING, summary(s).c_str(), s.gpu.empty() ? "unknown" : s.gpu.c_str(), s.driver.c_str(),
         s.dlss_loaded ? (s.dlss_version.empty() ? "loaded" : s.dlss_version.c_str()) : "not loaded", s.dlss_calls, s.dlss_upscales,
         s.fsr_loaded ? (s.fsr_version.empty() ? "loaded" : s.fsr_version.c_str()) : "not loaded", s.fsr_calls, s.shader_found, s.screen_draws,
-        s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing, s.glass_strength,
+        s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing, s.extra_smoothing, s.glass_strength,
         s.experimental.detail_clamp, s.experimental.edge_fade, s.experimental.angle_softening, s.experimental.edge_stretch, s.experimental.dark_screens);
 }
 
@@ -65,10 +65,15 @@ void draw(reshade::api::effect_runtime*) {
     bool enabled = s.enabled, tint = s.tint;
     int smoothing = s.line_smoothing;
     if (ImGui::Checkbox("Fix enabled  (Ctrl+Shift+F9)", &enabled)) glass::set_enabled(enabled);
-    if (ImGui::SliderInt("Line smoothing", &smoothing, 0, 50, smoothing ? "%d%%" : "off (sharpest)", ImGuiSliderFlags_AlwaysClamp))
+    bool extra = s.extra_smoothing;
+    if (ImGui::SliderInt("Line smoothing", &smoothing, 0, extra ? 100 : 50, smoothing ? "%d%%" : "off (sharpest)", ImGuiSliderFlags_AlwaysClamp))
         glass::set_line_smoothing(smoothing);
-    ImGui::SetItemTooltip("Smooths stair steps on thin slanted lines, like DLSS did. 0 = sharpest, 35 = default, 50 = softest.\n"
+    ImGui::SetItemTooltip("Smooths stair steps and shimmer on thin lines, like DLSS did. 0 = sharpest, 35 = default, 50 = like DLSS.\n"
         "Ctrl+click to type a value.");
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Extra", &extra)) glass::set_extra_smoothing(extra);
+    ImGui::SetItemTooltip("Lets Line smoothing go up to 100 %% for stubborn shimmer (e.g. in VR).\n"
+        "Above 50 the whole screen picture gets softer than with DLSS alone.");
     if (ImGui::Checkbox("Green tint on fixed screens  (Ctrl+Shift+F11)", &tint)) glass::set_tint(tint);
     if (!(s.experimental == glass::Experimental{})) ImGui::TextColored(yellow, "Experimental fixes changed (see Troubleshooting below)");
     if (!s.jitter_positive || s.glass_strength != 100) ImGui::TextColored(yellow, "Advanced settings changed (see Troubleshooting below)");
@@ -99,6 +104,11 @@ void draw(reshade::api::effect_runtime*) {
     }
     ImGui::SameLine();
     if (ImGui::Button("Copy report")) ImGui::SetClipboardText(report(s).c_str());
+    ImGui::SameLine();
+    if (ImGui::Button("Capture screens")) glass::request_capture();
+    ImGui::SetItemTooltip("Saves 3 frames as pictures next to the log: the sim's own frame, the upscaled frame before and\n"
+        "after the fix, and the screen map. Use it with the problem visible on screen; attach the folder to a bug report.");
+    if (!s.capture.empty()) ImGui::TextColored(grey, "%s", s.capture.c_str());
     ImGui::TextColored(grey, "For bug reports, attach glass-cockpit-dlss-fix.log and .old.log from the log folder.");
 
     // Fixes for problems only some aircraft have; collapsed, and each can be undone with Reset to defaults.
@@ -115,7 +125,7 @@ void draw(reshade::api::effect_runtime*) {
             "Try 100 if you see such lines. Lower it if small text looks duller than with the fix off.");
         changed |= ImGui::SliderInt("Edge fade", &e.edge_fade, 0, 250, e.edge_fade ? "%d" : "off", ImGuiSliderFlags_AlwaysClamp);
         ImGui::SetItemTooltip("Fades screen edges into the sim's own picture, in hundredths of a render pixel (100 = 1 pixel).\n"
-            "Can calm jaggy or crawling screen edges. Higher values can flicker.");
+            "Can calm jaggy or crawling screen edges. Within that band the upscaler's trails come back a little; higher values can flicker.");
         changed |= ImGui::SliderInt("Angle softening", &e.angle_softening, 0, 100, e.angle_softening ? "%d%%" : "off", ImGuiSliderFlags_AlwaysClamp);
         ImGui::SetItemTooltip("Draws screens seen at a steep angle softer, like the sim does. Screens seen straight on are unchanged.");
         changed |= ImGui::SliderInt("Edge stretcher", &e.edge_stretch, 0, 400, e.edge_stretch ? "%d" : "off", ImGuiSliderFlags_AlwaysClamp);
