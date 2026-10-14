@@ -1406,9 +1406,14 @@ struct CaptureFrame {
     std::string upscaler;
     UINT render_w = 0, render_h = 0, out_w = 0, out_h = 0, layer = 0;
     float jitter_x = 0, jitter_y = 0;
+    int presented = -1; // >= 0: a frame sent to the monitor (index), not an upscaler call
+    bool real = false;  // presented frame: the fix ran since the previous present (a real frame, not a generated one)
 };
 constexpr int capture_frame_count = 6, capture_spacing = 5; // 6 frames, every 5th fixed frame (~0.5 s)
 std::atomic<int> capture_countdown{0};
+// Frames sent to the monitor, consecutively from the request (frame generation's frames included).
+constexpr int capture_present_count = 12;
+std::atomic<int> capture_presents_left{0};
 std::mutex capture_mutex;
 std::atomic<int> capture_requested{0};
 std::vector<CaptureFrame> capture_frames;
@@ -1530,6 +1535,32 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
         break;
     }
     summary << "exposure scale (all colour images): " << scale << "\n";
+    std::vector<CapturedFrame> fixed, presented;
+    for (auto& frame : frames) (frame.info.presented >= 0 ? presented : fixed).push_back(std::move(frame));
+    if (!presented.empty()) summary << "\npresented frames (sent to the monitor, consecutive; real = the fix ran since the previous one, generated = frame generation):\n";
+    for (const auto& frame : presented) {
+        for (const auto& image : frame.images) {
+            std::vector<uint8_t> rgba(size_t(image.width) * image.height * 4, 0);
+            const bool linear = image.format == DXGI_FORMAT_R16G16B16A16_FLOAT; // scRGB; the others are already display-encoded
+            bool decoded = true;
+            for (UINT y = 0; y < image.height && decoded; ++y) for (UINT x = 0; x < image.width; ++x) {
+                std::array<float, 4> c{};
+                if (!decode_texel(image.format, image.bytes.data() + size_t(y) * image.pitch + size_t(x) * texel_bytes(image.format), c)) { decoded = false; break; }
+                uint8_t* out = &rgba[(size_t(y) * image.width + x) * 4];
+                for (int i = 0; i < 3; ++i) {
+                    const float v = std::clamp(std::isfinite(c[i]) ? c[i] : 0.0f, 0.0f, 1.0f);
+                    out[i] = uint8_t(std::lround((linear ? (v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1 / 2.4f) - 0.055f) : v) * 255));
+                }
+                out[3] = 255;
+            }
+            const auto name = "present" + std::to_string(frame.info.presented) + (frame.info.real ? "-real" : "-generated");
+            const auto file = folder / (std::wstring(name.begin(), name.end()) + L".png");
+            const HRESULT result = decoded ? save_png(file, image.width, image.height, rgba) : E_NOTIMPL;
+            summary << "  " << name << ": " << image.width << "x" << image.height << " format " << unsigned(image.format)
+                << (decoded ? (SUCCEEDED(result) ? " saved" : " save failed") : " format not supported") << "\n";
+        }
+    }
+    frames = std::move(fixed);
     for (size_t f = 0; f < frames.size(); ++f) {
         const auto& info = frames[f].info;
         summary << "\nframe " << f << ": " << info.upscaler << " render " << info.render_w << "x" << info.render_h << " output " << info.out_w << "x" << info.out_h
@@ -1587,7 +1618,7 @@ void capture_flush(uint64_t now) {
     std::filesystem::path folder;
     {
         std::lock_guard lock(capture_mutex);
-        if (!capture_ready_at || now < capture_ready_at) return;
+        if (!capture_ready_at || now < capture_ready_at || capture_presents_left.load()) return;
         capture_ready_at = 0;
         frames.swap(capture_frames);
         folder = capture_folder;
@@ -1773,7 +1804,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     const bool capturing = capture_requested.load(std::memory_order_relaxed) > 0 && capture_countdown.fetch_sub(1) <= 0;
     if (capturing) capture_countdown = capture_spacing - 1;
     if (capturing) {
-        capture = {{}, {}, u.name, render_w, render_h, out_w, out_h, layer, jitter_x, jitter_y};
+        capture = {{}, {}, u.name, render_w, render_h, out_w, out_h, layer, jitter_x, jitter_y, -1, false};
         capture_copy(d.native, native, colour, 0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, in_format, "1-sim-raw-frame", capture);
         capture_copy(d.native, native, output, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out_format, "2-upscaler-output", capture);
         capture_copy(d.native, native, map->texture.Get(), layer /* one mip: subresource = layer */, map_resting, glass::map_format, "map", capture);
@@ -2167,8 +2198,40 @@ void measure_cost(ID3D12CommandQueue* queue, DeviceState* d, uint64_t now) {
     }
 }
 
+// Copies the frame about to be shown into a readback buffer (only while a capture is running).
+void capture_present(api::effect_runtime* runtime) {
+    static uint64_t composites_seen = 0;
+    const uint64_t composites = stats.composites.load();
+    const bool real = composites != composites_seen;
+    composites_seen = composites;
+    if (capture_presents_left.load() <= 0) return;
+    const auto queue = runtime->get_command_queue();
+    const auto back_buffer = runtime->get_current_back_buffer();
+    auto* resource = reinterpret_cast<ID3D12Resource*>(back_buffer.handle);
+    auto* list = queue ? queue->get_immediate_command_list() : nullptr;
+    if (!resource || !list) { capture_presents_left = 0; return; }
+    auto format = resource->GetDesc().Format;
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: format = DXGI_FORMAT_B8G8R8A8_UNORM; break;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: format = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+    default: break;
+    }
+    const int index = capture_present_count - capture_presents_left.load();
+    CaptureFrame frame;
+    frame.presented = index; frame.real = real;
+    capture_copy(reinterpret_cast<ID3D12Device*>(runtime->get_device()->get_native()), reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native()),
+        resource, 0, D3D12_RESOURCE_STATE_PRESENT, format, "presented", frame);
+    queue->flush_immediate_command_list();
+    std::lock_guard lock(capture_mutex);
+    capture_frames.push_back(std::move(frame));
+    --capture_presents_left;
+}
+
 void on_present(api::effect_runtime* runtime) {
     ++present_count;
+    capture_present(runtime);
     capture_flush(present_count.load(std::memory_order_relaxed));
     const auto queue = runtime->get_command_queue();
     measure_cost(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr, runtime->get_device()->get_private_data<DeviceState>(),
@@ -2265,7 +2328,7 @@ void set_enabled(bool on) {
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
 void request_capture() {
     std::lock_guard lock(capture_mutex);
-    if (capture_requested.load() || capture_ready_at) return;
+    if (capture_requested.load() || capture_ready_at || capture_presents_left.load()) return;
     SYSTEMTIME t; GetLocalTime(&t);
     wchar_t name[64];
     swprintf(name, 64, L"glass-capture-%04u%02u%02u-%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
@@ -2273,6 +2336,7 @@ void request_capture() {
     capture_frames.clear();
     capture_message = "Capturing... (fly with the screens in view)";
     capture_countdown = 0;
+    capture_presents_left = capture_present_count;
     capture_requested = capture_frame_count;
     log("capture requested: %ls", capture_folder.c_str());
 }
