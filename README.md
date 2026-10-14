@@ -29,7 +29,8 @@ cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headse
 
 ## Requirements
 
-- Microsoft Flight Simulator 2024, DirectX 12 (Steam or Microsoft Store / Xbox app).
+- Microsoft Flight Simulator 2024, DirectX 12 (Steam or Microsoft Store / Xbox app). **MSFS 2020 is not supported**
+  (see [Game versions](#game-versions)).
 - **DLSS Super Resolution** (NVIDIA RTX) or **FSR** (any GPU) selected in the sim's graphics settings.
 - [ReShade](https://reshade.me) 6.7 or newer **with full add-on support** (the "with full add-on support" download)
 
@@ -141,11 +142,22 @@ Other headsets and runtimes should work the same; reports welcome.
 
 Tested on the Microsoft Store / Xbox app (Game Pass) version and by the community on Steam.
 
+**MSFS 2020 is not supported.** The add-on finds the cockpit screens by how MSFS 2024 draws them, and I don't have
+2020 to test or port it. The source is open (MIT), so a 2020 port by someone who has it is welcome.
+
 ### Other mods
 
 - **ReShade presets and effects:** work as usual.
-- **DLSS 5 / Neural Rendering add-ons:** tested alongside the RenoDX DLSS 5 add-on. If it runs an extra DLSS pass of
-  its own, 0.8.3 or newer keeps the fix on the sim's real upscale (reports welcome).
+- **DLSS 5 / Neural Rendering add-ons:** tested alongside the RenoDX DLSS 5 add-on. **Freeze warning:** with
+  `renodx-dlss.addon64` installed, the sim can freeze when a Fenix aircraft loads. This happens with this fix removed
+  too, so it's between RenoDX and the Fenix; if you get it, remove `renodx-dlss.addon64` (OptiScaler or OptiShade also
+  offer Neural Rendering).
+- **Extra DLSS passes:** if a mod or the sim runs a second DLSS pass at the internal resolution, 0.8.3 or newer keeps
+  the fix on the sim's real upscale (the one with the largest output).
+- **"Standalone-DLSS-Glass-Cockpit-Refresh" (wesimglide.org):** a third-party package built from this add-on's code
+  with its own changes and its own ReShade core, installed as `dxgi.dll`. It isn't made or supported by me, and its
+  logs and messages can look like this add-on's: please report its problems to its author. Don't use it together with
+  this add-on (the fix would run twice). For the official version, follow [Installation](#installation).
 - **OptiShade:** the OptiShade developer is building this fix into OptiShade.
 - **Multi Frame Generation unlocks for RTX 40:**
   - **RenoDX MFG unlock add-on:** tested, works together with this fix.
@@ -205,6 +217,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | No "Glass Cockpit DLSS Fix" tab in the ReShade menu | The add-on isn't loaded. If the ReShade menu has no **Add-ons** tab, reinstall ReShade with the *full add-on support* download. Check that the file is next to the ReShade DLL, and that **Settings → Add-on search path** in the ReShade menu points to that folder. |
 | Nothing changes, no green tint | Check that ReShade is the *full add-on support* build, the file is next to the ReShade DLL and DLSS or FSR is selected. Then read the tab and the log. |
 | Picture freezes or turns black with Frame Generation on (fine when alt-tabbed) | Update to 0.8.1 or newer (0.8.0 only) |
+| Sim freezes when a Fenix aircraft loads, with RenoDX's DLSS add-on installed | Remove `renodx-dlss.addon64`; see [Other mods](#other-mods) |
 | Tab says "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
 | Screen lines look jagged / too soft | Adjust Line smoothing |
