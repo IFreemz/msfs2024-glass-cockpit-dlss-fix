@@ -619,6 +619,7 @@ struct Map {
     ComPtr<ID3D12DescriptorHeap> rtv;
     bool initialised = false;
     std::atomic<uint32_t> views{0}; // layers drawn this frame and not yet composited (upscaler calls come in view order)
+    std::atomic<uint64_t> recorded_present{0}; // present count when screens were last recorded into the map
     // Largest upscaler output seen for this render size, and when: another mod (e.g. RenoDX's DLSS add-on) can run an
     // extra DLSS pass at the same render size before the sim's own upscale; the fix belongs on the real (largest) one.
     std::atomic<uint64_t> largest_output{0}, largest_output_present{0};
@@ -1030,6 +1031,7 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
     native->OMSetRenderTargets(state.target_count, state.targets.data(), FALSE, &state.depth);
     transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, map_resting);
     map->views = map->layers;
+    map->recorded_present = present_count.load(std::memory_order_relaxed);
     if (stats.replays++ == 0) log("milestone first cockpit screen recorded (render target %ux%u)", UINT(desc.Width), desc.Height);
     if (layers > 1) LOG_ONCE("milestone first VR cockpit screen recorded (render target %ux%u, %u views)", UINT(desc.Width), desc.Height, layers);
 } catch (...) { note(stats.unsupported_draw, "exception"); }
@@ -1706,6 +1708,11 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     }
     uint32_t pending = map->views.load();
     do {
+        // The sim records frames on several threads: the next frame's screens can be recorded before this frame's
+        // upscaler call, which then finds the count used up although its screens are in the map (the GPU runs them in
+        // frame order). Without views to tell apart, fix it anyway while screens are being drawn; a second call in the
+        // same frame finds the map already cleared and changes nothing.
+        if (!pending && map->layers == 1 && present_count.load(std::memory_order_relaxed) - map->recorded_present.load() <= 8) break;
         if (!pending) {
             // Diagnostics: an upscaler call that found this frame's screens already composited.
             static std::atomic<int> logged{0};
@@ -1714,7 +1721,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
             return;
         }
     } while (!map->views.compare_exchange_weak(pending, pending - 1));
-    const UINT layer = map->layers > 1 ? layer_for_call(map->layers - pending, map->layers, output) : 0;
+    const UINT layer = map->layers > 1 ? layer_for_call(map->layers - pending, map->layers, output) : 0; // VR: pending > 0 here
     const auto out = output->GetDesc(), in = colour->GetDesc();
     // Any float or UNORM colour output the compute pass can write (DLSS in MSFS: R11G11B10_FLOAT).
     const DXGI_FORMAT out_format = typed(out.Format), in_format = typed(in.Format);
