@@ -105,8 +105,8 @@ void draw(reshade::api::effect_runtime*) {
     ImGui::SameLine();
     if (ImGui::Button("Copy report")) ImGui::SetClipboardText(report(s).c_str());
     ImGui::SameLine();
-    if (ImGui::Button("Capture screens")) glass::request_capture();
-    ImGui::SetItemTooltip("Saves 3 frames as pictures next to the log: the sim's own frame, the upscaled frame before and\n"
+    if (ImGui::Button("Capture screens  (Ctrl+Shift+F8)")) glass::request_capture();
+    ImGui::SetItemTooltip("Saves 6 frames over about half a second as pictures next to the log: the sim's own frame, the upscaled frame before and\n"
         "after the fix, and the screen map. Use it with the problem visible on screen; attach the folder to a bug report.");
     if (!s.capture.empty()) ImGui::TextColored(grey, "%s", s.capture.c_str());
     ImGui::TextColored(grey, "For bug reports, attach glass-cockpit-dlss-fix.log and .old.log from the log folder.");

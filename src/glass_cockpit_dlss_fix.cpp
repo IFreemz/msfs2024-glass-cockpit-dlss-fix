@@ -1402,11 +1402,13 @@ struct CaptureImage {
 };
 struct CaptureFrame {
     std::vector<CaptureImage> images;
+    ComPtr<ID3D12Resource> params; // per-slot colour match (a, b, quality) after this frame's fit
     std::string upscaler;
     UINT render_w = 0, render_h = 0, out_w = 0, out_h = 0, layer = 0;
     float jitter_x = 0, jitter_y = 0;
 };
-constexpr int capture_frame_count = 3;
+constexpr int capture_frame_count = 6, capture_spacing = 5; // 6 frames, every 5th fixed frame (~0.5 s)
+std::atomic<int> capture_countdown{0};
 std::mutex capture_mutex;
 std::atomic<int> capture_requested{0};
 std::vector<CaptureFrame> capture_frames;
@@ -1501,7 +1503,7 @@ HRESULT save_png(const std::filesystem::path& path, UINT width, UINT height, con
 }
 
 struct CapturedPixels { std::string name; DXGI_FORMAT format; UINT width = 0, height = 0, pitch = 0; std::vector<uint8_t> bytes; };
-struct CapturedFrame { CaptureFrame info; std::vector<CapturedPixels> images; };
+struct CapturedFrame { CaptureFrame info; std::vector<CapturedPixels> images; std::vector<float> params; };
 
 // Writes the frames: colour images share one exposure (from the upscaler output) so they compare 1:1; the map shows
 // u in red, v in green and the screen slot in blue.
@@ -1532,6 +1534,15 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
         const auto& info = frames[f].info;
         summary << "\nframe " << f << ": " << info.upscaler << " render " << info.render_w << "x" << info.render_h << " output " << info.out_w << "x" << info.out_h
             << " jitter " << info.jitter_x << "," << info.jitter_y << " map layer " << info.layer << "\n";
+        const auto& params = frames[f].params;
+        for (unsigned slot = 0; params.size() >= slot_count * 12 && slot < slot_count; ++slot) {
+            const float* a = params.data() + slot * 12;
+            if (a[3] == 0) continue;
+            char line[256];
+            snprintf(line, sizeof(line), "    colour match slot %u: gain=%.4f,%.4f,%.4f offset=%.5f,%.5f,%.5f quality=%.3f %s\n", slot, a[0], a[1], a[2], a[4], a[5], a[6],
+                a[11], a[3] > 0 ? "fixed" : "skipped");
+            summary << line;
+        }
         for (const auto& image : frames[f].images) {
             const bool map_image = image.name == "map";
             std::vector<uint8_t> rgba(size_t(image.width) * image.height * 4, 0);
@@ -1583,8 +1594,18 @@ void capture_flush(uint64_t now) {
     }
     std::vector<CapturedFrame> copies;
     for (auto& frame : frames) {
-        CapturedFrame copy{frame, {}};
+        CapturedFrame copy{frame, {}, {}};
         copy.info.images.clear();
+        copy.info.params.Reset();
+        if (frame.params) {
+            void* data = nullptr;
+            const D3D12_RANGE range{0, slot_count * 3 * 16};
+            if (SUCCEEDED(frame.params->Map(0, &range, &data))) {
+                copy.params.assign(static_cast<float*>(data), static_cast<float*>(data) + slot_count * 12);
+                const D3D12_RANGE none{0, 0};
+                frame.params->Unmap(0, &none);
+            }
+        }
         for (auto& image : frame.images) {
             CapturedPixels pixels{image.name, image.format, image.footprint.Footprint.Width, image.footprint.Footprint.Height, image.footprint.Footprint.RowPitch, {}};
             void* data = nullptr;
@@ -1748,9 +1769,11 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     uav_barrier(native); // the upscaler just wrote the output
     // Screen capture: the sim's raw frame, the upscaler's output and the screen map, before the fix.
     CaptureFrame capture;
-    const bool capturing = capture_requested.load(std::memory_order_relaxed) > 0;
+    // Every capture_spacing-th fixed frame while a capture is requested (the frames then span ~0.5 s of motion).
+    const bool capturing = capture_requested.load(std::memory_order_relaxed) > 0 && capture_countdown.fetch_sub(1) <= 0;
+    if (capturing) capture_countdown = capture_spacing - 1;
     if (capturing) {
-        capture = {{}, u.name, render_w, render_h, out_w, out_h, layer, jitter_x, jitter_y};
+        capture = {{}, {}, u.name, render_w, render_h, out_w, out_h, layer, jitter_x, jitter_y};
         capture_copy(d.native, native, colour, 0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, in_format, "1-sim-raw-frame", capture);
         capture_copy(d.native, native, output, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out_format, "2-upscaler-output", capture);
         capture_copy(d.native, native, map->texture.Get(), layer /* one mip: subresource = layer */, map_resting, glass::map_format, "map", capture);
@@ -1796,6 +1819,15 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     }
     if (capturing) {
         capture_copy(d.native, native, output, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out_format, "3-after-fix", capture);
+        // The colour match this frame used (the solve pass wrote it before the composite).
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slot_count * 3 * 16, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        if (SUCCEEDED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&capture.params)))) {
+            transition(native, d.params.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            native->CopyBufferRegion(capture.params.Get(), 0, d.params.Get(), 0, slot_count * 3 * 16);
+            transition(native, d.params.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         std::lock_guard capture_lock(capture_mutex);
         capture_frames.push_back(std::move(capture));
         if (capture_requested.fetch_sub(1) == 1) capture_ready_at = present_count.load() + 10;
@@ -2142,6 +2174,7 @@ void on_present(api::effect_runtime* runtime) {
     measure_cost(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr, runtime->get_device()->get_private_data<DeviceState>(),
         present_count.load(std::memory_order_relaxed));
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
+    if (chord && runtime->is_key_pressed(VK_F8)) glass::request_capture();
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
     if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
     if (chord && runtime->is_key_pressed(VK_F12)) {
@@ -2239,6 +2272,7 @@ void request_capture() {
     capture_folder = addon_directory / name;
     capture_frames.clear();
     capture_message = "Capturing... (fly with the screens in view)";
+    capture_countdown = 0;
     capture_requested = capture_frame_count;
     log("capture requested: %ls", capture_folder.c_str());
 }
