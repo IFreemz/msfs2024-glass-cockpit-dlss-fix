@@ -227,6 +227,22 @@ bool tap(int2 p, out float4 value)
     return map_slot(value) < slot_count;
 }
 
+// Texture coordinates at `location` continued from map pixel q (value m) along the steps to its neighbours on the
+// same side of any UV seam (the smaller step of each pair), and the per-output-pixel gradients.
+void continue_from(int2 q, float4 m, float2 location, out float2 uv, out float2 dx, out float2 dy)
+{
+    float4 r = load_map(q + int2(1, 0)), l = load_map(q - int2(1, 0)), down = load_map(q + int2(0, 1)), up = load_map(q - int2(0, 1));
+    float2 to_r = r.w == m.w ? r.xy - m.xy : 1e3, to_l = l.w == m.w ? m.xy - l.xy : 1e3;
+    float2 to_d = down.w == m.w ? down.xy - m.xy : 1e3, to_u = up.w == m.w ? m.xy - up.xy : 1e3;
+    float2 gx = length(to_r) <= length(to_l) ? to_r : to_l, gy = length(to_d) <= length(to_u) ? to_d : to_u;
+    if (length(gx) > 1) gx = 0;
+    if (length(gy) > 1) gy = 0;
+    float2 o = location - float2(q);
+    uv = m.xy + o.x * gx + o.y * gy;
+    dx = gx * map_per_output.x;
+    dy = gy * map_per_output.y;
+}
+
 [numthreads(8, 8, 1)]
 void composite(uint3 id : SV_DispatchThreadID)
 {
@@ -240,6 +256,8 @@ void composite(uint3 id : SV_DispatchThreadID)
     bool covered = tap(cell, a) & tap(cell + int2(1, 0), b) & tap(cell + int2(0, 1), c) & tap(cell + int2(1, 1), d);
     float2 f = location - cell;
     float2 uv, dx, dy;
+    float2 seam_uv = 0, seam_dx = 0, seam_dy = 0; // UV seam: the other side, and its share of this pixel
+    float seam_share = 0;
     bool filled = false;
     if (covered && a.w == b.w && a.w == c.w && a.w == d.w)
     {
@@ -256,22 +274,26 @@ void composite(uint3 id : SV_DispatchThreadID)
             float jump = max(max(lab, lcd), max(lac, lbd)), step = min(min(lab, lcd), min(lac, lbd));
             if (jump > 0.02 && jump > 4 * step)
             {
+                // Two sides: the taps near the nearest one in the texture, and the rest. Each side continues its own
+                // nearest tap; the two samples are blended by how much of this pixel each side covers (bilinear
+                // weights), so the seam is as smooth as the upscaler draws it instead of following the render grid.
                 float4 taps[4] = { a, b, c, d };
                 float weights[4] = { (1 - f.x) * (1 - f.y), f.x * (1 - f.y), (1 - f.x) * f.y, f.x * f.y };
                 uint k = 0;
                 [unroll] for (uint i = 1; i < 4; ++i) if (weights[i] > weights[k]) k = i;
-                float4 m = taps[k];
-                int2 q = cell + int2(k & 1, k >> 1);
-                float4 r = load_map(q + int2(1, 0)), l = load_map(q - int2(1, 0)), down = load_map(q + int2(0, 1)), up = load_map(q - int2(0, 1));
-                float2 to_r = r.w == m.w ? r.xy - m.xy : 1e3, to_l = l.w == m.w ? m.xy - l.xy : 1e3;
-                float2 to_d = down.w == m.w ? down.xy - m.xy : 1e3, to_u = up.w == m.w ? m.xy - up.xy : 1e3;
-                float2 gx = length(to_r) <= length(to_l) ? to_r : to_l, gy = length(to_d) <= length(to_u) ? to_d : to_u;
-                if (length(gx) > 1) gx = 0;
-                if (length(gy) > 1) gy = 0;
-                float2 o = location - float2(q);
-                uv = m.xy + o.x * gx + o.y * gy;
-                dx = gx * map_per_output.x;
-                dy = gy * map_per_output.y;
+                uint other = 4;
+                float side = 0;
+                [unroll] for (uint j = 0; j < 4; ++j)
+                {
+                    if (length(taps[j].xy - taps[k].xy) < jump * 0.5) side += weights[j];
+                    else if (other == 4 || weights[j] > weights[other]) other = j;
+                }
+                continue_from(cell + int2(k & 1, k >> 1), taps[k], location, uv, dx, dy);
+                if (other < 4)
+                {
+                    continue_from(cell + int2(other & 1, other >> 1), taps[other], location, seam_uv, seam_dx, seam_dy);
+                    seam_share = 1 - side;
+                }
             }
         }
     }
@@ -363,6 +385,11 @@ void composite(uint3 id : SV_DispatchThreadID)
         }
     }
     float3 content = ((flags & 8) ? sample_display_smooth(slot, uv, dx, dy) : sample_display(slot, uv, dx, dy)) * gain.rgb;
+    if (seam_share > 0)
+    {
+        float3 other_side = (flags & 8) ? sample_display_smooth(slot, seam_uv, seam_dx, seam_dy) : sample_display(slot, seam_uv, seam_dx, seam_dy);
+        content = lerp(content, other_side * gain.rgb, seam_share);
+    }
 
     // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder: bilinear value at this pixel and its
     // spread over the 3x3 render pixels around it (same display only).
