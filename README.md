@@ -63,7 +63,7 @@ All settings are in the add-on's tab in the ReShade menu (**Home**) and are reme
 | Setting | What it does |
 |---|---|
 | Fix enabled (Ctrl+Shift+F9) | Fix on/off, for comparison |
-| Line smoothing (0-50 %, default 35 %) | Smooths stair steps on thin slanted lines in the screens, like the upscaler did. 0 = sharpest, 50 = softest. Ctrl+click to type a value |
+| Line smoothing (0-50 %, default 35 %) | Smooths stair steps on thin slanted lines in the screens, like the upscaler did. 0 = sharpest, 50 = softest. Ctrl+click to type a value. Tick **Extra** next to it to go up to 100 % (blurs the whole screen; for screens with very jagged lines) |
 | Green tint (Ctrl+Shift+F11) | Tints every screen the fix covers (for checking, not remembered) |
 
 Under **Troubleshooting → Advanced** (collapsed; only change these if asked to in a bug report, "Reset to defaults"
@@ -74,12 +74,14 @@ puts them back):
 | Flip jitter direction | Only needed if the screen text shimmers when the camera is still |
 | Glass layer (0-100 %, default 100 %) | How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens. Lower values can help if quickly changing numbers leave a milky trail |
 
-Under **Troubleshooting → Experimental fixes** (collapsed, **all off by default**; for problems that only some
-aircraft have, "Reset experimental fixes" turns them all off again):
+Under **Troubleshooting → Experimental fixes** (collapsed, **all off by default except UV seam fix**; for problems
+that only some aircraft have, "Reset experimental fixes" puts them all back to default):
 
 | Setting | What it does |
 |---|---|
-| Detail clamp (0-100 %) | Keeps the fixed screens within the brightness the sim itself draws around each pixel. Hides texture detail too thin for the sim to show, e.g. a **dashed light line where a screen's picture meets its bezel** (FSS E-Jets: try 100 %). **Can make screens flicker**, the more the lower the DLSS render resolution: almost none with DLAA and Quality, more with Balanced and Performance. Lower it if that bothers you, or if small text looks duller than with the fix off |
+| Dark screen fix (off) | Keeps very dark screens fixed in strong sunlight (e.g. the F/A-18E Super Hornet). Off by default since 0.8.3, because it made some other screens drop out of the fix (e.g. the iFly EFB) |
+| UV seam fix (on) | Removes thin dashed lines where a screen's picture meets a part of the same screen that uses another area of its image (FSS E-Jets: the line between the picture and its bezel band), and keeps those edges smooth on low DLSS modes. If a screen edge looks worse with it on, untick it and please report the aircraft |
+| Detail clamp (0-100 %) | Keeps the fixed screens within the brightness the sim itself draws around each pixel. Hides texture detail too thin for the sim to show. **Can make screens flicker**, the more the lower the DLSS render resolution: almost none with DLAA and Quality, more with Balanced and Performance. Lower it if that bothers you, or if small text looks duller than with the fix off |
 | Edge fade (0-250) | Fades screen edges into the sim's own picture, in hundredths of a render pixel (100 = 1 pixel). Can calm jaggy or crawling screen edges. Above about 200 it can flicker |
 | Angle softening (0-100 %) | Draws screens seen at a steep angle softer, like the sim does. Screens seen straight on are unchanged |
 | Edge stretcher (0-400) | Extends screens outwards over their frame, in hundredths of a render pixel, continuing their picture. For screens that don't quite reach their frame |
@@ -106,8 +108,8 @@ ReShade presets and effects keep working as usual on top of the fix.
 | FlightFX C750 | Tested by the community (0.7.6 or newer) |
 | Default DA62 | Tested |
 | Default Cessna Longitude | Tested by the community (in VR) |
-| FSS E-Jets (ERJ-170/175/190/195) | Tested (a dashed line at the screens' edges: set Detail clamp to 100 %, see [Settings](#settings)) |
-| Default F/A-18E Super Hornet | Tested (0.8.2 or newer keeps its dark screens fixed in strong sun) |
+| FSS E-Jets (ERJ-170/175/190/195) | Tested (0.8.3 or newer removes the dashed line at the screens' edges) |
+| Default F/A-18E Super Hornet | Tested (if its dark screens drop out of the fix in strong sun, tick Dark screen fix, see [Settings](#settings)) |
 
 Other glass cockpits should work too. If some screens of an aircraft don't turn green with Ctrl+Shift+F11, please
 report it (see [Troubleshooting](#troubleshooting)).
@@ -142,7 +144,8 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
 ### Other mods
 
 - **ReShade presets and effects:** work as usual.
-- **DLSS 5 / Neural Rendering add-ons:** tested alongside the RenoDX DLSS 5 add-on.
+- **DLSS 5 / Neural Rendering add-ons:** tested alongside the RenoDX DLSS 5 add-on. If it runs an extra DLSS pass of
+  its own, 0.8.3 or newer keeps the fix on the sim's real upscale (reports welcome).
 - **OptiShade:** the OptiShade developer is building this fix into OptiShade.
 - **Multi Frame Generation unlocks for RTX 40:**
   - **RenoDX MFG unlock add-on:** tested, works together with this fix.
@@ -166,8 +169,21 @@ Open the ReShade menu (**Home**) and the **Glass Cockpit DLSS Fix** tab first. I
 (GPU, upscaler running, cockpit shader found, screens recorded, fix drawn) and explains any problem in plain words.
 It has an **Open log folder** button and a **Copy report** button for bug reports.
 
-The add-on also writes `glass-cockpit-dlss-fix.log` next to itself, and keeps the previous session as
-`glass-cockpit-dlss-fix.old.log`. **Please attach both to any bug report.**
+### What to send with a bug report
+
+| Problem | Send |
+|---|---|
+| The fix doesn't work at all, the tab shows a problem, a screen is never fixed, a crash or freeze | **Both logs**: `glass-cockpit-dlss-fix.log` and `glass-cockpit-dlss-fix.old.log` (button **Open log folder**). For screens that are never fixed, press **Ctrl+Shift+F12** while looking at them first |
+| Something you can see on fixed screens: wrong or changing colours, flicker, lines, jagged or blurry edges, trails | A **capture**: with the problem visible, press **Capture screens** (or **Ctrl+Shift+F8**), keep the screens in view for a few seconds, then attach the `glass-capture-....zip` from the log folder. It already contains both logs |
+
+Always mention the aircraft, your DLSS/FSR mode, Frame Generation on/off and other mods (OptiScaler, RenoDX, MFG
+unlocks...).
+
+The **logs** are written every session: the add-on writes `glass-cockpit-dlss-fix.log` next to itself and keeps the
+previous session as `glass-cockpit-dlss-fix.old.log` (if the sim crashed or you restarted it, the problem is in the
+`.old.log`). The **capture** saves a few frames as pictures, cropped to the cockpit screens: what the sim drew, the
+upscaled frame before and after the fix, and the frames sent to your monitor, plus a summary. It is only made when you
+press it and costs nothing otherwise; nothing is uploaded anywhere.
 
 The log lists your GPU, driver, ReShade version, the DLSS/FSR files the sim loaded and other ReShade add-ons,
 followed by milestones in order:
@@ -192,8 +208,9 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Tab says "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
 | Screen lines look jagged / too soft | Adjust Line smoothing |
-| Dashed light line along the edge of a screen's picture (e.g. FSS E-Jets) | Set **Detail clamp** under Troubleshooting → Experimental fixes to 100 % (can add some flicker on DLSS Balanced/Performance) |
-| Dark screens drop out of the fix (green tint goes away) in strong sun | Update to 0.8.2 or newer |
+| Dashed light line along the edge of a screen's picture (e.g. FSS E-Jets) | Update to 0.8.3 or newer and keep **UV seam fix** ticked under Troubleshooting → Experimental fixes. If a line remains, try **Detail clamp** (can add some flicker on DLSS Balanced/Performance) |
+| Dark screens drop out of the fix (green tint goes away) in strong sun | Tick **Dark screen fix** under Troubleshooting → Experimental fixes |
+| Screens change colour for a moment while the camera or aircraft moves (most often with Frame Generation) | Update to 0.8.3 or newer (on a monitor; the VR version of this fix comes later) |
 | Screen text shimmers when the camera is still | Tick **Flip jitter direction** in the Advanced section under Troubleshooting. If it's already ticked (the tab says "Advanced settings changed"), click **Reset to defaults** |
 | Screens flicker in brightness (G-Sync / FreeSync monitor) | VRR flicker from a changing frame rate, most visible on dark screens. Turn on V-Sync, or cap the frame rate a few fps below your refresh rate |
 | Crash at startup | Remove the add-on, start once, put it back, then send both logs |
@@ -230,6 +247,8 @@ no measurable FPS difference with the fix on or off in testing.
 - A thin band at each screen's edge (about one render pixel) still comes from the upscaler (Edge fade and Edge
   stretcher under Experimental fixes can help on some aircraft).
 - Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) would be covered by it.
+- VR: the 0.8.3 fix for screens briefly changing colour while moving is for monitors only so far. It will come to VR
+  in a later version.
 - Sim updates that change the cockpit display shader stop the fix (the sim then just looks like stock DLSS/FSR)
   until the add-on is updated.
 

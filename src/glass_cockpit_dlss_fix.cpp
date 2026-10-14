@@ -1411,10 +1411,10 @@ struct CaptureFrame {
     int presented = -1; // >= 0: a frame sent to the monitor (index), not an upscaler call
     bool real = false;  // presented frame: the fix ran since the previous present (a real frame, not a generated one)
 };
-constexpr int capture_frame_count = 6, capture_spacing = 5; // 6 frames, every 5th fixed frame (~0.5 s)
+constexpr int capture_frame_count = 4, capture_spacing = 5; // 4 frames, every 5th fixed frame (~0.3 s)
 std::atomic<int> capture_countdown{0};
 // Frames sent to the monitor, consecutively from the request (frame generation's frames included).
-constexpr int capture_present_count = 12;
+constexpr int capture_present_count = 8;
 std::atomic<int> capture_presents_left{0};
 std::mutex capture_mutex;
 std::atomic<int> capture_requested{0};
@@ -1509,6 +1509,52 @@ HRESULT save_png(const std::filesystem::path& path, UINT width, UINT height, con
     return result;
 }
 
+// A plain zip (stored, no compression: the PNGs are compressed already) so a capture is one file to attach.
+uint32_t crc32(const uint8_t* data, size_t size, uint32_t crc = 0) {
+    static const auto table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) { uint32_t c = i; for (int k = 0; k < 8; ++k) c = c & 1 ? 0xedb88320u ^ (c >> 1) : c >> 1; t[i] = c; }
+        return t;
+    }();
+    crc = ~crc;
+    for (size_t i = 0; i < size; ++i) crc = table[(crc ^ data[i]) & 0xff] ^ (crc >> 8);
+    return ~crc;
+}
+bool write_zip(const std::filesystem::path& zip, const std::vector<std::pair<std::string, std::filesystem::path>>& entries) {
+    std::ofstream out(zip, std::ios::binary);
+    if (!out) return false;
+    SYSTEMTIME t; GetLocalTime(&t);
+    const uint16_t time = uint16_t((t.wHour << 11) | (t.wMinute << 5) | (t.wSecond / 2)), date = uint16_t(((t.wYear - 1980) << 9) | (t.wMonth << 5) | t.wDay);
+    std::vector<uint8_t> directory;
+    const auto put = [](std::vector<uint8_t>& v, uint32_t value, int bytes) { for (int i = 0; i < bytes; ++i) v.push_back(uint8_t(value >> (8 * i))); };
+    uint32_t offset = 0, count = 0;
+    for (const auto& [name, path] : entries) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) continue;
+        const std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (data.size() >= 0xffffffffu || offset >= 0x7fffffffu) break;
+        const uint32_t crc = crc32(data.data(), data.size()), size = uint32_t(data.size());
+        std::vector<uint8_t> header;
+        put(header, 0x04034b50, 4); put(header, 10, 2); put(header, 0, 2); put(header, 0, 2); put(header, time, 2); put(header, date, 2);
+        put(header, crc, 4); put(header, size, 4); put(header, size, 4); put(header, uint32_t(name.size()), 2); put(header, 0, 2);
+        header.insert(header.end(), name.begin(), name.end());
+        out.write(reinterpret_cast<const char*>(header.data()), std::streamsize(header.size()));
+        out.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+        put(directory, 0x02014b50, 4); put(directory, 20, 2); put(directory, 10, 2); put(directory, 0, 2); put(directory, 0, 2); put(directory, time, 2);
+        put(directory, date, 2); put(directory, crc, 4); put(directory, size, 4); put(directory, size, 4); put(directory, uint32_t(name.size()), 2);
+        put(directory, 0, 2); put(directory, 0, 2); put(directory, 0, 2); put(directory, 0, 2); put(directory, 0, 4); put(directory, offset, 4);
+        directory.insert(directory.end(), name.begin(), name.end());
+        offset += uint32_t(header.size()) + size;
+        ++count;
+    }
+    std::vector<uint8_t> end;
+    put(end, 0x06054b50, 4); put(end, 0, 2); put(end, 0, 2); put(end, count, 2); put(end, count, 2);
+    put(end, uint32_t(directory.size()), 4); put(end, offset, 4); put(end, 0, 2);
+    out.write(reinterpret_cast<const char*>(directory.data()), std::streamsize(directory.size()));
+    out.write(reinterpret_cast<const char*>(end.data()), std::streamsize(end.size()));
+    return bool(out);
+}
+
 struct CapturedPixels { std::string name; DXGI_FORMAT format; UINT width = 0, height = 0, pitch = 0; std::vector<uint8_t> bytes; };
 struct CapturedFrame { CaptureFrame info; std::vector<CapturedPixels> images; std::vector<float> params; };
 
@@ -1537,18 +1583,49 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
         break;
     }
     summary << "exposure scale (all colour images): " << scale << "\n";
+    // Colour images are cropped to the screens (all maps together, plus a margin) to keep the folder small; with no
+    // screens recognised they stay whole.
+    UINT map_w = 0, map_h = 0, crop[4]{UINT_MAX, UINT_MAX, 0, 0};
+    for (const auto& frame : frames) for (const auto& image : frame.images) if (image.name == "map") {
+        map_w = image.width; map_h = image.height;
+        for (UINT y = 0; y < image.height; y += 2) for (UINT x = 0; x < image.width; x += 2) {
+            std::array<float, 4> c{};
+            if (decode_texel(image.format, image.bytes.data() + size_t(y) * image.pitch + size_t(x) * texel_bytes(image.format), c) && c[3] > 0.5f) {
+                crop[0] = std::min(crop[0], x); crop[1] = std::min(crop[1], y); crop[2] = std::max(crop[2], x + 2); crop[3] = std::max(crop[3], y + 2);
+            }
+        }
+    }
+    const bool cropping = map_w && map_h && crop[2] > crop[0] && crop[3] > crop[1];
+    if (cropping) {
+        constexpr UINT margin = 32;
+        crop[0] = crop[0] > margin ? crop[0] - margin : 0; crop[1] = crop[1] > margin ? crop[1] - margin : 0;
+        crop[2] = std::min(crop[2] + margin, map_w); crop[3] = std::min(crop[3] + margin, map_h);
+        summary << "colour images cropped to map pixels " << crop[0] << "," << crop[1] << " to " << crop[2] << "," << crop[3]
+            << " (scaled to each image's size; the map image is whole)\n";
+    }
+    // Area of an image to save: x0, y0, x1, y1 (end exclusive).
+    const auto area = [&](UINT width, UINT height, bool whole) {
+        std::array<UINT, 4> a{0, 0, width, height};
+        if (!cropping || whole || !width || !height) return a;
+        const double sx = double(width) / map_w, sy = double(height) / map_h;
+        a[0] = std::min(width - 1, UINT(crop[0] * sx)); a[1] = std::min(height - 1, UINT(crop[1] * sy));
+        a[2] = std::clamp(UINT(std::ceil(crop[2] * sx)), a[0] + 1, width); a[3] = std::clamp(UINT(std::ceil(crop[3] * sy)), a[1] + 1, height);
+        return a;
+    };
     std::vector<CapturedFrame> fixed, presented;
     for (auto& frame : frames) (frame.info.presented >= 0 ? presented : fixed).push_back(std::move(frame));
     if (!presented.empty()) summary << "\npresented frames (sent to the monitor, consecutive; real = the fix ran since the previous one, generated = frame generation):\n";
     for (const auto& frame : presented) {
         for (const auto& image : frame.images) {
-            std::vector<uint8_t> rgba(size_t(image.width) * image.height * 4, 0);
+            const auto a = area(image.width, image.height, false);
+            const UINT w = a[2] - a[0], h = a[3] - a[1];
+            std::vector<uint8_t> rgba(size_t(w) * h * 4, 0);
             const bool linear = image.format == DXGI_FORMAT_R16G16B16A16_FLOAT; // scRGB; the others are already display-encoded
             bool decoded = true;
-            for (UINT y = 0; y < image.height && decoded; ++y) for (UINT x = 0; x < image.width; ++x) {
+            for (UINT y = a[1]; y < a[3] && decoded; ++y) for (UINT x = a[0]; x < a[2]; ++x) {
                 std::array<float, 4> c{};
                 if (!decode_texel(image.format, image.bytes.data() + size_t(y) * image.pitch + size_t(x) * texel_bytes(image.format), c)) { decoded = false; break; }
-                uint8_t* out = &rgba[(size_t(y) * image.width + x) * 4];
+                uint8_t* out = &rgba[(size_t(y - a[1]) * w + (x - a[0])) * 4];
                 for (int i = 0; i < 3; ++i) {
                     const float v = std::clamp(std::isfinite(c[i]) ? c[i] : 0.0f, 0.0f, 1.0f);
                     out[i] = uint8_t(std::lround((linear ? (v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1 / 2.4f) - 0.055f) : v) * 255));
@@ -1557,8 +1634,8 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
             }
             const auto name = "present" + std::to_string(frame.info.presented) + (frame.info.real ? "-real" : "-generated");
             const auto file = folder / (std::wstring(name.begin(), name.end()) + L".png");
-            const HRESULT result = decoded ? save_png(file, image.width, image.height, rgba) : E_NOTIMPL;
-            summary << "  " << name << ": " << image.width << "x" << image.height << " format " << unsigned(image.format)
+            const HRESULT result = decoded ? save_png(file, w, h, rgba) : E_NOTIMPL;
+            summary << "  " << name << ": " << image.width << "x" << image.height << " saved area " << a[0] << "," << a[1] << " to " << a[2] << "," << a[3] << " format " << unsigned(image.format)
                 << (decoded ? (SUCCEEDED(result) ? " saved" : " save failed") : " format not supported") << "\n";
         }
     }
@@ -1578,13 +1655,15 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
         }
         for (const auto& image : frames[f].images) {
             const bool map_image = image.name == "map";
-            std::vector<uint8_t> rgba(size_t(image.width) * image.height * 4, 0);
+            const auto a = area(image.width, image.height, map_image);
+            const UINT w = a[2] - a[0], h = a[3] - a[1];
+            std::vector<uint8_t> rgba(size_t(w) * h * 4, 0);
             std::map<int, std::array<UINT, 5>> slots; // slot -> min x, min y, max x, max y, pixels
             bool decoded = true;
-            for (UINT y = 0; y < image.height && decoded; ++y) for (UINT x = 0; x < image.width; ++x) {
+            for (UINT y = a[1]; y < a[3] && decoded; ++y) for (UINT x = a[0]; x < a[2]; ++x) {
                 std::array<float, 4> c{};
                 if (!decode_texel(image.format, image.bytes.data() + size_t(y) * image.pitch + size_t(x) * texel_bytes(image.format), c)) { decoded = false; break; }
-                uint8_t* out = &rgba[(size_t(y) * image.width + x) * 4];
+                uint8_t* out = &rgba[(size_t(y - a[1]) * w + (x - a[0])) * 4];
                 if (map_image) {
                     const int slot = int(c[3] + 0.5f) - 1;
                     if (slot >= 0) {
@@ -1601,17 +1680,29 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
                 out[3] = 255;
             }
             const auto file = folder / (L"frame" + std::to_wstring(f) + L"-" + std::wstring(image.name.begin(), image.name.end()) + L".png");
-            const HRESULT result = decoded ? save_png(file, image.width, image.height, rgba) : E_NOTIMPL;
-            summary << "  " << image.name << ": " << image.width << "x" << image.height << " format " << unsigned(image.format)
+            const HRESULT result = decoded ? save_png(file, w, h, rgba) : E_NOTIMPL;
+            summary << "  " << image.name << ": " << image.width << "x" << image.height << " saved area " << a[0] << "," << a[1] << " to " << a[2] << "," << a[3] << " format " << unsigned(image.format)
                 << (decoded ? (SUCCEEDED(result) ? " saved" : " save failed") : " format not supported") << "\n";
             for (const auto& [slot, box] : slots)
                 summary << "    screen slot " << slot << ": map pixels " << box[0] << "," << box[1] << " to " << box[2] << "," << box[3] << " (" << box[4] << " pixels)\n";
         }
     }
     summary.close();
+    // One zip with the pictures, the summary and both logs, ready to attach to a bug report.
     log("capture saved: %ls", folder.c_str());
+    std::vector<std::pair<std::string, std::filesystem::path>> entries;
+    for (const auto& file : std::filesystem::directory_iterator(folder, error))
+        if (file.is_regular_file(error)) entries.emplace_back(folder.filename().string() + "/" + file.path().filename().string(), file.path());
+    std::sort(entries.begin(), entries.end());
+    const auto logs = folder.parent_path();
+    entries.emplace_back("glass-cockpit-dlss-fix.log", logs / L"glass-cockpit-dlss-fix.log");
+    entries.emplace_back("glass-cockpit-dlss-fix.old.log", logs / L"glass-cockpit-dlss-fix.old.log");
+    auto zip = folder; zip += L".zip";
+    const bool zipped = write_zip(zip, entries);
+    log("capture zip %s: %ls", zipped ? "saved" : "failed", zip.c_str());
     std::lock_guard lock(capture_mutex);
-    capture_message = "Saved to " + folder.filename().string() + " (next to the log)";
+    capture_message = zipped ? "Saved " + zip.filename().string() + " next to the log: attach it to your bug report"
+                             : "Saved to " + folder.filename().string() + " (next to the log)";
 }
 
 // Called once per present: hands finished captures to the writer thread.
