@@ -216,8 +216,12 @@ std::wstring file_company(const wchar_t* path) {
 }
 
 // Logs DLSS/Streamline/ReShade-related modules once each, with version and path (helps spot missing DLSS or conflicts).
+// Any other module loaded more than a minute after start is logged too: tools that attach to the running sim (e.g.
+// GlassOut) show up there.
 void scan_modules() {
-    static std::set<std::wstring> seen;
+    static std::set<std::wstring> seen, all;
+    static int late = 0;
+    const bool settled = GetTickCount64() - init_tick > 60000;
     HMODULE modules[1024]; DWORD needed = 0;
     if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) return;
     for (DWORD i = 0; i < std::min<DWORD>(needed / sizeof(HMODULE), 1024); ++i) {
@@ -225,9 +229,14 @@ void scan_modules() {
         if (!GetModuleFileNameW(modules[i], path, MAX_PATH)) continue;
         std::wstring name = std::filesystem::path(path).filename().wstring();
         for (auto& c : name) c = wchar_t(towlower(c));
+        const bool new_module = all.insert(path).second;
         const bool relevant = name.starts_with(L"nvngx") || name.starts_with(L"_nvngx") || name.starts_with(L"sl.") ||
             name.ends_with(L".addon64") || name.ends_with(L".addon") || name.starts_with(L"reshade") || name == L"d3d12core.dll" ||
             name == L"dxgi.dll" || name == L"version.dll" || name == L"nvapi64.dll";
+        if (!relevant && new_module && settled && late < 64) {
+            ++late;
+            log("module loaded later: %ls version=%s company=\"%ls\" path=%ls", name.c_str(), file_version(path).c_str(), file_company(path).c_str(), path);
+        }
         if (!relevant || !seen.insert(name).second) continue;
         const auto version = file_version(path);
         log("module %ls version=%s path=%ls", name.c_str(), version.c_str(), path);
@@ -1990,6 +1999,24 @@ bool nested_upscaler() {
     LOG_ONCE("note an upscaler ran inside another one (e.g. OptiScaler answering the sim's FSR with DLSS): the fix is drawn once, after the outer one");
     return true;
 }
+template <class F, class C> NVSDK_NGX_Result evaluate_body(F original, ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, C callback) {
+    ++upscaler_depth;
+    const auto result = original(list, handle, params, callback);
+    --upscaler_depth;
+    if (!upscaler_depth) count_evaluation(params);
+    if (result == NVSDK_NGX_Result_Success) { if (!nested_upscaler()) composite_dlss(list, params); }
+    else LOG_ONCE("note DLSS evaluate returned 0x%x (not success)", unsigned(result));
+    return result;
+}
+// Second attachment points, used when another mod replaces the add-on's hook (see check_ngx_hooks).
+Evaluate original_evaluate_again = nullptr;
+EvaluateC original_evaluate_c_again = nullptr;
+NVSDK_NGX_Result evaluate_again_hook(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, PFN_NVSDK_NGX_ProgressCallback callback) {
+    return evaluate_body(original_evaluate_again, list, handle, params, callback);
+}
+NVSDK_NGX_Result evaluate_c_again_hook(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, PFN_NVSDK_NGX_ProgressCallback_C callback) {
+    return evaluate_body(original_evaluate_c_again, list, handle, params, callback);
+}
 NVSDK_NGX_Result evaluate_hook(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, PFN_NVSDK_NGX_ProgressCallback callback) {
     ++upscaler_depth;
     const auto result = original_evaluate(list, handle, params, callback);
@@ -2093,18 +2120,70 @@ void* follow_jumps(void* address) {
 
 // Hook a DLSS entry point; if another mod has redirected it so that it can't be hooked directly, hook the code it
 // leads to instead (that mod's handler, which then calls DLSS itself): the fix then runs after both.
-template <class T> bool hook_ngx(void* target, void* detour, T& original, const char* name) {
-    if (hook(target, detour, original)) return true;
+// Where each DLSS hook sits and the bytes there before and after hooking: another mod that attaches to the sim later
+// (e.g. GlassOut) can overwrite them, and the DLSS calls then stop reaching the fix (see check_ngx_hooks).
+struct NgxWatch {
+    const char* name = nullptr;
+    void* at = nullptr;
+    void* detour = nullptr;
+    std::array<uint8_t, 16> before{}, after{};
+    bool changed = false, repaired = false;
+};
+NgxWatch ngx_watch[2];
+template <class T> bool hook_watched(void* target, void* detour, T& original, NgxWatch& watch) {
+    std::array<uint8_t, 16> before{};
+    read_bytes(target, before.data(), before.size());
+    if (!hook(target, detour, original)) return false;
+    watch.at = target; watch.detour = detour; watch.before = before;
+    read_bytes(target, watch.after.data(), watch.after.size());
+    return true;
+}
+template <class T> bool hook_ngx(void* target, void* detour, T& original, const char* name, NgxWatch& watch) {
+    watch.name = name;
+    if (hook_watched(target, detour, original, watch)) return true;
     const MH_STATUS status = last_hook_status;
     void* real = follow_jumps(target);
     if (real == target) return false;
     const std::string where = describe_code(real);
-    if (hook(real, detour, original)) {
+    if (hook_watched(real, detour, original, watch)) {
         log("DLSS %s is redirected by another mod (%s): fix attached at its destination (%s)", name, MH_StatusToString(status), where.c_str());
         return true;
     }
     last_hook_status = status;
     return false;
+}
+
+// Called every 10 s. Logs a DLSS hook that another mod has changed; if the DLSS calls have also stopped reaching the
+// fix, attaches again: the hook is written back if the original code was restored, or the fix attaches at the other
+// mod's handler if it jumps there (that handler then calls DLSS; a nested call is drawn once, after the outer one).
+void check_ngx_hooks(bool stopped, bool just_stopped) {
+    for (int i = 0; i < 2; ++i) {
+        auto& w = ngx_watch[i];
+        if (!w.at) continue;
+        std::array<uint8_t, 16> now{};
+        if (!read_bytes(w.at, now.data(), now.size())) continue;
+        if (now == w.after) {
+            if (just_stopped) log("note DLSS %s hook is still in place (%s)", w.name, describe_code(w.at).c_str());
+            continue;
+        }
+        void* leads = follow_jumps(w.at);
+        if (!w.changed || just_stopped) {
+            w.changed = true;
+            log("WARNING DLSS %s hook was changed by another mod: now %s, leads to %s%s", w.name, describe_code(w.at).c_str(),
+                describe_code(leads).c_str(), leads == w.detour ? " (still the fix)" : now == w.before ? " (original code restored)" : "");
+        }
+        if (!stopped || w.repaired || leads == w.detour) continue;
+        w.repaired = true;
+        if (now == w.before) {
+            const MH_STATUS off = MH_DisableHook(w.at), on = MH_EnableHook(w.at);
+            read_bytes(w.at, w.after.data(), w.after.size());
+            log("DLSS %s hook written again: %s / %s, now %s", w.name, MH_StatusToString(off), MH_StatusToString(on), describe_code(w.at).c_str());
+        } else if (leads != w.at) {
+            const bool ok = i == 0 ? hook(leads, reinterpret_cast<void*>(&evaluate_again_hook), original_evaluate_again)
+                                   : hook(leads, reinterpret_cast<void*>(&evaluate_c_again_hook), original_evaluate_c_again);
+            log("DLSS %s: fix attached at the other mod's handler %s: %s", w.name, describe_code(leads).c_str(), ok ? "ok" : MH_StatusToString(last_hook_status));
+        } else log("DLSS %s: no way to attach again (code changed without a jump)", w.name);
+    }
 }
 
 bool ngx_hooked = false, ngx_hook_failed = false; // failed: DLSS is loaded but its evaluate could not be hooked
@@ -2119,9 +2198,9 @@ void install_ngx() {
     auto evaluate_c = GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature_C");
     HMODULE pinned = nullptr;
     if (evaluate) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(evaluate), &pinned);
-    const bool a = evaluate && hook_ngx(reinterpret_cast<void*>(evaluate), reinterpret_cast<void*>(&evaluate_hook), original_evaluate, "evaluate");
+    const bool a = evaluate && hook_ngx(reinterpret_cast<void*>(evaluate), reinterpret_cast<void*>(&evaluate_hook), original_evaluate, "evaluate", ngx_watch[0]);
     const MH_STATUS status_a = evaluate ? last_hook_status : MH_ERROR_FUNCTION_NOT_FOUND;
-    const bool b = evaluate_c && hook_ngx(reinterpret_cast<void*>(evaluate_c), reinterpret_cast<void*>(&evaluate_c_hook), original_evaluate_c, "evaluate_c");
+    const bool b = evaluate_c && hook_ngx(reinterpret_cast<void*>(evaluate_c), reinterpret_cast<void*>(&evaluate_c_hook), original_evaluate_c, "evaluate_c", ngx_watch[1]);
     const MH_STATUS status_b = evaluate_c ? last_hook_status : MH_ERROR_FUNCTION_NOT_FOUND;
     wchar_t path[MAX_PATH]{};
     GetModuleFileNameW(module, path, MAX_PATH);
@@ -2195,7 +2274,8 @@ void install_ngx_proxies() {
         ngx_proxies[index] = module;
         HMODULE pinned = nullptr;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(evaluate), &pinned);
-        const bool hooked = hook_ngx(reinterpret_cast<void*>(evaluate), reinterpret_cast<void*>(proxy_evaluate_hooks[index]), original_proxy_evaluate[index], "evaluate (another mod's)");
+        static NgxWatch proxy_watch; // not watched: proxies are another mod's own DLSS
+        const bool hooked = hook_ngx(reinterpret_cast<void*>(evaluate), reinterpret_cast<void*>(proxy_evaluate_hooks[index]), original_proxy_evaluate[index], "evaluate (another mod's)", proxy_watch);
         log("DLSS answered by another mod: %ls %s path=%ls hook=%d", name.c_str(), file_version(path).c_str(), path, hooked);
         ngx_proxy_hooked |= hooked;
     }
@@ -2350,6 +2430,20 @@ void on_present(api::effect_runtime* runtime) {
     install_ngx_proxies();
     install_ffx();
     scan_modules();
+    {
+        // DLSS calls that stop reaching the fix while the sim keeps drawing cockpit screens: DLSS turned off in the sim,
+        // or another mod took over the DLSS call.
+        static uint64_t last_evaluations = 0, last_draws = 0, last_fsr = 0;
+        static bool stopped = false;
+        const uint64_t evaluations = stats.evaluations.load(), draws = stats.display_draws.load(), fsr = stats.fsr_dispatches.load();
+        const bool now_stopped = ngx_hooked && last_evaluations && evaluations == last_evaluations && fsr == last_fsr && draws > last_draws;
+        if (now_stopped && !stopped)
+            log("WARNING DLSS calls stopped reaching the add-on while the sim still draws cockpit screens (DLSS turned off in the sim, or another mod took over the DLSS call)");
+        if (stopped && evaluations != last_evaluations) log("note DLSS calls reach the add-on again");
+        check_ngx_hooks(now_stopped, now_stopped && !stopped);
+        stopped = now_stopped;
+        last_evaluations = evaluations; last_draws = draws; last_fsr = fsr;
+    }
     if (main_device) {
         const HRESULT removed = main_device->GetDeviceRemovedReason();
         if (removed != S_OK) LOG_ONCE("ERROR graphics device removed, reason=0x%08lx (0x887a0005 = hung/TDR, 0x887a0006 = driver error, 0x887a0001 = invalid call, 0x887a0020 = driver internal)", static_cast<unsigned long>(removed));
