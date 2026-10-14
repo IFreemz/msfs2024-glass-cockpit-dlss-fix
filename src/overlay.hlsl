@@ -257,7 +257,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     float2 f = location - cell;
     float2 uv, dx, dy;
     float2 seam_uv = 0, seam_dx = 0, seam_dy = 0; // UV seam: the other side, and its share of this pixel
-    float seam_share = 0;
+    float seam_share = 0, seam_upscaler = 0;
     bool filled = false;
     if (covered && a.w == b.w && a.w == c.w && a.w == d.w)
     {
@@ -293,6 +293,11 @@ void composite(uint3 id : SV_DispatchThreadID)
                 {
                     continue_from(cell + int2(other & 1, other >> 1), taps[other], location, seam_uv, seam_dx, seam_dy);
                     seam_share = 1 - side;
+                    // Right on the seam the render grid still shows as small steps; the upscaler's picture there is
+                    // smooth (it has seen the seam from many jittered frames) and, as nothing moves across a seam,
+                    // free of trails. Hand those pixels to it: fully at the middle of the seam, not at all a render
+                    // pixel away.
+                    seam_upscaler = 1 - abs(2 * side - 1);
                 }
             }
         }
@@ -362,7 +367,7 @@ void composite(uint3 id : SV_DispatchThreadID)
         }
         edge = saturate(inside_pixels / edge_fade);
     }
-    float blend = edge;
+    float blend = (flags & 4) ? min(edge, 1 - seam_upscaler) : edge;
     if (blend <= 0) return;
     float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
     if (gain.w <= 0) return;
