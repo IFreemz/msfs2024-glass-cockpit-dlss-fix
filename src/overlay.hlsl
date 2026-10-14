@@ -16,7 +16,7 @@ cbuffer Constants : register(b0)
     float2 jitter;           // offset added to map coordinates to undo this frame's camera jitter
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
-                             // bit 3: smooth lines, bits 4-6: unused
+                             // bit 3: smooth lines, bit 4: dark screen fix
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -208,8 +208,10 @@ void solve(uint3 id : SV_DispatchThreadID)
         ? pooled_covariance * pooled_covariance / (pooled_variance * pooled_scene_variance) : 0.0;
     // The same on fine detail only. Sun glare across a mostly dark screen dwarfs its thin symbols and drags the score
     // above down, but barely touches the detail; a picture the texture doesn't hold still scores low on both.
+    // Experimental (dark screen fix): it can also let through a screen whose picture the sim draws differently
+    // (reported for the iFly 737 EFB), so it is off by default.
     double detail_xx = v[16], detail_yy = v[17] * 1024, detail_xy = v[18] - v[19];
-    if (pooled_variance > 3e-6 && detail_xx > 0 && detail_yy > 0 && detail_xy > 0)
+    if ((flags & 16) && pooled_variance > 3e-6 && detail_xx > 0 && detail_yy > 0 && detail_xy > 0)
         quality = max(quality, detail_xy * detail_xy / (detail_xx * detail_yy));
     float w = previous_a.w > 0 ? smoothing : 1;
     float q = previous_a.w != 0 ? lerp(previous_q.w, float(quality), smoothing) : float(quality);

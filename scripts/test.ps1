@@ -36,6 +36,9 @@ try {
     & .\FlightSimulator2024.exe --ngx-proxy --vr
     if ($LASTEXITCODE) { throw "Offline DLSS answered by OptiScaler VR test failed ($LASTEXITCODE)" }
     # OptiScaler answers the sim's FSR with DLSS inside the FSR dispatch: the fix must be drawn once per view.
+    # Another mod (RenoDX's DLSS add-on) runs an extra DLSS pass at the same render size first: the fix goes on the sim's own.
+    & .\FlightSimulator2024.exe --extra-pass
+    if ($LASTEXITCODE) { throw "Offline extra DLSS pass test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --fsr --vr --nested
     if ($LASTEXITCODE) { throw "Offline nested upscaler VR test failed ($LASTEXITCODE)" }
 } finally { Pop-Location }

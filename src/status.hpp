@@ -7,6 +7,7 @@ namespace glass {
 // Experimental fixes (panel section of the same name).
 struct Experimental {
     int detail_clamp = 0, edge_fade = 0, angle_softening = 0, edge_stretch = 0; // percent / hundredths of a render pixel
+    int dark_screens = 0; // dark screen fix on/off
     bool operator==(const Experimental&) const = default;
 };
 

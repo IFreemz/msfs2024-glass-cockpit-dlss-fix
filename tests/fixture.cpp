@@ -243,11 +243,12 @@ int main(int argc, char** argv) {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
         bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false,
-            ngx_proxy = false;
+            ngx_proxy = false, extra_pass = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
             nested |= !std::strcmp(argv[i], "--nested");
+            extra_pass |= !std::strcmp(argv[i], "--extra-pass");
             optiscaler_fsr |= !std::strcmp(argv[i], "--optiscaler-fsr");
             ngx_proxy |= !std::strcmp(argv[i], "--ngx-proxy");
         }
@@ -528,6 +529,9 @@ int main(int argc, char** argv) {
         D3D12_CLEAR_VALUE magenta_clear{DXGI_FORMAT_R11G11B10_FLOAT, {1, 0, 1, 1}};
         auto output = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R11G11B10_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET, &magenta_clear);
+        // --extra-pass: another mod's DLSS pass at the same render size with a render-size output, before the sim's own.
+        auto extra_output = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R11G11B10_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &magenta_clear);
         D3D12_CLEAR_VALUE ref_clear{DXGI_FORMAT_R32G32B32A32_FLOAT, {}};
         auto reference = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, &ref_clear);
         auto ref_depth = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &stencil_clear);
@@ -699,6 +703,10 @@ int main(int argc, char** argv) {
                 proxy_fsr.jitterOffset = {f.jx, f.jy};
                 require(proxy_evaluate(list.Get(), nullptr, &ngx, nullptr) == NVSDK_NGX_Result_Success, "evaluate (OptiScaler) failed");
             } else {
+                if (extra_pass) {
+                    Params extra = ngx; extra.output = extra_output.Get();
+                    require(evaluate(list.Get(), nullptr, &extra, nullptr) == NVSDK_NGX_Result_Success, "evaluate (extra pass) failed");
+                }
                 require(evaluate(list.Get(), nullptr, &ngx, nullptr) == NVSDK_NGX_Result_Success, "evaluate failed");
             }
             transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
