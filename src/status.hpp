@@ -8,6 +8,7 @@ namespace glass {
 struct Experimental {
     int detail_clamp = 0, edge_fade = 0, angle_softening = 0, edge_stretch = 0; // percent / hundredths of a render pixel
     int dark_screens = 0; // dark screen fix on/off
+    int seam_fix = 1; // UV seam fix on/off (on by default)
     bool operator==(const Experimental&) const = default;
 };
 

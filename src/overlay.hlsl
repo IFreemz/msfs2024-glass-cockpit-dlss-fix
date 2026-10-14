@@ -16,7 +16,7 @@ cbuffer Constants : register(b0)
     float2 jitter;           // offset added to map coordinates to undo this frame's camera jitter
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
-                             // bit 3: smooth lines, bit 4: dark screen fix
+                             // bit 3: smooth lines, bit 4: dark screen fix, bit 5: UV seam fix
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -246,6 +246,34 @@ void composite(uint3 id : SV_DispatchThreadID)
         uv = lerp(lerp(a.xy, b.xy, f.x), lerp(c.xy, d.xy, f.x), f.y);
         dx = lerp(b.xy - a.xy, d.xy - c.xy, f.y) * map_per_output.x;
         dy = lerp(c.xy - a.xy, d.xy - b.xy, f.x) * map_per_output.y;
+        // UV seam: one screen mesh whose texture coordinates jump between neighbouring pixels (e.g. the FSS E-Jets'
+        // bezel band points at the texture's corner, right next to the picture). Blending across the jump samples
+        // whatever lies between in the texture: a thin line along the seam that the sim never draws. Continue the
+        // nearest render pixel's own coordinates instead, along the steps to its neighbours on the same side.
+        if (flags & 32)
+        {
+            float lab = length(b.xy - a.xy), lcd = length(d.xy - c.xy), lac = length(c.xy - a.xy), lbd = length(d.xy - b.xy);
+            float jump = max(max(lab, lcd), max(lac, lbd)), step = min(min(lab, lcd), min(lac, lbd));
+            if (jump > 0.02 && jump > 4 * step)
+            {
+                float4 taps[4] = { a, b, c, d };
+                float weights[4] = { (1 - f.x) * (1 - f.y), f.x * (1 - f.y), (1 - f.x) * f.y, f.x * f.y };
+                uint k = 0;
+                [unroll] for (uint i = 1; i < 4; ++i) if (weights[i] > weights[k]) k = i;
+                float4 m = taps[k];
+                int2 q = cell + int2(k & 1, k >> 1);
+                float4 r = load_map(q + int2(1, 0)), l = load_map(q - int2(1, 0)), down = load_map(q + int2(0, 1)), up = load_map(q - int2(0, 1));
+                float2 to_r = r.w == m.w ? r.xy - m.xy : 1e3, to_l = l.w == m.w ? m.xy - l.xy : 1e3;
+                float2 to_d = down.w == m.w ? down.xy - m.xy : 1e3, to_u = up.w == m.w ? m.xy - up.xy : 1e3;
+                float2 gx = length(to_r) <= length(to_l) ? to_r : to_l, gy = length(to_d) <= length(to_u) ? to_d : to_u;
+                if (length(gx) > 1) gx = 0;
+                if (length(gy) > 1) gy = 0;
+                float2 o = location - float2(q);
+                uv = m.xy + o.x * gx + o.y * gy;
+                dx = gx * map_per_output.x;
+                dy = gy * map_per_output.y;
+            }
+        }
     }
     else
     {

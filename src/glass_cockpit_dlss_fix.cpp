@@ -92,6 +92,8 @@ constexpr int default_detail_clamp = 0, max_edge_fade = 250, max_edge_stretch = 
 std::atomic<int> detail_clamp_percent{default_detail_clamp}, edge_fade_percent{0}, angle_soften_percent{0}, edge_stretch_percent{0};
 // Dark screen fix (experimental, on/off): also judge the screen match on fine detail (keeps dark screens fixed in sun glare).
 std::atomic<int> dark_screen_fix{0};
+// UV seam fix (on by default): don't blend texture coordinates across a jump inside one screen mesh.
+std::atomic<int> seam_fix{1};
 // Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like.
 // With Extra smoothing on it goes to 100 % (twice the DLSS-like footprint: softer than DLSS, for stubborn shimmer).
 constexpr int max_smoothing = 50, max_extra_smoothing = 100, default_smoothing = 35;
@@ -1725,7 +1727,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
 
     struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp, angle_soften; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
-        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u),
+        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u),
         smoothing_percent / 50.0f, layer, glass_percent / 100.0f, edge_fade_percent / 100.0f,
         edge_stretch_percent / 100.0f, detail_clamp_percent / 100.0f,
         angle_soften_percent / 100.0f};
@@ -2051,6 +2053,7 @@ void load_settings() {
     angle_soften_percent = std::clamp(int(GetPrivateProfileIntW(L"experimental", L"angle_softening", 0, settings_path().c_str())), 0, 100);
     edge_stretch_percent = std::clamp(int(GetPrivateProfileIntW(L"experimental", L"edge_stretch", 0, settings_path().c_str())), 0, max_edge_stretch);
     dark_screen_fix = GetPrivateProfileIntW(L"experimental", L"dark_screen_fix", 0, settings_path().c_str()) != 0;
+    seam_fix = GetPrivateProfileIntW(L"experimental", L"seam_fix", 1, settings_path().c_str()) != 0;
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
@@ -2068,6 +2071,7 @@ void save_settings() {
     WritePrivateProfileStringW(L"experimental", L"angle_softening", std::to_wstring(angle_soften_percent.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"edge_stretch", std::to_wstring(edge_stretch_percent.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"dark_screen_fix", std::to_wstring(dark_screen_fix.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"seam_fix", std::to_wstring(seam_fix.load()).c_str(), settings_path().c_str());
 }
 
 // One measurement window every 10 s: 120 frames, reported ~30 frames later (the GPU has finished them by then).
@@ -2208,7 +2212,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
+    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
@@ -2250,8 +2254,9 @@ void set_experimental(const Experimental& e) {
     detail_clamp_percent = std::clamp(e.detail_clamp, 0, 100); edge_fade_percent = std::clamp(e.edge_fade, 0, max_edge_fade);
     angle_soften_percent = std::clamp(e.angle_softening, 0, 100); edge_stretch_percent = std::clamp(e.edge_stretch, 0, max_edge_stretch);
     dark_screen_fix = e.dark_screens ? 1 : 0;
+    seam_fix = e.seam_fix ? 1 : 0;
     save_settings();
-    log("setting dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d", dark_screen_fix.load(), detail_clamp_percent.load(),
+    log("setting seam_fix=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d", seam_fix.load(), dark_screen_fix.load(), detail_clamp_percent.load(),
         edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load());
 }
 void set_glass_strength(int percent) { glass_percent = std::clamp(percent, 0, 100); save_settings(); log("setting glass_strength=%d", glass_percent.load()); }
@@ -2332,9 +2337,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     log("Glass Cockpit DLSS Fix %s (built " __DATE__ " " __TIME__ ")", overlay_version);
     log("windows %lu.%lu.%lu  game=%ls", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, executable);
     log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
-    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d",
+    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d seam_fix=%d",
         module, fixture, enabled.load(), jitter_positive.load(), smoothing_percent.load(), int(extra_smoothing.load()), glass_percent.load(), detail_clamp_percent.load(),
-        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), dark_screen_fix.load());
+        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), dark_screen_fix.load(), seam_fix.load());
     log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint");
     scan_modules();
     std::thread(worker).detach();
