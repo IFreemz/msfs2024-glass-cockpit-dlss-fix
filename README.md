@@ -154,10 +154,9 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
   offer Neural Rendering).
 - **Extra DLSS passes:** if a mod or the sim runs a second DLSS pass at the internal resolution, 0.8.3 or newer keeps
   the fix on the sim's real upscale (the one with the largest output).
-- **"Standalone-DLSS-Glass-Cockpit-Refresh" (wesimglide.org):** a third-party package built from this add-on's code
-  with its own changes and its own ReShade core, installed as `dxgi.dll`. It isn't made or supported by me, and its
-  logs and messages can look like this add-on's: please report its problems to its author. Don't use it together with
-  this add-on (the fix would run twice). For the official version, follow [Installation](#installation).
+- **Standalone DLSS Glass Cockpit Refresh** ([wesimglide.org](https://wesimglide.org/otherdata/tools/Standalone-DLSS-Glass-Cockpit-Refresh.html)):
+  a third-party package of this add-on with ReShade built in, by WeSimGlide. For problems with it, follow the support
+  steps on its page. Don't use it together with this add-on (the fix would run twice).
 - **OptiShade:** the OptiShade developer is building this fix into OptiShade.
 - **Multi Frame Generation unlocks for RTX 40:**
   - **RenoDX MFG unlock add-on:** tested, works together with this fix.
