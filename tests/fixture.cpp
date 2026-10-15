@@ -670,7 +670,7 @@ int main(int argc, char** argv) {
                 for (UINT y = 0; y < output_h; ++y)
                     std::memcpy(&result[size_t(y) * output_w], static_cast<uint8_t*>(mapped) + rb.footprint.Offset + size_t(y) * rb.footprint.Footprint.RowPitch, size_t(output_w) * 16);
                 rb.buffer->Unmap(0, nullptr);
-                for (auto& v : result) { for (int c = 0; c < 3; ++c) v[c] /= 16; v[3] = v[3] >= 7.99f ? 1.0f : 0.0f; } // w: fully covered
+                for (auto& v : result) { for (int c = 0; c < 3; ++c) v[c] /= 16; v[3] /= 8; } // w: share of the pixel on the screen
                 return result;
             };
             auto run = [&](const Image& ideal, float jx, float jy) {
@@ -717,10 +717,11 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; };
-            const Mode modes[]{{"still-off-ls0", 0, 0, 0}, {"still-taa-ls0", 0, 1, 0}, {"off-ls0", 0, 0}, {"off-ls20", 20, 0}, {"off-ls35", 35, 0}, {"off-ls50", 50, 0},
-                {"off-ls70", 70, 0}, {"gauss-ls20", 20, 0, 0.0007f, 1}, {"gauss-ls35", 35, 0, 0.0007f, 1}, {"gauss-ls50", 50, 0, 0.0007f, 1}, {"gauss-ls70", 70, 0, 0.0007f, 1},
-                {"taa-ls0", 0, 1}, {"taa-ls20", 20, 1}, {"taa-gauss20", 20, 1, 0.0007f, 1}};
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; };
+            const Mode modes[]{{"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
+                {"still-taa-ls0", 0, 1, 0}, {"off-ls35", 35, 0}, {"off-ls50", 50, 0}, {"gauss-ls35", 35, 0, 0.0007f, 1}, {"taa-ls0", 0, 1}, {"taa-ls20", 20, 1}};
+            const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
+            require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
             require(set_gaussian != nullptr, "exports missing");
             const float jitters[8][2]{{0.0f, -0.1667f}, {-0.25f, 0.1667f}, {0.25f, -0.3889f}, {-0.375f, -0.0556f},
@@ -736,11 +737,12 @@ int main(int argc, char** argv) {
             for (const auto& m : modes) {
                 set_smooth(m.smoothing);
                 set_gaussian(m.gaussian);
+                set_stable(m.stable);
                 set_temporal(0);
                 upload_display(0);
                 Image previous_out, previous_ideal;
-                double error = 0, flicker = 0, after_change = 0;
-                uint64_t error_n = 0, flicker_n = 0, change_n = 0;
+                double error = 0, flicker = 0, after_change = 0, edge_error = 0, edge_flicker = 0;
+                uint64_t error_n = 0, flicker_n = 0, change_n = 0, edge_n = 0, edge_flicker_n = 0;
                 for (int t = 0; t < frame_count; ++t) {
                     if (t == 1) set_temporal(m.temporal); // the first frame without history (like switching it on)
                     if (t == change_at) upload_display(8);
@@ -750,8 +752,18 @@ int main(int argc, char** argv) {
                     const auto out = run(ideal, jitters[t % 8][0], jitters[t % 8][1]);
                     for (UINT y = 3; y + 3 < output_h; ++y) for (UINT x = 3; x + 3 < output_w; ++x) {
                         const size_t i = size_t(y) * output_w + x;
+                        if (ideal[i][3] > 0.001f && ideal[i][3] < 0.999f && t >= measure_from && t < change_at) {
+                            // Screen edge: the pixel is partly on the screen.
+                            double e = 0, f = 0;
+                            for (int k = 0; k < 3; ++k) {
+                                e += std::abs(double(out[i][k]) - ideal[i][k]);
+                                if (!previous_out.empty()) f += std::abs((double(out[i][k]) - previous_out[i][k]) - (double(ideal[i][k]) - previous_ideal[i][k]));
+                            }
+                            edge_error += e / 3; ++edge_n;
+                            if (!previous_out.empty()) { edge_flicker += f / 3; ++edge_flicker_n; }
+                        }
                         bool inner = true;
-                        for (int dy = -3; dy <= 3 && inner; dy += 3) for (int dx = -3; dx <= 3 && inner; dx += 3) inner = ideal[i + dy * int(output_w) + dx][3] > 0;
+                        for (int dy = -3; dy <= 3 && inner; dy += 3) for (int dx = -3; dx <= 3 && inner; dx += 3) inner = ideal[i + dy * int(output_w) + dx][3] >= 0.999f;
                         if (!inner) continue;
                         double e = 0, f = 0;
                         for (int k = 0; k < 3; ++k) {
@@ -765,8 +777,9 @@ int main(int argc, char** argv) {
                     if (t == change_at) save(out, std::string(m.name) + "-changed");
                     previous_out = out; previous_ideal = ideal;
                 }
-                std::printf("%-10s error=%.4f flicker=%.4f after_change=%.4f\n", m.name, error / std::max<uint64_t>(error_n, 1),
-                    flicker / std::max<uint64_t>(flicker_n, 1), after_change / std::max<uint64_t>(change_n, 1));
+                std::printf("%-16s error=%.4f flicker=%.4f after_change=%.4f edge_error=%.4f edge_flicker=%.4f\n", m.name, error / std::max<uint64_t>(error_n, 1),
+                    flicker / std::max<uint64_t>(flicker_n, 1), after_change / std::max<uint64_t>(change_n, 1), edge_error / std::max<uint64_t>(edge_n, 1),
+                    edge_flicker / std::max<uint64_t>(edge_flicker_n, 1));
             }
             set_temporal(0); set_smooth(0);
             return 0;

@@ -11,6 +11,8 @@ struct Experimental {
     int seam_fix = 1; // UV seam fix on/off (on by default)
     int temporal_aa = 0; // temporal anti-aliasing on/off
     int soft_smoothing = 0; // soft-edged (Gaussian) line smoothing on/off
+    int stable_edges = 1; // stable screen edges on/off (on by default)
+    int full_size = 1; // full-size sampling on/off (on by default; off = the game's mip levels)
     bool operator==(const Experimental&) const = default;
 };
 

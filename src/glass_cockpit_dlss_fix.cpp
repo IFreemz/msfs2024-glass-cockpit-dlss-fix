@@ -77,9 +77,10 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
     for (size_t i = 0; i < size; ++i) hash = (hash ^ data[i]) * 1099511628211ULL;
     return size ? hash : 0;
 }
-// Per frame: map, scene colour, one SRV per display slot, then output, tiles, params, map, residual and the two
-// temporal anti-aliasing history UAVs.
-constexpr unsigned slot_count = 32, ring_size = 8, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 7;
+// Per frame: map, scene colour, one SRV per display slot, then output, tiles, params, map, residual, the two temporal
+// anti-aliasing history UAVs and the learnt screen edges.
+constexpr unsigned slot_count = 32, ring_size = 8, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 8;
+constexpr unsigned bounds_cells = 64; // stable screen edges: cells per side of each screen texture's grid
 std::filesystem::path addon_directory;
 ID3D12Device* main_device = nullptr;
 struct DeviceState;
@@ -101,6 +102,10 @@ std::atomic<int> temporal_aa{0};
 // Soft-edged line smoothing (experimental, on/off): Line smoothing weighted towards the pixel's centre over a wider area
 // (Gaussian) instead of evenly over it (box). Less shimmer in motion at about the same sharpness.
 std::atomic<int> soft_smoothing{0};
+// Stable screen edges (on by default): where each screen ends is learnt in its texture, so the camera jitter doesn't
+// make the pixels along its edge flip between the fix and the upscaler every frame.
+std::atomic<int> stable_edges{1};
+std::atomic<uint32_t> bounds_reset{0}; // slots whose learnt edges must be forgotten (the slot took another texture)
 // Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like.
 // With Extra smoothing on it goes to 100 % (twice the DLSS-like footprint: softer than DLSS, for stubborn shimmer).
 constexpr int max_smoothing = 50, max_extra_smoothing = 100, default_smoothing = 35;
@@ -449,7 +454,9 @@ std::array<DXGI_FORMAT, slot_count> slot_formats{};
 std::array<UINT, slot_count> slot_first_mip{}, slot_mip_count{};
 std::mutex view_mips_mutex;
 std::unordered_map<ID3D12Resource*, std::pair<UINT, UINT>> view_mips;
-std::atomic<bool> mip0_only{false}; // test (Ctrl+Shift+F7): sample level 0 of every screen texture
+// Full-size sampling (experimental section, on by default; Ctrl+Shift+F7 toggles it): screen textures are read at full
+// size only, their smaller mip levels flicker as the view moves. Off: the game's own mip levels, as before 0.8.4.
+std::atomic<bool> mip0_only{true};
 std::array<std::atomic<uint64_t>, slot_count> slot_last_used{};
 std::atomic<uint64_t> present_count{0};
 std::mutex slots_mutex;
@@ -633,6 +640,7 @@ int slot_of(ID3D12Resource* resource, DXGI_FORMAT format) {
     { std::lock_guard view_lock(view_mips_mutex); if (const auto found = view_mips.find(resource); found != view_mips.end()) { mips = found->second; known = true; } }
     slot_first_mip[chosen] = mips.first; slot_mip_count[chosen] = mips.second;
     slot_resources[chosen] = resource;
+    bounds_reset.fetch_or(1u << chosen);
     const auto d = resource->GetDesc();
     log("display_slot slot=%d resource=%p w=%llu h=%u mips=%u format=%u game_view_mips=%u+%d%s", chosen, resource, d.Width, d.Height, d.MipLevels, unsigned(format),
         mips.first, int(mips.second), known ? "" : " (view not seen)");
@@ -671,7 +679,7 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     ComPtr<ID3D12RootSignature> root;
     std::array<ComPtr<ID3D12PipelineState>, 5> passes; // zero, fit, solve, composite, clear
     ComPtr<ID3D12DescriptorHeap> heap, scratch;
-    ComPtr<ID3D12Resource> sums, params;
+    ComPtr<ID3D12Resource> sums, params, edge_bounds;
     ComPtr<ID3D12Resource> params_readback; // brightness match per screen, copied out now and then for the log
     std::atomic<uint64_t> readback_next{600}, readback_ready{UINT64_MAX};
     uint64_t frame = 0;
@@ -1225,10 +1233,10 @@ bool create_composite(DeviceState& d) {
     D3D12_DESCRIPTOR_RANGE ranges[3]{
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, uav_base, 0, 0, 0},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, uav_base},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 5, 0, uav_base + 4}}; // u4 is the root UAV (fit sums)
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 5, 0, uav_base + 4}}; // u4 is the root UAV (fit sums)
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 19};
+    params[0].Constants = {0, 0, 20};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {3, ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -1254,6 +1262,8 @@ bool create_composite(DeviceState& d) {
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.sums)))) return false;
     buffer.Width = slot_count * 3 * 16;
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.params)))) return false;
+    buffer.Width = slot_count * bounds_cells * bounds_cells * 16;
+    if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.edge_bounds)))) return false;
     D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
     if (FAILED(d.native->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&d.params_readback))))
@@ -1954,21 +1964,24 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     d.native->CreateUnorderedAccessView(temporal ? map->history.Get() : nullptr, nullptr, &history_view, at(uav_base + 5));
     history_view.Format = DXGI_FORMAT_R16G16_UNORM;
     d.native->CreateUnorderedAccessView(temporal ? map->history_uv.Get() : nullptr, nullptr, &history_view, at(uav_base + 6));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC raw{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+    raw.Buffer = {0, slot_count * bounds_cells * bounds_cells * 4, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+    d.native->CreateUnorderedAccessView(d.edge_bounds.Get(), nullptr, &raw, at(uav_base + 7));
 
     struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp, angle_soften;
-        UINT history_info, frame_index; } constants{
+        UINT history_info, frame_index, bounds_reset; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
-        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u) | (temporal ? 64u : 0u) | (soft_smoothing ? 128u : 0u),
+        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u) | (temporal ? 64u : 0u) | (soft_smoothing ? 128u : 0u) | (stable_edges ? 256u : 0u),
         smoothing_percent / 50.0f, layer, glass_percent / 100.0f, edge_fade_percent / 100.0f,
         edge_stretch_percent / 100.0f, detail_clamp_percent / 100.0f,
-        angle_soften_percent / 100.0f, history_info, frame_index};
+        angle_soften_percent / 100.0f, history_info, frame_index, bounds_reset.exchange(0)};
 
     api::command_list* api_list = list;
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(api_list->get_native());
     ID3D12DescriptorHeap* heaps[]{d.heap.Get()};
     native->SetDescriptorHeaps(1, heaps);
     native->SetComputeRootSignature(d.root.Get());
-    native->SetComputeRoot32BitConstants(0, 19, &constants, 0);
+    native->SetComputeRoot32BitConstants(0, 20, &constants, 0);
     native->SetComputeRootDescriptorTable(1, gpu);
     native->SetComputeRootUnorderedAccessView(2, d.sums->GetGPUVirtualAddress());
     // DLSS leaves its colour input compute-readable and the output as UAV; FSR reports the states it restores.
@@ -1996,7 +2009,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         uav_barrier(native);
         d.accumulators_zeroed = true;
         constants.flags |= 1;
-        native->SetComputeRoot32BitConstants(0, 19, &constants, 0);
+        native->SetComputeRoot32BitConstants(0, 20, &constants, 0);
     }
     native->SetPipelineState(d.passes[1].Get());
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
@@ -2369,6 +2382,9 @@ void load_settings() {
     seam_fix = GetPrivateProfileIntW(L"experimental", L"seam_fix", 1, settings_path().c_str()) != 0;
     temporal_aa = GetPrivateProfileIntW(L"experimental", L"temporal_aa", 0, settings_path().c_str()) != 0;
     soft_smoothing = GetPrivateProfileIntW(L"experimental", L"soft_smoothing", 0, settings_path().c_str()) != 0;
+    if (soft_smoothing) temporal_aa = 0; // one or the other
+    stable_edges = GetPrivateProfileIntW(L"experimental", L"stable_edges", 1, settings_path().c_str()) != 0;
+    mip0_only = GetPrivateProfileIntW(L"experimental", L"full_size_sampling", 1, settings_path().c_str()) != 0;
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
@@ -2389,6 +2405,8 @@ void save_settings() {
     WritePrivateProfileStringW(L"experimental", L"seam_fix", std::to_wstring(seam_fix.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"temporal_aa", std::to_wstring(temporal_aa.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"soft_smoothing", std::to_wstring(soft_smoothing.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"stable_edges", std::to_wstring(stable_edges.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"full_size_sampling", mip0_only.load() ? L"1" : L"0", settings_path().c_str());
 }
 
 // One measurement window every 10 s: 120 frames, reported ~30 frames later (the GPU has finished them by then).
@@ -2492,7 +2510,7 @@ void on_present(api::effect_runtime* runtime) {
         present_count.load(std::memory_order_relaxed));
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
     if (chord && runtime->is_key_pressed(VK_F8)) glass::request_capture();
-    if (chord && runtime->is_key_pressed(VK_F7)) { mip0_only = !mip0_only; log("setting mip0_only=%d (test: screen textures sampled at full size only)", int(mip0_only.load())); }
+    if (chord && runtime->is_key_pressed(VK_F7)) { mip0_only = !mip0_only; save_settings(); log("setting full_size_sampling=%d (Ctrl+Shift+F7)", int(mip0_only.load())); }
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
     if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
     if (chord && runtime->is_key_pressed(VK_F12)) {
@@ -2577,7 +2595,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
+    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing, stable_edges, int(mip0_only.load())}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
@@ -2624,9 +2642,12 @@ void set_experimental(const Experimental& e) {
     seam_fix = e.seam_fix ? 1 : 0;
     temporal_aa = e.temporal_aa ? 1 : 0;
     soft_smoothing = e.soft_smoothing ? 1 : 0;
+    if (soft_smoothing) temporal_aa = 0; // one or the other
+    stable_edges = e.stable_edges ? 1 : 0;
+    mip0_only = e.full_size != 0;
     save_settings();
-    log("setting seam_fix=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d temporal_aa=%d soft_smoothing=%d", seam_fix.load(), dark_screen_fix.load(), detail_clamp_percent.load(),
-        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), temporal_aa.load(), soft_smoothing.load());
+    log("setting seam_fix=%d full_size_sampling=%d stable_edges=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d temporal_aa=%d soft_smoothing=%d", seam_fix.load(), int(mip0_only.load()), stable_edges.load(),
+        dark_screen_fix.load(), detail_clamp_percent.load(), edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), temporal_aa.load(), soft_smoothing.load());
 }
 void set_glass_strength(int percent) { glass_percent = std::clamp(percent, 0, 100); save_settings(); log("setting glass_strength=%d", glass_percent.load()); }
 }
@@ -2706,9 +2727,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     log("Glass Cockpit DLSS Fix %s (built " __DATE__ " " __TIME__ ")", overlay_version);
     log("windows %lu.%lu.%lu  game=%ls", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, executable);
     log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
-    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d seam_fix=%d temporal_aa=%d soft_smoothing=%d",
+    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d",
         module, fixture, enabled.load(), jitter_positive.load(), smoothing_percent.load(), int(extra_smoothing.load()), glass_percent.load(), detail_clamp_percent.load(),
-        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), dark_screen_fix.load(), seam_fix.load(), temporal_aa.load(), soft_smoothing.load());
+        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), dark_screen_fix.load(), seam_fix.load(), int(mip0_only.load()), stable_edges.load(), temporal_aa.load(), soft_smoothing.load());
     log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint");
     scan_modules();
     std::thread(worker).detach();
@@ -2723,6 +2744,7 @@ extern "C" __declspec(dllexport) void GlassFixLineSmoothing(int percent) { smoot
 extern "C" __declspec(dllexport) void GlassFixTemporal(int on) { temporal_aa = on ? 1 : 0; }
 extern "C" __declspec(dllexport) void GlassFixGaussian(int on) { soft_smoothing = on ? 1 : 0; }
 extern "C" __declspec(dllexport) void GlassFixGlassStrength(int percent) { glass_percent = percent; }
+extern "C" __declspec(dllexport) void GlassFixStableEdges(int on) { stable_edges = on ? 1 : 0; }
 // Offline test host: one call per frame stands in for the present event (cost window of 4 frames, reported 2 later).
 extern "C" __declspec(dllexport) void GlassFixCostTick(ID3D12CommandQueue* queue) {
     static uint64_t frame = 0;

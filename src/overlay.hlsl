@@ -8,6 +8,8 @@
 //               The glass layer is taken from the DLSS output itself (sharp dirt/shadows), clamped to this frame's
 //               remainder range around the pixel, which removes ghost trails of the old screen content (TAA-style clamp).
 //   clear     - empties the UV map for the next frame
+// Screen edges: where each screen ends is learnt in its texture (edge_bounds), where the camera jitter doesn't move
+// it, so edge pixels get a steady partial coverage instead of flipping between the fix and the upscaler every frame.
 
 cbuffer Constants : register(b0)
 {
@@ -18,7 +20,7 @@ cbuffer Constants : register(b0)
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
                              // bit 3: smooth lines, bit 4: dark screen fix, bit 5: UV seam fix, bit 6: temporal anti-aliasing,
-                             // bit 7: soft-edged line smoothing
+                             // bit 7: soft-edged line smoothing, bit 8: stable screen edges
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -29,6 +31,7 @@ cbuffer Constants : register(b0)
     uint history_info;       // temporal anti-aliasing: bit 0 = history slice written this frame (the other is last frame's),
                              // bit 1 = last frame's history belongs to this view and can be used
     uint frame_index;        // temporal anti-aliasing: picks this frame's sample position inside the pixel
+    uint bounds_reset;       // stable screen edges: slots whose learnt edges are forgotten (another texture took the slot)
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -44,11 +47,16 @@ RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * di
 RWTexture2DArray<float4> history : register(u6);    // rgb = screen colour (before the brightness match), w = brightness of the
                                                     // screen texture at the pixel's own coordinates (sees content changes)
 RWTexture2DArray<float2> history_uv : register(u7); // where the pixel was on its screen texture (0 = not a screen pixel)
+// Stable screen edges: per slot a 64x64 grid over the texture; per cell the smallest and largest u and v any render
+// pixel of the screen sampled there (24-bit fixed point; min > max = nothing seen). Kept until the slot changes texture.
+RWByteAddressBuffer edge_bounds : register(u8);
 SamplerState display_sampler : register(s0);
 
 static const uint slot_count = 32;
 static const uint terms = 20;
 static const float fixed_scale = 16777216.0;
+static const uint bounds_cells = 64;
+static const float bounds_scale = 16777215.0;
 
 float3 srgb_to_linear(float3 c)
 {
@@ -56,9 +64,39 @@ float3 srgb_to_linear(float3 c)
     return select(c <= 0.04045, c / 12.92, pow(c * 0.947867 + 0.0521327, 2.4));
 }
 
+// Screens are read at full size only (their smaller mip levels flicker when the view moves; the sim may not keep them
+// up to date). Instead, a footprint holding many texels gets more taps: n x n so that taps are at most ~1.5 texels apart.
+uint taps_for(uint slot, float2 fx, float2 fy)
+{
+    float w, h;
+    displays[NonUniformResourceIndex(slot)].GetDimensions(w, h);
+    float texels = max(length(fx * float2(w, h)), length(fy * float2(w, h)));
+    return clamp(uint(ceil(texels / 1.5)), 2, 8);
+}
+
+// n x n taps over the footprint fx, fy around uv (rotated grid: no two taps share a row or column); soft: Gaussian
+// weights (sigma 0.4 of the footprint) over a footprint twice as wide, given as such by the caller.
+float3 sample_area(uint slot, float2 uv, float2 fx, float2 fy, uint n, bool soft)
+{
+    float3 sum = 0;
+    float total = 0, step = 1.0 / n;
+    [loop] for (uint j = 0; j < n; ++j)
+        [loop] for (uint i = 0; i < n; ++i)
+        {
+            float2 o = (float2(i, j) + (float2(j, i) + 0.5) * step) * step - 0.5;
+            float2 r = o * 2;
+            float w = soft ? exp(-dot(r, r) / (2 * 0.16)) : 1;
+            sum += w * displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv + o.x * fx + o.y * fy, fx * step, fy * step).rgb;
+            total += w;
+        }
+    return sum / total;
+}
+
 // The game averages four half-footprint taps (SampleBias -1) before linearising; do the same at output scale.
 float3 sample_display(uint slot, float2 uv, float2 dx, float2 dy)
 {
+    uint n = taps_for(slot, dx, dy);
+    if (n > 2) return srgb_to_linear(saturate(sample_area(slot, uv, dx, dy, n, false)));
     static const float2 offsets[4] = { float2(0.125, 0.375), float2(0.375, -0.125), float2(-0.125, -0.375), float2(-0.375, 0.125) };
     float3 sum = 0;
     [unroll] for (uint i = 0; i < 4; ++i)
@@ -74,21 +112,12 @@ float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy)
     float2 width = max(1.0 / map_per_output, 1.25) * line_width;
     // Soft-edged (flags bit 7): Gaussian weights (sigma 0.4 of the width) over twice the area instead of a box. A box's
     // hard edges let through fine detail that flickers as the view moves; a Gaussian passes almost none of it.
-    float spread = (flags & 128) ? 2.0 : 1.0;
+    // At least a rotated 4x4 grid (16 distinct coverage levels for near-horizontal and near-vertical lines), more taps
+    // where the area holds many texels.
+    bool soft = (flags & 128) != 0;
+    float spread = soft ? 2.0 : 1.0;
     float2 fx = dx * width.x * spread, fy = dy * width.y * spread;
-    float3 sum = 0;
-    float total = 0;
-    [unroll] for (uint i = 0; i < 16; ++i)
-    {
-        // Rotated 4x4 grid: no two samples share a row or column, so near-horizontal and near-vertical lines get
-        // 16 distinct coverage levels.
-        float2 o = (float2(i % 4, i / 4) + float2(((i / 4) * 0.25 + 0.125), ((i % 4) * 0.25 + 0.125))) / 4.0 - 0.5;
-        float2 r = o * spread;
-        float w = (flags & 128) ? exp(-dot(r, r) / (2 * 0.16)) : 1;
-        sum += w * displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv + o.x * fx + o.y * fy, fx * 0.25, fy * 0.25).rgb;
-        total += w;
-    }
-    return srgb_to_linear(saturate(sum / total));
+    return srgb_to_linear(saturate(sample_area(slot, uv, fx, fy, max(taps_for(slot, fx, fy), 4), soft)));
 }
 
 uint map_slot(float4 m)
@@ -101,6 +130,42 @@ void zero(uint3 id : SV_DispatchThreadID)
 {
     for (uint i = id.x; i < slot_count * terms; i += 64) sums.Store<uint64_t>(i * 8, 0);
     for (uint j = id.x; j < slot_count * 3; j += 64) params[j] = 0;
+    for (uint c = id.x; c < slot_count * bounds_cells * bounds_cells; c += 64) edge_bounds.Store4(c * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
+}
+
+uint bounds_address(uint slot, int2 cell) { return (slot * bounds_cells * bounds_cells + cell.y * bounds_cells + cell.x) * 16; }
+
+// Learnt extent (umin, vmin, umax, vmax) of the screen in one texture cell; false if nothing was seen there.
+bool cell_bounds(uint slot, int2 cell, out float4 b)
+{
+    b = 0;
+    if (any(cell < 0) || any(cell >= int(bounds_cells))) return false;
+    uint4 r = edge_bounds.Load4(bounds_address(slot, cell));
+    b = float4(r) / bounds_scale;
+    return r.x <= r.z && r.y <= r.w;
+}
+
+// Share of the output pixel at texture coordinates uv (per-pixel gradients dx, dy) that lies on the screen, from the
+// learnt edges: distance in pixels to the nearest edge (a cell side with nothing beyond it), as area coverage.
+// -1: no learnt edges around (not seen yet).
+float edge_coverage(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    int2 cell = int2(floor(saturate(uv) * bounds_cells - 1e-4));
+    float4 b;
+    bool found = cell_bounds(slot, cell, b);
+    static const int2 sides[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+    // Past the edge: measure from the neighbouring cell with screen in it.
+    [unroll] for (uint k = 0; k < 4; ++k)
+        if (!found && cell_bounds(slot, cell + sides[k], b)) { found = true; cell += sides[k]; }
+    if (!found) return -1;
+    float su = max(length(float2(dx.x, dy.x)), 1e-9), sv = max(length(float2(dx.y, dy.y)), 1e-9);
+    float4 unused;
+    float d = 1e9;
+    if (!cell_bounds(slot, cell + sides[0], unused)) d = min(d, (uv.x - b.x) / su);
+    if (!cell_bounds(slot, cell + sides[1], unused)) d = min(d, (b.z - uv.x) / su);
+    if (!cell_bounds(slot, cell + sides[2], unused)) d = min(d, (uv.y - b.y) / sv);
+    if (!cell_bounds(slot, cell + sides[3], unused)) d = min(d, (b.w - uv.y) / sv);
+    return saturate(0.5 + d);
 }
 
 groupshared uint tile_slot;
@@ -168,6 +233,35 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     float4 gain = active ? params[slot * 3] : 0;
     if (all(p < int2(map_size))) residual[p] = active && gain.w > 0 ? float4(y - gain.rgb * x, slot + 1) : 0;
     if (index == 0 && all(group.xy < (map_size + 7) / 8)) tiles[group.xy] = tile_slot < slot_count ? tile_slot + 1 : 0;
+
+    // Stable screen edges: widen the bounds of the texture cell this render pixel sampled (one set of atomics per cell
+    // and wave). With the camera jitter the samples move every frame, so the bounds close in on the screen's real edge.
+    if (flags & 256)
+    {
+        bool pending = slot < slot_count;
+        uint key = pending ? slot * bounds_cells * bounds_cells + uint(clamp(m.y, 0, 1) * bounds_cells - 1e-4) * bounds_cells + uint(clamp(m.x, 0, 1) * bounds_cells - 1e-4) : 0;
+        uint2 q = uint2(saturate(m.xy) * bounds_scale + 0.5);
+        while (WaveActiveAnyTrue(pending))
+        {
+            if (pending)
+            {
+                uint first = WaveReadLaneFirst(key);
+                if (key == first)
+                {
+                    uint2 low = WaveActiveMin(q), high = WaveActiveMax(q);
+                    if (WaveIsFirstLane())
+                    {
+                        uint address = key * 16, unused;
+                        edge_bounds.InterlockedMin(address, low.x, unused);
+                        edge_bounds.InterlockedMin(address + 4, low.y, unused);
+                        edge_bounds.InterlockedMax(address + 8, high.x, unused);
+                        edge_bounds.InterlockedMax(address + 12, high.y, unused);
+                    }
+                    pending = false;
+                }
+            }
+        }
+    }
 
     // Waterfall: each pass handles the lanes of one display slot.
     bool done = !active;
@@ -418,7 +512,27 @@ void composite(uint3 id : SV_DispatchThreadID)
     float2 seam_uv = 0, seam_dx = 0, seam_dy = 0; // UV seam: the other side, and its share of this pixel
     float seam_share = 0, seam_upscaler = 0;
     bool filled = false;
-    if (covered && a.w == b.w && a.w == c.w && a.w == d.w)
+    float coverage = 1; // stable screen edges: share of this pixel on the screen
+    bool inside = covered && a.w == b.w && a.w == c.w && a.w == d.w;
+    bool edge_pixel = false;
+    if (!inside && (flags & 256))
+    {
+        // A pixel at a screen's edge: continue the texture coordinates of the nearest render pixel on the screen and
+        // let the learnt edge decide how much of the pixel is screen.
+        float4 taps[4] = { a, b, c, d };
+        float weights[4] = { (1 - f.x) * (1 - f.y), f.x * (1 - f.y), (1 - f.x) * f.y, f.x * f.y };
+        uint k = 4;
+        [unroll] for (uint i = 0; i < 4; ++i)
+            if (map_slot(taps[i]) < slot_count && (k == 4 || weights[i] > weights[k])) k = i;
+        if (k < 4)
+        {
+            continue_from(cell + int2(k & 1, k >> 1), taps[k], location, uv, dx, dy);
+            float share = edge_coverage(map_slot(taps[k]), uv, dx, dy);
+            if (share > 0.5) { a = taps[k]; coverage = share; edge_pixel = true; }
+        }
+    }
+    if (edge_pixel) {}
+    else if (inside)
     {
         uv = lerp(lerp(a.xy, b.xy, f.x), lerp(c.xy, d.xy, f.x), f.y);
         dx = lerp(b.xy - a.xy, d.xy - c.xy, f.y) * map_per_output.x;
@@ -459,6 +573,11 @@ void composite(uint3 id : SV_DispatchThreadID)
                     seam_upscaler = 1 - abs(2 * side - 1);
                 }
             }
+        }
+        if (flags & 256)
+        {
+            float share = edge_coverage(map_slot(a), uv, dx, dy);
+            if (share >= 0) coverage = share;
         }
     }
     else
@@ -502,7 +621,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     // Distance to the edge from the share of a tent (radius 3 render pixels) around this pixel that lies on this
     // display: about 2/3 at the outermost redrawn pixel, 1 from two render pixels in. Needs the upscaler output readable.
     float edge = 1;
-    if (!filled && edge_fade > 0 && (flags & 4))
+    if (!filled && !edge_pixel && edge_fade > 0 && (flags & 4))
     {
         float inside = 0;
         [unroll] for (int t = 0; t < 36; ++t)
@@ -527,7 +646,10 @@ void composite(uint3 id : SV_DispatchThreadID)
         edge = saturate(inside_pixels / edge_fade);
     }
     float blend = (flags & 4) ? min(edge, 1 - seam_upscaler) : edge;
-    if (blend <= 0) return;
+    // The upscaler's pixel already holds its share of the screen: a pixel half on the screen stays the upscaler's, from
+    // there the redrawn screen takes over, fully on a whole pixel. Steady, as the learnt edge doesn't move with jitter.
+    coverage = (flags & 4) ? saturate(2 * coverage - 1) : (coverage >= 0.75 ? 1 : 0);
+    if (blend <= 0 || coverage <= 0) return;
     float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
     if (gain.w <= 0) return;
     // Angle softening: on a screen seen at a steep angle the texture footprint of a pixel is long and thin. Anisotropic
@@ -548,7 +670,7 @@ void composite(uint3 id : SV_DispatchThreadID)
             dy = lerp(dy, sim_dy, t);
         }
     }
-    float3 content = ((flags & 64) && !filled && seam_share == 0 ? temporal_content(id.xy, slot, uv, dx, dy) : sample_lines(slot, uv, dx, dy)) * gain.rgb;
+    float3 content = ((flags & 64) && !filled && !edge_pixel && seam_share == 0 ? temporal_content(id.xy, slot, uv, dx, dy) : sample_lines(slot, uv, dx, dy)) * gain.rgb;
     if (seam_share > 0)
     {
         float3 other_side = (flags & 8) ? sample_display_smooth(slot, seam_uv, seam_dx, seam_dy) : sample_display(slot, seam_uv, seam_dx, seam_dy);
@@ -611,12 +733,16 @@ void composite(uint3 id : SV_DispatchThreadID)
     }
     if (glass_strength < 1) colour -= (1 - glass_strength) * (glass - offset.rgb);
     if (flags & 2) colour = colour * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0);
-    if (blend < 1) colour = lerp(output[id.xy].rgb, colour, blend * blend * (3 - 2 * blend));
+    float keep = (blend < 1 ? blend * blend * (3 - 2 * blend) : 1) * coverage;
+    if (keep < 1) colour = lerp(output[id.xy].rgb, colour, keep);
     if (all(isfinite(colour))) output[id.xy] = float4(max(colour, 0), 1);
 }
 
 [numthreads(8, 8, 1)]
 void clear(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID)
 {
+    uint index = id.y * map_size.x + id.x, cells = bounds_cells * bounds_cells;
+    if (bounds_reset && id.x < map_size.x && index < slot_count * cells && (bounds_reset & (1u << (index / cells))))
+        edge_bounds.Store4(index * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
     if (all(id.xy < map_size) && all(group.xy < (map_size + 7) / 8) && tiles[group.xy]) map_rw[uint3(id.xy, layer)] = 0;
 }
