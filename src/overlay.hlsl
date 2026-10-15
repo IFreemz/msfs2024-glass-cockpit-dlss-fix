@@ -145,29 +145,6 @@ bool cell_bounds(uint slot, int2 cell, out float4 b)
     return r.x <= r.z && r.y <= r.w;
 }
 
-// Share of the output pixel at texture coordinates uv (per-pixel gradients dx, dy) that lies on the screen, from the
-// learnt edges: distance in pixels to the nearest edge (a cell side with nothing beyond it), as area coverage.
-// -1: no learnt edges around (not seen yet).
-float edge_coverage(uint slot, float2 uv, float2 dx, float2 dy)
-{
-    int2 cell = int2(floor(saturate(uv) * bounds_cells - 1e-4));
-    float4 b;
-    bool found = cell_bounds(slot, cell, b);
-    static const int2 sides[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
-    // Past the edge: measure from the neighbouring cell with screen in it.
-    [unroll] for (uint k = 0; k < 4; ++k)
-        if (!found && cell_bounds(slot, cell + sides[k], b)) { found = true; cell += sides[k]; }
-    if (!found) return -1;
-    float su = max(length(float2(dx.x, dy.x)), 1e-9), sv = max(length(float2(dx.y, dy.y)), 1e-9);
-    float4 unused;
-    float d = 1e9;
-    if (!cell_bounds(slot, cell + sides[0], unused)) d = min(d, (uv.x - b.x) / su);
-    if (!cell_bounds(slot, cell + sides[1], unused)) d = min(d, (b.z - uv.x) / su);
-    if (!cell_bounds(slot, cell + sides[2], unused)) d = min(d, (uv.y - b.y) / sv);
-    if (!cell_bounds(slot, cell + sides[3], unused)) d = min(d, (b.w - uv.y) / sv);
-    return saturate(0.5 + d);
-}
-
 groupshared uint tile_slot;
 
 // detail: pooled products of neighbour differences (screen x, scene y): xx, yy, xy (fine detail only, see solve).
@@ -191,6 +168,49 @@ float4 load_map(int2 p)
 {
     return all(p >= 0) && all(p < int2(map_size)) ? map.Load(int4(p, layer, 0)) : 0;
 }
+
+// Distance in output pixels from texture coordinates uv (per-pixel gradients dx, dy) to the nearest learnt edge of the
+// screen's picture in its texture (a cell side with nothing beyond it), positive inside, and the direction on the
+// monitor towards that edge. false: no learnt edges around, or no gradients (a band pointing at one texel).
+bool edge_distance(uint slot, float2 uv, float2 dx, float2 dy, out float d, out float2 toward)
+{
+    d = 1e9; toward = 0;
+    if (length(dx) + length(dy) < 1e-7) return false;
+    int2 cell = int2(floor(saturate(uv) * bounds_cells - 1e-4));
+    float4 b;
+    bool found = cell_bounds(slot, cell, b);
+    static const int2 sides[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+    // Past the edge: measure from the neighbouring cell with screen in it.
+    [unroll] for (uint k = 0; k < 4; ++k)
+        if (!found && cell_bounds(slot, cell + sides[k], b)) { found = true; cell += sides[k]; }
+    if (!found) return false;
+    float2 gu = float2(dx.x, dy.x), gv = float2(dx.y, dy.y); // change of u and v per output pixel along x and y
+    float su = max(length(gu), 1e-9), sv = max(length(gv), 1e-9);
+    float4 unused;
+    float e;
+    if (!cell_bounds(slot, cell + sides[0], unused)) { e = (uv.x - b.x) / su; if (e < d) { d = e; toward = -gu / su; } }
+    if (!cell_bounds(slot, cell + sides[1], unused)) { e = (b.z - uv.x) / su; if (e < d) { d = e; toward = gu / su; } }
+    if (!cell_bounds(slot, cell + sides[2], unused)) { e = (uv.y - b.y) / sv; if (e < d) { d = e; toward = -gv / sv; } }
+    if (!cell_bounds(slot, cell + sides[3], unused)) { e = (b.w - uv.y) / sv; if (e < d) { d = e; toward = gv / sv; } }
+    return true;
+}
+
+// Share of the output pixel at map position `location` (texture coordinates uv) that lies on the screen, from the
+// learnt edges. Only where the screen really ends on the monitor: the picture can also end at a UV seam inside one
+// screen mesh (e.g. the FSS E-Jets' bezel band), where the screen goes on beyond it (the seam handling blends those).
+// -1: unknown (no learnt edges around).
+float edge_coverage(uint slot, float2 uv, float2 dx, float2 dy, float2 location)
+{
+    float d;
+    float2 toward;
+    if (!edge_distance(slot, uv, dx, dy, d, toward)) return -1;
+    if (d > 1.5) return 1;
+    // One render pixel past the edge on the monitor: still this screen there means a seam, not its end.
+    float2 probe = location + toward * (max(d, 0) * map_per_output + 1.0);
+    if (map_slot(load_map(int2(round(probe)))) == slot) return 1;
+    return saturate(0.5 + d);
+}
+
 
 [numthreads(8, 8, 1)]
 void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : SV_GroupIndex)
@@ -527,7 +547,7 @@ void composite(uint3 id : SV_DispatchThreadID)
         if (k < 4)
         {
             continue_from(cell + int2(k & 1, k >> 1), taps[k], location, uv, dx, dy);
-            float share = edge_coverage(map_slot(taps[k]), uv, dx, dy);
+            float share = edge_coverage(map_slot(taps[k]), uv, dx, dy, location);
             if (share > 0.5) { a = taps[k]; coverage = share; edge_pixel = true; }
         }
     }
@@ -571,12 +591,28 @@ void composite(uint3 id : SV_DispatchThreadID)
                     // free of trails. Hand those pixels to it: fully at the middle of the seam, not at all a render
                     // pixel away.
                     seam_upscaler = 1 - abs(2 * side - 1);
+                    // Stable screen edges: the split from where the picture ends in its texture (learnt, so the camera
+                    // jitter doesn't move it) instead of from which render pixels happen to be on either side. The
+                    // picture is the side whose coordinates change across the pixel (a bezel band points at one texel).
+                    if (flags & 256)
+                    {
+                        bool picture_near = length(dx) + length(dy) >= length(seam_dx) + length(seam_dy);
+                        float d;
+                        float2 toward;
+                        if (picture_near ? edge_distance(map_slot(taps[k]), uv, dx, dy, d, toward)
+                                         : edge_distance(map_slot(taps[other]), seam_uv, seam_dx, seam_dy, d, toward))
+                        {
+                            float picture = saturate(0.5 + d);
+                            seam_share = picture_near ? 1 - picture : picture;
+                            seam_upscaler = 0;
+                        }
+                    }
                 }
             }
         }
-        if (flags & 256)
+        if ((flags & 256) && seam_share == 0)
         {
-            float share = edge_coverage(map_slot(a), uv, dx, dy);
+            float share = edge_coverage(map_slot(a), uv, dx, dy, location);
             if (share >= 0) coverage = share;
         }
     }
