@@ -243,7 +243,7 @@ int main(int argc, char** argv) {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
         bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false,
-            ngx_proxy = false, extra_pass = false;
+            ngx_proxy = false, extra_pass = false, motion = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
@@ -251,6 +251,7 @@ int main(int argc, char** argv) {
             extra_pass |= !std::strcmp(argv[i], "--extra-pass");
             optiscaler_fsr |= !std::strcmp(argv[i], "--optiscaler-fsr");
             ngx_proxy |= !std::strcmp(argv[i], "--ngx-proxy");
+            motion |= !std::strcmp(argv[i], "--motion");
         }
         if (hotpatch) redirect_evaluate_like_mfg_unlock();
         if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
@@ -372,6 +373,10 @@ int main(int argc, char** argv) {
         ComPtr<ID3D12PipelineState> reference_pso; check(device->CreateGraphicsPipelineState(&rd, IID_PPV_ARGS(&reference_pso)));
         rd.VS = {reference_vs_eye1.data(), reference_vs_eye1.size()};
         ComPtr<ID3D12PipelineState> reference_pso_eye1; check(device->CreateGraphicsPipelineState(&rd, IID_PPV_ARGS(&reference_pso_eye1)));
+        // --motion: the reference drawn 16 times at sub-pixel offsets and summed (the screen filtered over each pixel's area).
+        auto sum_desc = rd; sum_desc.VS = {reference_vs.data(), reference_vs.size()}; sum_desc.DepthStencilState.DepthEnable = FALSE;
+        for (auto& b : sum_desc.BlendState.RenderTarget) { b.BlendEnable = TRUE; b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_ONE; }
+        ComPtr<ID3D12PipelineState> accumulate_pso; check(device->CreateGraphicsPipelineState(&sum_desc, IID_PPV_ARGS(&accumulate_pso)));
 
         // Mesh, constants.
         std::array<Vertex, 7> vertices{};
@@ -636,6 +641,136 @@ int main(int argc, char** argv) {
         std::array<std::vector<std::array<float, 4>>, 2> previous_refs;
         std::vector<uint32_t> prefill(size_t(output_w) * output_h);
         bool all_passed = true;
+        if (motion) {
+            // Shimmer and trails with the camera panning slowly (~1/3 output pixel per frame) over a screen with thin lines,
+            // and a content change (the picture scrolls 8 texels) at frame 30. Compared with the screen filtered over each
+            // pixel's area (16 sub-pixel reference renders): "error" = how far from that, "flicker" = how much more the
+            // picture changes from frame to frame than that ideal picture does (shimmer), "after change" = error on the
+            // 3 frames after the content change (trails would show here).
+            const auto set_temporal = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixTemporal"));
+            require(set_temporal != nullptr, "exports missing");
+            using Image = std::vector<std::array<float, 4>>;
+            auto truth = [&] {
+                const float zero[4]{};
+                list->ClearRenderTargetView(rtv(2), zero, 0, nullptr);
+                bind(accumulate_pso.Get(), 0);
+                auto r2 = rtv(2); list->OMSetRenderTargets(1, &r2, FALSE, nullptr);
+                const D3D12_RECT sc{0, 0, LONG(output_w), LONG(output_h)}; list->RSSetScissorRects(1, &sc);
+                for (int k = 0; k < 16; ++k) {
+                    const D3D12_VIEWPORT vp{(k % 4 + 0.5f) / 4 - 0.5f, (k / 4 + 0.5f) / 4 - 0.5f, float(output_w), float(output_h), 0, 1};
+                    list->RSSetViewports(1, &vp);
+                    list->DrawIndexedInstanced(6, 1, 0, 1, 0);
+                }
+                transition(list.Get(), reference.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                auto rb = readback(device.Get(), reference.Get()); copy(list.Get(), reference.Get(), rb);
+                transition(list.Get(), reference.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                submit();
+                Image result(size_t(output_w) * output_h);
+                void* mapped = nullptr; check(rb.buffer->Map(0, nullptr, &mapped));
+                for (UINT y = 0; y < output_h; ++y)
+                    std::memcpy(&result[size_t(y) * output_w], static_cast<uint8_t*>(mapped) + rb.footprint.Offset + size_t(y) * rb.footprint.Footprint.RowPitch, size_t(output_w) * 16);
+                rb.buffer->Unmap(0, nullptr);
+                for (auto& v : result) { for (int c = 0; c < 3; ++c) v[c] /= 16; v[3] = v[3] >= 7.99f ? 1.0f : 0.0f; } // w: fully covered
+                return result;
+            };
+            auto run = [&](const Image& ideal, float jx, float jy) {
+                list->ClearRenderTargetView(rtv(0), black.Color, 0, nullptr);
+                list->ClearDepthStencilView(dsv(0), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+                bind(game_pso.Get(), 0);
+                const D3D12_VIEWPORT vp{jx, jy, float(render_w), float(render_h), 0, 1}; const D3D12_RECT sc{0, 0, LONG(render_w), LONG(render_h)};
+                list->RSSetViewports(1, &vp); list->RSSetScissorRects(1, &sc);
+                auto r0 = rtv(0), d0 = dsv(0); list->OMSetRenderTargets(1, &r0, FALSE, &d0);
+                list->DrawIndexedInstanced(6, 1, 0, 1, 0);
+                transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                submit();
+                // The fake DLSS output: the ideal picture (no ghost); the fix redraws the screen over it.
+                for (size_t i = 0; i < prefill.size(); ++i) prefill[i] = encode_r11g11b10({ideal[i][0], ideal[i][1], ideal[i][2]});
+                {
+                    void* data = nullptr; check(prefill_upload->Map(0, nullptr, &data));
+                    for (UINT y = 0; y < output_h; ++y)
+                        std::memcpy(static_cast<uint8_t*>(data) + out_rb.footprint.Offset + size_t(y) * out_rb.footprint.Footprint.RowPitch, &prefill[size_t(y) * output_w], size_t(output_w) * 4);
+                    prefill_upload->Unmap(0, nullptr);
+                }
+                transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION to{output.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{prefill_upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                from.PlacedFootprint = out_rb.footprint;
+                list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                ngx.jitter_x = jx; ngx.jitter_y = jy;
+                require(evaluate(list.Get(), nullptr, &ngx, nullptr) == NVSDK_NGX_Result_Success, "evaluate failed");
+                transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                copy(list.Get(), output.Get(), out_rb);
+                transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                submit();
+                Image result(size_t(output_w) * output_h);
+                void* mapped = nullptr; check(out_rb.buffer->Map(0, nullptr, &mapped));
+                for (UINT y = 0; y < output_h; ++y) for (UINT x = 0; x < output_w; ++x) {
+                    const auto c = r11g11b10(*reinterpret_cast<const uint32_t*>(static_cast<uint8_t*>(mapped) + out_rb.footprint.Offset + size_t(y) * out_rb.footprint.Footprint.RowPitch + x * 4));
+                    result[size_t(y) * output_w + x] = {c[0], c[1], c[2], 1};
+                }
+                out_rb.buffer->Unmap(0, nullptr);
+                return result;
+            };
+            auto save = [&](const Image& image, const std::string& name) {
+                std::vector<BYTE> png(size_t(output_w) * output_h * 4);
+                for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
+                save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
+            };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; };
+            const Mode modes[]{{"still-off-ls0", 0, 0, 0}, {"still-taa-ls0", 0, 1, 0}, {"off-ls0", 0, 0}, {"off-ls20", 20, 0}, {"off-ls35", 35, 0}, {"off-ls50", 50, 0},
+                {"off-ls70", 70, 0}, {"gauss-ls20", 20, 0, 0.0007f, 1}, {"gauss-ls35", 35, 0, 0.0007f, 1}, {"gauss-ls50", 50, 0, 0.0007f, 1}, {"gauss-ls70", 70, 0, 0.0007f, 1},
+                {"taa-ls0", 0, 1}, {"taa-ls20", 20, 1}, {"taa-gauss20", 20, 1, 0.0007f, 1}};
+            const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
+            require(set_gaussian != nullptr, "exports missing");
+            const float jitters[8][2]{{0.0f, -0.1667f}, {-0.25f, 0.1667f}, {0.25f, -0.3889f}, {-0.375f, -0.0556f},
+                {0.125f, 0.2778f}, {-0.125f, -0.2778f}, {0.375f, 0.0556f}, {-0.4375f, 0.3889f}};
+            constexpr int frame_count = 52, change_at = 46, measure_from = 26;
+            // Screen content only: no dirt, glare or shadow, glass layer off (the fake DLSS output is the ideal picture,
+            // which the glass layer would otherwise pass through).
+            set_material({"motion", 0, true, true, 0, 0, 0, 0.0f, 0.0f, false, Frame::perfect, Frame::info});
+            const auto set_glass = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGlassStrength"));
+            require(set_glass != nullptr, "exports missing");
+            set_glass(0);
+            Sleep(1500); // let the background PSO compile finish
+            for (const auto& m : modes) {
+                set_smooth(m.smoothing);
+                set_gaussian(m.gaussian);
+                set_temporal(0);
+                upload_display(0);
+                Image previous_out, previous_ideal;
+                double error = 0, flicker = 0, after_change = 0;
+                uint64_t error_n = 0, flicker_n = 0, change_n = 0;
+                for (int t = 0; t < frame_count; ++t) {
+                    if (t == 1) set_temporal(m.temporal); // the first frame without history (like switching it on)
+                    if (t == change_at) upload_display(8);
+                    const auto c = constants(m.speed * t);
+                    upload(globals[0].Get(), c.global.data(), sizeof(c.global));
+                    const auto ideal = truth();
+                    const auto out = run(ideal, jitters[t % 8][0], jitters[t % 8][1]);
+                    for (UINT y = 3; y + 3 < output_h; ++y) for (UINT x = 3; x + 3 < output_w; ++x) {
+                        const size_t i = size_t(y) * output_w + x;
+                        bool inner = true;
+                        for (int dy = -3; dy <= 3 && inner; dy += 3) for (int dx = -3; dx <= 3 && inner; dx += 3) inner = ideal[i + dy * int(output_w) + dx][3] > 0;
+                        if (!inner) continue;
+                        double e = 0, f = 0;
+                        for (int k = 0; k < 3; ++k) {
+                            e += std::abs(double(out[i][k]) - ideal[i][k]);
+                            if (!previous_out.empty()) f += std::abs((double(out[i][k]) - previous_out[i][k]) - (double(ideal[i][k]) - previous_ideal[i][k]));
+                        }
+                        if (t >= measure_from && t < change_at) { error += e / 3; ++error_n; if (!previous_out.empty()) { flicker += f / 3; ++flicker_n; } }
+                        if (t >= change_at && t < change_at + 3) { after_change += e / 3; ++change_n; }
+                    }
+                    if (t == change_at - 1) save(out, std::string(m.name));
+                    if (t == change_at) save(out, std::string(m.name) + "-changed");
+                    previous_out = out; previous_ideal = ideal;
+                }
+                std::printf("%-10s error=%.4f flicker=%.4f after_change=%.4f\n", m.name, error / std::max<uint64_t>(error_n, 1),
+                    flicker / std::max<uint64_t>(flicker_n, 1), after_change / std::max<uint64_t>(change_n, 1));
+            }
+            set_temporal(0); set_smooth(0);
+            return 0;
+        }
         for (const auto& f : frames) {
             set_jitter(f.jitter_positive);
             if (!std::strcmp(f.name, "warmup2")) Sleep(1500); // let the background PSO compile finish

@@ -77,8 +77,9 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
     for (size_t i = 0; i < size; ++i) hash = (hash ^ data[i]) * 1099511628211ULL;
     return size ? hash : 0;
 }
-// Per frame: map, scene colour, one SRV per display slot, then output, tiles, params, map UAV and residual UAVs.
-constexpr unsigned slot_count = 32, ring_size = 8, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 5;
+// Per frame: map, scene colour, one SRV per display slot, then output, tiles, params, map, residual and the two
+// temporal anti-aliasing history UAVs.
+constexpr unsigned slot_count = 32, ring_size = 8, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 7;
 std::filesystem::path addon_directory;
 ID3D12Device* main_device = nullptr;
 struct DeviceState;
@@ -94,6 +95,12 @@ std::atomic<int> detail_clamp_percent{default_detail_clamp}, edge_fade_percent{0
 std::atomic<int> dark_screen_fix{0};
 // UV seam fix (on by default): don't blend texture coordinates across a jump inside one screen mesh.
 std::atomic<int> seam_fix{1};
+// Temporal anti-aliasing (experimental, on/off): screens accumulated over frames like the game's TAA, history dropped
+// wherever a screen's content changes.
+std::atomic<int> temporal_aa{0};
+// Soft-edged line smoothing (experimental, on/off): Line smoothing weighted towards the pixel's centre over a wider area
+// (Gaussian) instead of evenly over it (box). Less shimmer in motion at about the same sharpness.
+std::atomic<int> soft_smoothing{0};
 // Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like.
 // With Extra smoothing on it goes to 100 % (twice the DLSS-like footprint: softer than DLSS, for stubborn shimmer).
 constexpr int max_smoothing = 50, max_extra_smoothing = 100, default_smoothing = 35;
@@ -643,6 +650,12 @@ struct Map {
     // Largest upscaler output seen for this render size, and when: another mod (e.g. RenoDX's DLSS add-on) can run an
     // extra DLSS pass at the same render size before the sim's own upscale; the fix belongs on the real (largest) one.
     std::atomic<uint64_t> largest_output{0}, largest_output_present{0};
+    // Temporal anti-aliasing history (output size, two slices per view), made on first use. Under composite_mutex.
+    ComPtr<ID3D12Resource> history, history_uv;
+    std::vector<ComPtr<ID3D12Resource>> retired; // replaced history the GPU may still be reading
+    UINT history_w = 0, history_h = 0;
+    std::array<uint32_t, 8> history_parity{}, history_frames{};
+    std::array<uint64_t, 8> history_present{}; // present count + 1 of each view's last history write (0 = none)
 };
 
 struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
@@ -1212,10 +1225,10 @@ bool create_composite(DeviceState& d) {
     D3D12_DESCRIPTOR_RANGE ranges[3]{
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, uav_base, 0, 0, 0},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, uav_base},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 5, 0, uav_base + 4}}; // u4 is the root UAV (fit sums)
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 5, 0, uav_base + 4}}; // u4 is the root UAV (fit sums)
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 17};
+    params[0].Constants = {0, 0, 19};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {3, ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -1907,20 +1920,55 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     d.native->CreateUnorderedAccessView(map->texture.Get(), nullptr, &map_uav, at(uav_base + 3));
     uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     d.native->CreateUnorderedAccessView(map->residual.Get(), nullptr, &uav, at(uav_base + 4));
+    // Temporal anti-aliasing history: made when first used, again when the output size changes.
+    bool temporal = temporal_aa.load(std::memory_order_relaxed) != 0 && layer < 8;
+    if (temporal && (!map->history || map->history_w != out_w || map->history_h != out_h)) {
+        if (map->history) { map->retired.push_back(map->history); map->retired.push_back(map->history_uv); }
+        map->history = map->history_uv = nullptr;
+        map->history_present.fill(0);
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, out_w, out_h, UINT16(map->layers * 2), 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0},
+            D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+        bool made = SUCCEEDED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&map->history)));
+        desc.Format = DXGI_FORMAT_R16G16_UNORM;
+        made = made && SUCCEEDED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&map->history_uv)));
+        if (made) { map->history_w = out_w; map->history_h = out_h; }
+        else map->history = map->history_uv = nullptr;
+        log("temporal_aa history %ux%u x%u views: %s (%.0f MB)", out_w, out_h, map->layers, made ? "made" : "FAILED",
+            double(out_w) * out_h * map->layers * 2 * 12 / 1048576);
+    }
+    temporal = temporal && map->history;
+    uint32_t history_info = 0, frame_index = 0;
+    if (temporal) {
+        // Last frame's history is used only if it is this view's from the previous frame or two (not from before the
+        // option was switched off and on, a pause, or another view).
+        const uint64_t now = present_count.load(std::memory_order_relaxed) + 1;
+        const bool recent = map->history_present[layer] && now - map->history_present[layer] <= 3;
+        map->history_parity[layer] ^= 1;
+        history_info = map->history_parity[layer] | (recent ? 2u : 0u);
+        frame_index = map->history_frames[layer]++;
+        map->history_present[layer] = now;
+    } else map->history_present.fill(0);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC history_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
+    history_view.Texture2DArray = {0, 0, map->layers * 2, 0};
+    d.native->CreateUnorderedAccessView(temporal ? map->history.Get() : nullptr, nullptr, &history_view, at(uav_base + 5));
+    history_view.Format = DXGI_FORMAT_R16G16_UNORM;
+    d.native->CreateUnorderedAccessView(temporal ? map->history_uv.Get() : nullptr, nullptr, &history_view, at(uav_base + 6));
 
-    struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp, angle_soften; } constants{
+    struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp, angle_soften;
+        UINT history_info, frame_index; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
-        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u),
+        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u) | (temporal ? 64u : 0u) | (soft_smoothing ? 128u : 0u),
         smoothing_percent / 50.0f, layer, glass_percent / 100.0f, edge_fade_percent / 100.0f,
         edge_stretch_percent / 100.0f, detail_clamp_percent / 100.0f,
-        angle_soften_percent / 100.0f};
+        angle_soften_percent / 100.0f, history_info, frame_index};
 
     api::command_list* api_list = list;
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(api_list->get_native());
     ID3D12DescriptorHeap* heaps[]{d.heap.Get()};
     native->SetDescriptorHeaps(1, heaps);
     native->SetComputeRootSignature(d.root.Get());
-    native->SetComputeRoot32BitConstants(0, 17, &constants, 0);
+    native->SetComputeRoot32BitConstants(0, 19, &constants, 0);
     native->SetComputeRootDescriptorTable(1, gpu);
     native->SetComputeRootUnorderedAccessView(2, d.sums->GetGPUVirtualAddress());
     // DLSS leaves its colour input compute-readable and the output as UAV; FSR reports the states it restores.
@@ -1948,7 +1996,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         uav_barrier(native);
         d.accumulators_zeroed = true;
         constants.flags |= 1;
-        native->SetComputeRoot32BitConstants(0, 17, &constants, 0);
+        native->SetComputeRoot32BitConstants(0, 19, &constants, 0);
     }
     native->SetPipelineState(d.passes[1].Get());
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
@@ -2319,6 +2367,8 @@ void load_settings() {
     edge_stretch_percent = std::clamp(int(GetPrivateProfileIntW(L"experimental", L"edge_stretch", 0, settings_path().c_str())), 0, max_edge_stretch);
     dark_screen_fix = GetPrivateProfileIntW(L"experimental", L"dark_screen_fix", 0, settings_path().c_str()) != 0;
     seam_fix = GetPrivateProfileIntW(L"experimental", L"seam_fix", 1, settings_path().c_str()) != 0;
+    temporal_aa = GetPrivateProfileIntW(L"experimental", L"temporal_aa", 0, settings_path().c_str()) != 0;
+    soft_smoothing = GetPrivateProfileIntW(L"experimental", L"soft_smoothing", 0, settings_path().c_str()) != 0;
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
@@ -2337,6 +2387,8 @@ void save_settings() {
     WritePrivateProfileStringW(L"experimental", L"edge_stretch", std::to_wstring(edge_stretch_percent.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"dark_screen_fix", std::to_wstring(dark_screen_fix.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"seam_fix", std::to_wstring(seam_fix.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"temporal_aa", std::to_wstring(temporal_aa.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"soft_smoothing", std::to_wstring(soft_smoothing.load()).c_str(), settings_path().c_str());
 }
 
 // One measurement window every 10 s: 120 frames, reported ~30 frames later (the GPU has finished them by then).
@@ -2525,7 +2577,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
+    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
@@ -2570,9 +2622,11 @@ void set_experimental(const Experimental& e) {
     angle_soften_percent = std::clamp(e.angle_softening, 0, 100); edge_stretch_percent = std::clamp(e.edge_stretch, 0, max_edge_stretch);
     dark_screen_fix = e.dark_screens ? 1 : 0;
     seam_fix = e.seam_fix ? 1 : 0;
+    temporal_aa = e.temporal_aa ? 1 : 0;
+    soft_smoothing = e.soft_smoothing ? 1 : 0;
     save_settings();
-    log("setting seam_fix=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d", seam_fix.load(), dark_screen_fix.load(), detail_clamp_percent.load(),
-        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load());
+    log("setting seam_fix=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d temporal_aa=%d soft_smoothing=%d", seam_fix.load(), dark_screen_fix.load(), detail_clamp_percent.load(),
+        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), temporal_aa.load(), soft_smoothing.load());
 }
 void set_glass_strength(int percent) { glass_percent = std::clamp(percent, 0, 100); save_settings(); log("setting glass_strength=%d", glass_percent.load()); }
 }
@@ -2652,9 +2706,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     log("Glass Cockpit DLSS Fix %s (built " __DATE__ " " __TIME__ ")", overlay_version);
     log("windows %lu.%lu.%lu  game=%ls", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, executable);
     log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
-    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d seam_fix=%d",
+    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d seam_fix=%d temporal_aa=%d soft_smoothing=%d",
         module, fixture, enabled.load(), jitter_positive.load(), smoothing_percent.load(), int(extra_smoothing.load()), glass_percent.load(), detail_clamp_percent.load(),
-        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), dark_screen_fix.load(), seam_fix.load());
+        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), dark_screen_fix.load(), seam_fix.load(), temporal_aa.load(), soft_smoothing.load());
     log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint");
     scan_modules();
     std::thread(worker).detach();
@@ -2666,6 +2720,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
 }
 extern "C" __declspec(dllexport) void GlassFixJitterPositive(bool positive) { jitter_positive = positive; }
 extern "C" __declspec(dllexport) void GlassFixLineSmoothing(int percent) { smoothing_percent = percent; }
+extern "C" __declspec(dllexport) void GlassFixTemporal(int on) { temporal_aa = on ? 1 : 0; }
+extern "C" __declspec(dllexport) void GlassFixGaussian(int on) { soft_smoothing = on ? 1 : 0; }
+extern "C" __declspec(dllexport) void GlassFixGlassStrength(int percent) { glass_percent = percent; }
 // Offline test host: one call per frame stands in for the present event (cost window of 4 frames, reported 2 later).
 extern "C" __declspec(dllexport) void GlassFixCostTick(ID3D12CommandQueue* queue) {
     static uint64_t frame = 0;

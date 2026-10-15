@@ -44,12 +44,12 @@ std::string summary(const glass::Status& s) {
 std::string report(const glass::Status& s) {
     return format("Glass Cockpit DLSS Fix %s\nstatus: %s\ngpu: %s (driver %s)\ndlss: %s, calls=%llu upscales=%llu\nfsr: %s, calls=%llu\nshader_found=%d screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu\n"
         "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d\n"
-        "detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d seam_fix=%d\n",
+        "detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d seam_fix=%d temporal_aa=%d soft_smoothing=%d\n",
         GLASS_VERSION_STRING, summary(s).c_str(), s.gpu.empty() ? "unknown" : s.gpu.c_str(), s.driver.c_str(),
         s.dlss_loaded ? (s.dlss_version.empty() ? "loaded" : s.dlss_version.c_str()) : "not loaded", s.dlss_calls, s.dlss_upscales,
         s.fsr_loaded ? (s.fsr_version.empty() ? "loaded" : s.fsr_version.c_str()) : "not loaded", s.fsr_calls, s.shader_found, s.screen_draws,
         s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing, s.extra_smoothing, s.glass_strength,
-        s.experimental.detail_clamp, s.experimental.edge_fade, s.experimental.angle_softening, s.experimental.edge_stretch, s.experimental.dark_screens, s.experimental.seam_fix);
+        s.experimental.detail_clamp, s.experimental.edge_fade, s.experimental.angle_softening, s.experimental.edge_stretch, s.experimental.dark_screens, s.experimental.seam_fix, s.experimental.temporal_aa, s.experimental.soft_smoothing);
 }
 
 void draw(reshade::api::effect_runtime*) {
@@ -124,6 +124,17 @@ void draw(reshade::api::effect_runtime*) {
         ImGui::SetItemTooltip("Removes thin lines where a screen's picture meets a part of the same screen that points elsewhere\n"
             "in its texture (e.g. the bezel band on the FSS E-Jets).");
         e.seam_fix = seam ? 1 : 0;
+        bool soft = e.soft_smoothing != 0;
+        changed |= ImGui::Checkbox("Soft-edged line smoothing (test)", &soft);
+        ImGui::SetItemTooltip("Line smoothing weighted towards each pixel's centre instead of evenly: less shimmer on screen text and lines\n"
+            "while the view moves, at about the same sharpness. Needs Line smoothing above 0 (try 35).");
+        e.soft_smoothing = soft ? 1 : 0;
+        bool temporal = e.temporal_aa != 0;
+        changed |= ImGui::Checkbox("Temporal anti-aliasing (test)", &temporal);
+        ImGui::SetItemTooltip("Smooths shimmer on screen text and lines over several frames, like the sim's own TAA, without the trails:\n"
+            "the history is dropped wherever a screen's picture changes. Try it with Line smoothing at 0-20.\n"
+            "Uses some extra video memory (about 100 MB at 4K).");
+        e.temporal_aa = temporal ? 1 : 0;
         changed |= ImGui::SliderInt("Detail clamp", &e.detail_clamp, 0, 100, e.detail_clamp ? "%d%%" : "off", ImGuiSliderFlags_AlwaysClamp);
         ImGui::SetItemTooltip("Keeps the fixed screens within the brightness the sim itself draws around each pixel.\n"
             "Hides texture detail too thin for the sim to show, e.g. a dashed line where a screen's picture meets its bezel.\n"

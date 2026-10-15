@@ -3,7 +3,8 @@
 //   fit       - per display, least-squares fit of rendered colour = a * display_texture + b (render resolution),
 //               plus per pixel the remainder (scene - a * texture): dirt, sun glare, reflections, shadow edges
 //   solve     - turns the sums into a, b per display and smooths them over time
-//   composite - redraws the display texture at output resolution over the DLSS output (no history -> no ghosting).
+//   composite - redraws the display texture at output resolution over the DLSS output (no history -> no ghosting;
+//               the optional temporal anti-aliasing keeps a history that is dropped wherever the screen changes).
 //               The glass layer is taken from the DLSS output itself (sharp dirt/shadows), clamped to this frame's
 //               remainder range around the pixel, which removes ghost trails of the old screen content (TAA-style clamp).
 //   clear     - empties the UV map for the next frame
@@ -16,7 +17,8 @@ cbuffer Constants : register(b0)
     float2 jitter;           // offset added to map coordinates to undo this frame's camera jitter
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
-                             // bit 3: smooth lines, bit 4: dark screen fix, bit 5: UV seam fix
+                             // bit 3: smooth lines, bit 4: dark screen fix, bit 5: UV seam fix, bit 6: temporal anti-aliasing,
+                             // bit 7: soft-edged line smoothing
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -24,6 +26,9 @@ cbuffer Constants : register(b0)
     float edge_stretch;      // experimental: extend displays outwards by up to this many render pixels
     float detail_clamp;      // experimental: 0..1, keep the redrawn screen within the sim's own local brightness range this frame
     float angle_soften;      // experimental: 0..1, sample screens seen at a steep angle like the sim does (softer)
+    uint history_info;       // temporal anti-aliasing: bit 0 = history slice written this frame (the other is last frame's),
+                             // bit 1 = last frame's history belongs to this view and can be used
+    uint frame_index;        // temporal anti-aliasing: picks this frame's sample position inside the pixel
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -35,6 +40,10 @@ RWStructuredBuffer<float4> params : register(u2); // per slot: [3s] = a.rgb, val
 RWTexture2DArray<float4> map_rw : register(u3);
 RWByteAddressBuffer sums : register(u4);    // per slot 20 x uint64 fixed point
 RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * display, w = slot + 1 (0 = none)
+// Temporal anti-aliasing history per output pixel, two slices per view (this frame's and last frame's):
+RWTexture2DArray<float4> history : register(u6);    // rgb = screen colour (before the brightness match), w = brightness of the
+                                                    // screen texture at the pixel's own coordinates (sees content changes)
+RWTexture2DArray<float2> history_uv : register(u7); // where the pixel was on its screen texture (0 = not a screen pixel)
 SamplerState display_sampler : register(s0);
 
 static const uint slot_count = 32;
@@ -63,16 +72,23 @@ float3 sample_display(uint slot, float2 uv, float2 dx, float2 dy)
 float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy)
 {
     float2 width = max(1.0 / map_per_output, 1.25) * line_width;
-    float2 fx = dx * width.x, fy = dy * width.y;
+    // Soft-edged (flags bit 7): Gaussian weights (sigma 0.4 of the width) over twice the area instead of a box. A box's
+    // hard edges let through fine detail that flickers as the view moves; a Gaussian passes almost none of it.
+    float spread = (flags & 128) ? 2.0 : 1.0;
+    float2 fx = dx * width.x * spread, fy = dy * width.y * spread;
     float3 sum = 0;
+    float total = 0;
     [unroll] for (uint i = 0; i < 16; ++i)
     {
         // Rotated 4x4 grid: no two samples share a row or column, so near-horizontal and near-vertical lines get
         // 16 distinct coverage levels.
         float2 o = (float2(i % 4, i / 4) + float2(((i / 4) * 0.25 + 0.125), ((i % 4) * 0.25 + 0.125))) / 4.0 - 0.5;
-        sum += displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv + o.x * fx + o.y * fy, fx * 0.25, fy * 0.25).rgb;
+        float2 r = o * spread;
+        float w = (flags & 128) ? exp(-dot(r, r) / (2 * 0.16)) : 1;
+        sum += w * displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv + o.x * fx + o.y * fy, fx * 0.25, fy * 0.25).rgb;
+        total += w;
     }
-    return srgb_to_linear(saturate(sum / 16.0));
+    return srgb_to_linear(saturate(sum / total));
 }
 
 uint map_slot(float4 m)
@@ -243,10 +259,153 @@ void continue_from(int2 q, float4 m, float2 location, out float2 uv, out float2 
     dy = gy * map_per_output.y;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Temporal anti-aliasing (experimental). The game's own TAA leaves no trails on the screens: it keeps old frames only
+// as long as they agree with the current frame around each pixel. The same here, with two advantages: the current
+// frame is the exact screen texture (no render-resolution noise to hide), and a change of the screen's content is seen
+// in the texture itself: each history pixel remembers the texture's brightness at its own coordinates, and if the
+// texture there reads differently now, the history is dropped the frame a digit changes (not clamped away slowly).
+// Each frame samples the texture at another position inside the pixel (8-frame Halton pattern); blended over frames
+// that is the screen filtered over the pixel's area, like a still picture with TAA, and stable while the view moves.
+static const float temporal_blend = 0.1; // share of the new frame
+static const float3 luma = float3(0.2126, 0.7152, 0.0722);
+
+// Brightness of the screen texture at uv over one pixel's footprint: the change reference stored with the history.
+float texture_brightness(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    return dot(srgb_to_linear(displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv, dx, dy).rgb), luma);
+}
+
+uint history_slice(bool current) { return layer * 2 + ((history_info & 1) ^ (current ? 0 : 1)); }
+
+float2 halton_offset(uint index)
+{
+    static const float2 pattern[8] = { float2(0.5, 0.333333), float2(0.25, 0.666667), float2(0.75, 0.111111), float2(0.125, 0.444444),
+        float2(0.625, 0.777778), float2(0.375, 0.222222), float2(0.875, 0.555556), float2(0.0625, 0.888889) };
+    return pattern[index % 8] - 0.5;
+}
+
+// Last frame's texture coordinates at output position q (bilinear between pixel centres); false off a screen.
+bool history_uv_at(float2 q, out float2 uv)
+{
+    uv = 0;
+    float2 base = q - 0.5;
+    int2 i = int2(floor(base));
+    float2 f = base - i;
+    if (any(i < 0) || any(i + 1 >= int2(output_size))) return false;
+    uint s = history_slice(false);
+    float2 a = history_uv[uint3(i, s)], b = history_uv[uint3(i + int2(1, 0), s)], c = history_uv[uint3(i + int2(0, 1), s)], d = history_uv[uint3(i + 1, s)];
+    if (!all(float4(a.x, b.x, c.x, d.x) > 0)) return false;
+    uv = lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+    return true;
+}
+
+float4 history_load(int2 p, out bool valid)
+{
+    valid = all(p >= 0) && all(p < int2(output_size)) && history_uv[uint3(p, history_slice(false))].x > 0;
+    return valid ? history[uint3(p, history_slice(false))] : 0;
+}
+
+// Last frame's colour at output position q: Catmull-Rom, which keeps the history sharp although it is resampled every
+// frame while the view moves; bilinear where the 4x4 taps run off the screen.
+bool history_colour_at(float2 q, uint slot, float2 dx, float2 dy, out float4 value, out bool changed)
+{
+    changed = false;
+    float2 base = q - 0.5;
+    int2 i = int2(floor(base));
+    float2 f = base - i;
+    float2 w[4] = { f * (-0.5 + f * (1 - 0.5 * f)), 1 + f * f * (-2.5 + 1.5 * f), f * (0.5 + f * (2 - 1.5 * f)), f * f * (-0.5 + 0.5 * f) };
+    float4 sum = 0, inner = 0;
+    float inner_weight = 0;
+    bool all_valid = true;
+    [unroll] for (int y = 0; y < 4; ++y)
+        [unroll] for (int x = 0; x < 4; ++x)
+        {
+            bool valid;
+            float4 v = history_load(i + int2(x - 1, y - 1), valid);
+            all_valid = all_valid && valid;
+            sum += v * (w[x].x * w[y].y);
+            if (x >= 1 && x <= 2 && y >= 1 && y <= 2 && valid)
+            {
+                float b = (x == 1 ? 1 - f.x : f.x) * (y == 1 ? 1 - f.y : f.y);
+                inner += v * b; inner_weight += b;
+                // Content change: the texture now, at the coordinates this history pixel had, against what it read then.
+                float2 seen = history_uv[uint3(i + int2(x - 1, y - 1), history_slice(false))];
+                float now = texture_brightness(slot, seen, dx, dy);
+                changed = changed || abs(now - v.w) > 0.01 + 0.05 * max(now, v.w);
+            }
+        }
+    if (all_valid) { value = float4(max(sum.rgb, 0), sum.w); return true; }
+    value = inner;
+    return inner_weight > 0.999;
+}
+
+float3 sample_lines(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    return (flags & 8) ? sample_display_smooth(slot, uv, dx, dy) : sample_display(slot, uv, dx, dy);
+}
+
+// Screen colour (before the brightness match) at output pixel p, accumulated over frames. Writes this frame's history.
+float3 temporal_content(uint2 p, uint slot, float2 uv, float2 dx, float2 dy)
+{
+    float2 j = halton_offset(frame_index);
+    float3 current = sample_lines(slot, uv + j.x * dx + j.y * dy, dx, dy);
+    float3 still = sample_lines(slot, uv, dx, dy); // without history: as the fix draws it otherwise
+    // What the screen shows around this pixel now: history outside that range shows something no longer there.
+    float3 low = current, high = current;
+    [unroll] for (uint k = 0; k < 4; ++k)
+    {
+        float2 o = float2(k & 1 ? 0.6 : -0.6, k & 2 ? 0.6 : -0.6);
+        float3 n = sample_display(slot, uv + o.x * dx + o.y * dy, dx, dy);
+        low = min(low, n); high = max(high, n);
+    }
+    float reference = texture_brightness(slot, uv, dx, dy);
+
+    float3 result = still;
+    if (history_info & 2)
+    {
+        // Where this point of the screen was last frame: follow last frame's texture coordinates from this pixel (Newton
+        // steps on this frame's gradients). No motion vectors needed, and it can't take another screen or another part
+        // of the same texture by mistake: the coordinates must match at the end.
+        float det = dx.x * dy.y - dx.y * dy.x;
+        float2 q = float2(p) + 0.5;
+        bool found = abs(det) > 1e-14;
+        float2 step = 1e3;
+        [unroll] for (uint n = 0; n < 4; ++n)
+        {
+            float2 seen;
+            if (!found || !history_uv_at(q, seen)) { found = false; break; }
+            float2 e = uv - seen;
+            step = float2(e.x * dy.y - e.y * dy.x, dx.x * e.y - dx.y * e.x) / det;
+            if (length(step) > 64) { found = false; break; }
+            q += step;
+            if (length(step) < 0.01) break;
+        }
+        float4 previous;
+        bool changed;
+        if (found && length(step) < 0.05 && history_colour_at(q, slot, dx, dy, previous, changed))
+        {
+            if (!changed)
+            {
+                // Resampling the history at a fraction of a pixel softens it a little every frame: take more of the new
+                // frame the further from a whole pixel the history moved (up to 0.25 at half a pixel).
+                float2 moved = abs(q - 0.5 - round(q - 0.5) - (float2(p) - round(float2(p))));
+                float blend = temporal_blend + 0.3 * max(moved.x, moved.y);
+                float3 margin = (high - low) * 0.05 + 0.001;
+                result = lerp(clamp(previous.rgb, low - margin, high + margin), current, blend);
+            }
+        }
+    }
+    history[uint3(p, history_slice(true))] = float4(result, reference);
+    history_uv[uint3(p, history_slice(true))] = max(uv, 1.0 / 65535);
+    return result;
+}
+
 [numthreads(8, 8, 1)]
 void composite(uint3 id : SV_DispatchThreadID)
 {
     if (any(id.xy >= output_size)) return;
+    if (flags & 64) history_uv[uint3(id.xy, history_slice(true))] = 0; // not a screen pixel unless written below
     float2 location = (float2(id.xy) + 0.5) * map_per_output - 0.5 + jitter;
     int2 cell = int2(floor(location));
     if (any(cell < 0) || any(cell + 1 >= int2(map_size))) return;
@@ -389,7 +548,7 @@ void composite(uint3 id : SV_DispatchThreadID)
             dy = lerp(dy, sim_dy, t);
         }
     }
-    float3 content = ((flags & 8) ? sample_display_smooth(slot, uv, dx, dy) : sample_display(slot, uv, dx, dy)) * gain.rgb;
+    float3 content = ((flags & 64) && !filled && seam_share == 0 ? temporal_content(id.xy, slot, uv, dx, dy) : sample_lines(slot, uv, dx, dy)) * gain.rgb;
     if (seam_share > 0)
     {
         float3 other_side = (flags & 8) ? sample_display_smooth(slot, seam_uv, seam_dx, seam_dy) : sample_display(slot, seam_uv, seam_dx, seam_dy);
