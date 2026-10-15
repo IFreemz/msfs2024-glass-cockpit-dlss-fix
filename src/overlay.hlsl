@@ -358,15 +358,16 @@ bool tap(int2 p, out float4 value)
 }
 
 // Texture coordinates at `location` continued from map pixel q (value m) along the steps to its neighbours on the
-// same side of any UV seam (the smaller step of each pair), and the per-output-pixel gradients.
-void continue_from(int2 q, float4 m, float2 location, out float2 uv, out float2 dx, out float2 dy)
+// same side of any UV seam (the smaller step of each pair; a step longer than `limit` crosses a seam and is no step at
+// all, e.g. from a bezel band pointing at one texel into the picture next to it), and the per-output-pixel gradients.
+void continue_from(int2 q, float4 m, float2 location, float limit, out float2 uv, out float2 dx, out float2 dy)
 {
     float4 r = load_map(q + int2(1, 0)), l = load_map(q - int2(1, 0)), down = load_map(q + int2(0, 1)), up = load_map(q - int2(0, 1));
     float2 to_r = r.w == m.w ? r.xy - m.xy : 1e3, to_l = l.w == m.w ? m.xy - l.xy : 1e3;
     float2 to_d = down.w == m.w ? down.xy - m.xy : 1e3, to_u = up.w == m.w ? m.xy - up.xy : 1e3;
     float2 gx = length(to_r) <= length(to_l) ? to_r : to_l, gy = length(to_d) <= length(to_u) ? to_d : to_u;
-    if (length(gx) > 1) gx = 0;
-    if (length(gy) > 1) gy = 0;
+    if (length(gx) > limit) gx = 0;
+    if (length(gy) > limit) gy = 0;
     float2 o = location - float2(q);
     uv = m.xy + o.x * gx + o.y * gy;
     dx = gx * map_per_output.x;
@@ -546,7 +547,7 @@ void composite(uint3 id : SV_DispatchThreadID)
             if (map_slot(taps[i]) < slot_count && (k == 4 || weights[i] > weights[k])) k = i;
         if (k < 4)
         {
-            continue_from(cell + int2(k & 1, k >> 1), taps[k], location, uv, dx, dy);
+            continue_from(cell + int2(k & 1, k >> 1), taps[k], location, 0.02, uv, dx, dy);
             float share = edge_coverage(map_slot(taps[k]), uv, dx, dy, location);
             if (share > 0.5) { a = taps[k]; coverage = share; edge_pixel = true; }
         }
@@ -581,10 +582,10 @@ void composite(uint3 id : SV_DispatchThreadID)
                     if (length(taps[j].xy - taps[k].xy) < jump * 0.5) side += weights[j];
                     else if (other == 4 || weights[j] > weights[other]) other = j;
                 }
-                continue_from(cell + int2(k & 1, k >> 1), taps[k], location, uv, dx, dy);
+                continue_from(cell + int2(k & 1, k >> 1), taps[k], location, jump * 0.5, uv, dx, dy);
                 if (other < 4)
                 {
-                    continue_from(cell + int2(other & 1, other >> 1), taps[other], location, seam_uv, seam_dx, seam_dy);
+                    continue_from(cell + int2(other & 1, other >> 1), taps[other], location, jump * 0.5, seam_uv, seam_dx, seam_dy);
                     seam_share = 1 - side;
                     // Right on the seam the render grid still shows as small steps; the upscaler's picture there is
                     // smooth (it has seen the seam from many jittered frames) and, as nothing moves across a seam,
