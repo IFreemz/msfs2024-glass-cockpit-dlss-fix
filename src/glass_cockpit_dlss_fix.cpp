@@ -437,6 +437,12 @@ std::string hex(const Signature& s) {
     return text;
 }
 std::array<DXGI_FORMAT, slot_count> slot_formats{};
+// Mip levels of the game's own view of each screen texture (first level, count; UINT(-1) = all from first). The fix
+// samples exactly those: a sim that never fills a texture's smaller mips (iFly 737 CDUs and radios) only views level 0.
+std::array<UINT, slot_count> slot_first_mip{}, slot_mip_count{};
+std::mutex view_mips_mutex;
+std::unordered_map<ID3D12Resource*, std::pair<UINT, UINT>> view_mips;
+std::atomic<bool> mip0_only{false}; // test (Ctrl+Shift+F7): sample level 0 of every screen texture
 std::array<std::atomic<uint64_t>, slot_count> slot_last_used{};
 std::atomic<uint64_t> present_count{0};
 std::mutex slots_mutex;
@@ -615,9 +621,14 @@ int slot_of(ID3D12Resource* resource, DXGI_FORMAT format) {
     if (chosen < 0) return -1;
     slot_formats[chosen] = format;
     slot_last_used[chosen] = now;
+    std::pair<UINT, UINT> mips{0, UINT(-1)};
+    bool known = false;
+    { std::lock_guard view_lock(view_mips_mutex); if (const auto found = view_mips.find(resource); found != view_mips.end()) { mips = found->second; known = true; } }
+    slot_first_mip[chosen] = mips.first; slot_mip_count[chosen] = mips.second;
     slot_resources[chosen] = resource;
     const auto d = resource->GetDesc();
-    log("display_slot slot=%d resource=%p w=%llu h=%u mips=%u format=%u", chosen, resource, d.Width, d.Height, d.MipLevels, unsigned(format));
+    log("display_slot slot=%d resource=%p w=%llu h=%u mips=%u format=%u game_view_mips=%u+%d%s", chosen, resource, d.Width, d.Height, d.MipLevels, unsigned(format),
+        mips.first, int(mips.second), known ? "" : " (view not seen)");
     return chosen;
 }
 
@@ -883,6 +894,16 @@ void on_init_view(api::device* device, api::resource resource, api::resource_usa
         srv.Texture2D.MostDetailedMip = first;
         srv.Texture2D.MipLevels = count == UINT32_MAX ? UINT(-1) : count;
     }
+    {
+        // The game's mip range for this texture; a second, different view of it is logged (the first one is used).
+        const std::pair<UINT, UINT> mips = default_view ? std::pair<UINT, UINT>{0, UINT(-1)}
+            : std::pair<UINT, UINT>{desc.texture.first_level, desc.texture.level_count == UINT32_MAX ? UINT(-1) : desc.texture.level_count};
+        std::lock_guard view_lock(view_mips_mutex);
+        const auto [it, added] = view_mips.try_emplace(native, mips);
+        static std::atomic<int> logged{0};
+        if (!added && it->second != mips && logged++ < 16)
+            log("note screen texture %p has views with different mips: %u+%d and %u+%d (the first is used)", native, it->second.first, int(it->second.second), mips.first, int(mips.second));
+    }
     if (track_descriptors.load(std::memory_order_relaxed) && view.handle) set_tracked(uintptr_t(view.handle), texture_id(native, format));
     const auto slot = state->scratch->GetCPUDescriptorHandleForHeapStart();
     std::unique_lock lock(textures_mutex);
@@ -901,6 +922,7 @@ void on_destroy_resource(api::device*, api::resource resource) {
     { std::shared_lock lock(textures_mutex); if (!known_textures.contains(native)) return; }
     std::unique_lock lock(textures_mutex);
     known_textures.erase(native);
+    { std::lock_guard view_lock(view_mips_mutex); view_mips.erase(native); }
     std::erase_if(signatures, [&](const auto& p) { return p.second.resource == native; });
     if (track_descriptors.load(std::memory_order_relaxed)) forget_texture_ids(native);
     for (auto& slot : slot_resources) { auto expected = native; slot.compare_exchange_strong(expected, nullptr); }
@@ -1864,8 +1886,10 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     for (unsigned i = 0; i < slot_count; ++i) {
         auto resource = slot_resources[i].load();
         srv.Format = resource ? slot_formats[i] : DXGI_FORMAT_R8G8B8A8_UNORM;
-        srv.Texture2D.MipLevels = resource ? UINT(-1) : 1;
+        srv.Texture2D.MostDetailedMip = resource && !mip0_only ? slot_first_mip[i] : 0;
+        srv.Texture2D.MipLevels = !resource || mip0_only ? 1 : slot_mip_count[i];
         d.native->CreateShaderResourceView(resource, &srv, at(2 + i));
+        srv.Texture2D.MostDetailedMip = 0;
     }
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{out_format, D3D12_UAV_DIMENSION_TEXTURE2D};
     if (out.DepthOrArraySize > 1) {
@@ -2416,6 +2440,7 @@ void on_present(api::effect_runtime* runtime) {
         present_count.load(std::memory_order_relaxed));
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
     if (chord && runtime->is_key_pressed(VK_F8)) glass::request_capture();
+    if (chord && runtime->is_key_pressed(VK_F7)) { mip0_only = !mip0_only; log("setting mip0_only=%d (test: screen textures sampled at full size only)", int(mip0_only.load())); }
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
     if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
     if (chord && runtime->is_key_pressed(VK_F12)) {
