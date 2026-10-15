@@ -20,7 +20,7 @@ cbuffer Constants : register(b0)
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
                              // bit 3: smooth lines, bit 4: dark screen fix, bit 5: UV seam fix, bit 6: temporal anti-aliasing,
-                             // bit 7: soft-edged line smoothing, bit 8: stable screen edges
+                             // bit 7: soft-edged line smoothing, bit 8: stable screen edges, bit 9: full-size sampling
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -42,7 +42,8 @@ RWTexture2D<uint> tiles : register(u1);     // per 8x8 map tile: display slot + 
 RWStructuredBuffer<float4> params : register(u2); // per slot: [3s] = a.rgb, valid; [3s+1] = b.rgb, samples; [3s+2] = mean screen.rgb, fit quality
 RWTexture2DArray<float4> map_rw : register(u3);
 RWByteAddressBuffer sums : register(u4);    // per slot 20 x uint64 fixed point
-RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * display, w = slot + 1 (0 = none)
+RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * display, w = slot + 1 (0 = none), + 64 where
+                                             // the screen's picture has an edge (a symbol's outline: not trusted, see fit)
 // Temporal anti-aliasing history per output pixel, two slices per view (this frame's and last frame's):
 RWTexture2DArray<float4> history : register(u6);    // rgb = screen colour (before the brightness match), w = brightness of the
                                                     // screen texture at the pixel's own coordinates (sees content changes)
@@ -56,6 +57,7 @@ static const uint slot_count = 32;
 static const uint terms = 20;
 static const float fixed_scale = 16777216.0;
 static const uint bounds_cells = 64;
+static const float3 luma = float3(0.2126, 0.7152, 0.0722);
 static const float bounds_scale = 16777215.0;
 
 float3 srgb_to_linear(float3 c)
@@ -64,8 +66,18 @@ float3 srgb_to_linear(float3 c)
     return select(c <= 0.04045, c / 12.92, pow(c * 0.947867 + 0.0521327, 2.4));
 }
 
-// Screens are read at full size only (their smaller mip levels flicker when the view moves; the sim may not keep them
-// up to date). Instead, a footprint holding many texels gets more taps: n x n so that taps are at most ~1.5 texels apart.
+// Full-size sampling (flags bit 9): the redrawn screens are read at full size only (their smaller mip levels flicker
+// when the view moves). Instead, a footprint holding many texels gets more taps, n x n, at most ~1.5 texels apart.
+// The fit pass reads them exactly like the sim does (its mip levels, its four taps): the glass layer is the sim's
+// picture minus that, and any difference in sampling would show up in it as flicker around thin lines.
+static bool sim_sampling = false;
+
+float3 texture_tap(uint slot, float2 uv, float2 gx, float2 gy)
+{
+    if ((flags & 512) && !sim_sampling) return displays[NonUniformResourceIndex(slot)].SampleLevel(display_sampler, uv, 0).rgb;
+    return displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv, gx, gy).rgb;
+}
+
 uint taps_for(uint slot, float2 fx, float2 fy)
 {
     float w, h;
@@ -86,7 +98,7 @@ float3 sample_area(uint slot, float2 uv, float2 fx, float2 fy, uint n, bool soft
             float2 o = (float2(i, j) + (float2(j, i) + 0.5) * step) * step - 0.5;
             float2 r = o * 2;
             float w = soft ? exp(-dot(r, r) / (2 * 0.16)) : 1;
-            sum += w * displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv + o.x * fx + o.y * fy, fx * step, fy * step).rgb;
+            sum += w * texture_tap(slot, uv + o.x * fx + o.y * fy, fx * step, fy * step);
             total += w;
         }
     return sum / total;
@@ -95,12 +107,12 @@ float3 sample_area(uint slot, float2 uv, float2 fx, float2 fy, uint n, bool soft
 // The game averages four half-footprint taps (SampleBias -1) before linearising; do the same at output scale.
 float3 sample_display(uint slot, float2 uv, float2 dx, float2 dy)
 {
-    uint n = taps_for(slot, dx, dy);
+    uint n = sim_sampling || !(flags & 512) ? 2 : taps_for(slot, dx, dy);
     if (n > 2) return srgb_to_linear(saturate(sample_area(slot, uv, dx, dy, n, false)));
     static const float2 offsets[4] = { float2(0.125, 0.375), float2(0.375, -0.125), float2(-0.125, -0.375), float2(-0.375, 0.125) };
     float3 sum = 0;
     [unroll] for (uint i = 0; i < 4; ++i)
-        sum += displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv + offsets[i].x * dx + offsets[i].y * dy, dx * 0.5, dy * 0.5).rgb;
+        sum += texture_tap(slot, uv + offsets[i].x * dx + offsets[i].y * dy, dx * 0.5, dy * 0.5);
     return srgb_to_linear(saturate(sum * 0.25));
 }
 
@@ -117,7 +129,7 @@ float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy)
     bool soft = (flags & 128) != 0;
     float spread = soft ? 2.0 : 1.0;
     float2 fx = dx * width.x * spread, fy = dy * width.y * spread;
-    return srgb_to_linear(saturate(sample_area(slot, uv, fx, fy, max(taps_for(slot, fx, fy), 4), soft)));
+    return srgb_to_linear(saturate(sample_area(slot, uv, fx, fy, (flags & 512) ? max(taps_for(slot, fx, fy), 4) : 4, soft)));
 }
 
 uint map_slot(float4 m)
@@ -215,6 +227,7 @@ float edge_coverage(uint slot, float2 uv, float2 dx, float2 dy, float2 location)
 [numthreads(8, 8, 1)]
 void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : SV_GroupIndex)
 {
+    sim_sampling = true;
     if (index == 0) tile_slot = 0xffffffff;
     GroupMemoryBarrierWithGroupSync();
     int2 p = int2(id.xy);
@@ -223,6 +236,7 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     if (slot < slot_count) InterlockedMin(tile_slot, slot);
 
     bool active = slot < slot_count;
+    bool outline = false;
     float3 x = 0, y = 0, detail = 0;
     if (active)
     {
@@ -245,13 +259,22 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
             float3 hy = clamp(scene.Load(int3(np, 0)).rgb, 0, 1024) - y;
             float3 hx = sample_display(slot, n.xy, dx, dy) - x;
             if (all(isfinite(hy))) detail += float3(dot(hx, hx), dot(hy, hy), dot(hx, hy));
+            outline = outline || abs(dot(hx, luma)) > 0.02;
+        }
+        // Next to a symbol's outline the remainder below is mostly how differently the sim and this pass sample the
+        // texture there, and that changes with the jitter every frame. Glass effects (dirt, glare, reflections) change
+        // slowly across a screen: the composite takes them from the pixels around, not from outlines.
+        [unroll] for (uint k2 = 0; k2 < 2; ++k2)
+        {
+            float4 n = k2 ? u : l;
+            if (map_slot(n) == slot) outline = outline || abs(dot(sample_display(slot, n.xy, dx, dy) - x, luma)) > 0.02;
         }
     }
     GroupMemoryBarrierWithGroupSync();
 
     // Per-pixel remainder against last frame's gain (glass layer: dirt, glare, reflections, shadows).
     float4 gain = active ? params[slot * 3] : 0;
-    if (all(p < int2(map_size))) residual[p] = active && gain.w > 0 ? float4(y - gain.rgb * x, slot + 1) : 0;
+    if (all(p < int2(map_size))) residual[p] = active && gain.w > 0 ? float4(y - gain.rgb * x, slot + 1 + (outline ? 64 : 0)) : 0;
     if (index == 0 && all(group.xy < (map_size + 7) / 8)) tiles[group.xy] = tile_slot < slot_count ? tile_slot + 1 : 0;
 
     // Stable screen edges: widen the bounds of the texture cell this render pixel sampled (one set of atomics per cell
@@ -383,12 +406,11 @@ void continue_from(int2 q, float4 m, float2 location, float limit, out float2 uv
 // Each frame samples the texture at another position inside the pixel (8-frame Halton pattern); blended over frames
 // that is the screen filtered over the pixel's area, like a still picture with TAA, and stable while the view moves.
 static const float temporal_blend = 0.1; // share of the new frame
-static const float3 luma = float3(0.2126, 0.7152, 0.0722);
 
 // Brightness of the screen texture at uv over one pixel's footprint: the change reference stored with the history.
 float texture_brightness(uint slot, float2 uv, float2 dx, float2 dy)
 {
-    return dot(srgb_to_linear(displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv, dx, dy).rgb), luma);
+    return dot(srgb_to_linear(texture_tap(slot, uv, dx, dy)), luma);
 }
 
 uint history_slice(bool current) { return layer * 2 + ((history_info & 1) ^ (current ? 0 : 1)); }
@@ -714,18 +736,22 @@ void composite(uint3 id : SV_DispatchThreadID)
         content = lerp(content, other_side * gain.rgb, seam_share);
     }
 
-    // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder: bilinear value at this pixel and its
-    // spread over the 3x3 render pixels around it (same display only).
+    // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder around this pixel: its soft average and
+    // spread over the 5x5 render pixels around it (Gaussian weights, same display only, not at symbol outlines). A soft
+    // average of the jittered render pixels hardly changes from frame to frame; the nearest few would, wherever the
+    // remainder has fine detail. The sharp glass detail itself comes from the upscaler's (temporally stable) picture.
     float3 smooth = 0, m1 = 0, m2 = 0, scene_low = 1e9, scene_high = -1e9;
     float smooth_weight = 0, count = 0;
-    int2 centre = int2(round(location));
-    [unroll] for (int j = 0; j < 9; ++j)
+    int2 centre = int2(floor(location));
+    [loop] for (int j = 0; j < 64; ++j)
     {
-        int2 q = centre + int2(j % 3 - 1, j / 3 - 1);
+        int2 q = centre + int2(j % 8 - 3, j / 8 - 3);
         if (any(q < 0) || any(q >= int2(map_size))) continue;
         float4 rv = residual[q];
         if (uint(rv.w + 0.5) != slot + 1) continue;
-        m1 += rv.rgb; m2 += rv.rgb * rv.rgb; count += 1;
+        float2 t = float2(q) - location;
+        float w = exp(-dot(t, t) / (2 * 1.7 * 1.7));
+        smooth += w * rv.rgb; m2 += w * rv.rgb * rv.rgb; smooth_weight += w; count += 1;
     }
     // Detail clamp range: what the sim drew in the 5x5 render pixels around this one (same display). A wider window
     // than 3x3 changes less from frame to frame as the jitter moves, so the clamp doesn't flicker.
@@ -733,29 +759,20 @@ void composite(uint3 id : SV_DispatchThreadID)
         [unroll] for (int s = 0; s < 25; ++s)
         {
             int2 q = centre + int2(s % 5 - 2, s / 5 - 2);
-            if (any(q < 0) || any(q >= int2(map_size)) || uint(residual[q].w + 0.5) != slot + 1) continue;
+            if (any(q < 0) || any(q >= int2(map_size)) || (uint(residual[q].w + 0.5) & 63) != slot + 1) continue;
             float3 y = scene.Load(int3(q, 0)).rgb;
             if (all(isfinite(y))) { scene_low = min(scene_low, y); scene_high = max(scene_high, y); }
         }
-    [unroll] for (uint k = 0; k < 4; ++k)
-    {
-        int2 q = cell + int2(k & 1, k >> 1);
-        float4 rv = residual[q];
-        if (uint(rv.w + 0.5) != slot + 1) continue;
-        float w = ((k & 1) ? f.x : 1 - f.x) * ((k >> 1) ? f.y : 1 - f.y);
-        smooth += w * rv.rgb;
-        smooth_weight += w;
-    }
     float3 glass = offset.rgb;
     if (smooth_weight > 1e-3)
     {
         glass = smooth / smooth_weight;
-        if ((flags & 4) && count > 0)
+        if (flags & 4)
         {
             // DLSS output minus the clean content = sharp glass detail + ghost of old content. Keep it only within the
             // local spread of this frame's glass layer (variance clipping, as in TAA); ghost trails fall outside.
-            float3 mean = m1 / count, spread = sqrt(max(m2 / count - mean * mean, 0)) + 0.002;
-            glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread);
+            float3 spread = sqrt(max(m2 / smooth_weight - glass * glass, 0)) + 0.002;
+            if (!(flags & 1024)) glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread); // debug bit 10: smooth part only
         }
     }
     float3 colour = content + glass;

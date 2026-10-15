@@ -717,9 +717,11 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; };
-            const Mode modes[]{{"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
-                {"still-taa-ls0", 0, 1, 0}, {"off-ls35", 35, 0}, {"off-ls50", 50, 0}, {"gauss-ls35", 35, 0, 0.0007f, 1}, {"taa-ls0", 0, 1}, {"taa-ls20", 20, 1}};
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; };
+            const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 1024}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
+                {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
+                {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
+                {"off-ls35", 35, 0}, {"gauss-ls35", 35, 0, 0.0007f, 1}, {"taa-ls0", 0, 1}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
@@ -729,18 +731,24 @@ int main(int argc, char** argv) {
             constexpr int frame_count = 52, change_at = 46, measure_from = 26;
             // Screen content only: no dirt, glare or shadow, glass layer off (the fake DLSS output is the ideal picture,
             // which the glass layer would otherwise pass through).
-            set_material({"motion", 0, true, true, 0, 0, 0, 0.0f, 0.0f, false, Frame::perfect, Frame::info});
             const auto set_glass = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGlassStrength"));
-            require(set_glass != nullptr, "exports missing");
-            set_glass(0);
+            const auto set_full_size = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixFullSize"));
+            const auto set_debug = reinterpret_cast<void (*)(uint32_t)>(GetProcAddress(addon, "GlassFixDebugFlags"));
+            require(set_glass && set_full_size && set_debug, "exports missing");
             Sleep(1500); // let the background PSO compile finish
             for (const auto& m : modes) {
                 set_smooth(m.smoothing);
                 set_gaussian(m.gaussian);
                 set_stable(m.stable);
+                // Glass modes: dirt on the screen and the glass layer on (the fake DLSS output still the ideal picture).
+                set_material({"motion", 0, true, true, 0, 0, 0, m.glass ? 0.06f : 0.0f, 0.0f, false, Frame::perfect, Frame::info});
+                set_glass(m.glass);
+                set_debug(m.debug);
+                set_full_size(m.full_size);
                 set_temporal(0);
                 upload_display(0);
                 Image previous_out, previous_ideal;
+                std::vector<float> flicker_map(size_t(output_w) * output_h, 0.0f); // per pixel: summed frame-to-frame change beyond the ideal's
                 double error = 0, flicker = 0, after_change = 0, edge_error = 0, edge_flicker = 0;
                 uint64_t error_n = 0, flicker_n = 0, change_n = 0, edge_n = 0, edge_flicker_n = 0;
                 for (int t = 0; t < frame_count; ++t) {
@@ -770,10 +778,16 @@ int main(int argc, char** argv) {
                             e += std::abs(double(out[i][k]) - ideal[i][k]);
                             if (!previous_out.empty()) f += std::abs((double(out[i][k]) - previous_out[i][k]) - (double(ideal[i][k]) - previous_ideal[i][k]));
                         }
+                        if (t >= measure_from && t < change_at) flicker_map[i] += float(f / 3);
                         if (t >= measure_from && t < change_at) { error += e / 3; ++error_n; if (!previous_out.empty()) { flicker += f / 3; ++flicker_n; } }
                         if (t >= change_at && t < change_at + 3) { after_change += e / 3; ++change_n; }
                     }
-                    if (t == change_at - 1) save(out, std::string(m.name));
+                    if (t == change_at - 1) {
+                        save(out, std::string(m.name));
+                        Image heat(out.size());
+                        for (size_t i = 0; i < heat.size(); ++i) { const float v = flicker_map[i] * 4; heat[i] = {v, v, v, 1}; }
+                        save(heat, std::string(m.name) + "-flicker");
+                    }
                     if (t == change_at) save(out, std::string(m.name) + "-changed");
                     previous_out = out; previous_ideal = ideal;
                 }

@@ -106,6 +106,7 @@ std::atomic<int> soft_smoothing{0};
 // make the pixels along its edge flip between the fix and the upscaler every frame.
 std::atomic<int> stable_edges{1};
 std::atomic<uint32_t> bounds_reset{0}; // slots whose learnt edges must be forgotten (the slot took another texture)
+std::atomic<uint32_t> debug_flags{0}; // offline test only: extra shader flag bits
 // Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like.
 // With Extra smoothing on it goes to 100 % (twice the DLSS-like footprint: softer than DLSS, for stubborn shimmer).
 constexpr int max_smoothing = 50, max_extra_smoothing = 100, default_smoothing = 35;
@@ -1909,8 +1910,9 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     for (unsigned i = 0; i < slot_count; ++i) {
         auto resource = slot_resources[i].load();
         srv.Format = resource ? slot_formats[i] : DXGI_FORMAT_R8G8B8A8_UNORM;
-        srv.Texture2D.MostDetailedMip = resource && !mip0_only ? slot_first_mip[i] : 0;
-        srv.Texture2D.MipLevels = !resource || mip0_only ? 1 : slot_mip_count[i];
+        // The game's own mip range (the fit pass samples like the sim); full-size sampling reads level 0 in the shader.
+        srv.Texture2D.MostDetailedMip = resource ? slot_first_mip[i] : 0;
+        srv.Texture2D.MipLevels = !resource ? 1 : slot_mip_count[i];
         d.native->CreateShaderResourceView(resource, &srv, at(2 + i));
         srv.Texture2D.MostDetailedMip = 0;
     }
@@ -1971,7 +1973,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp, angle_soften;
         UINT history_info, frame_index, bounds_reset; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
-        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u) | (temporal ? 64u : 0u) | (soft_smoothing ? 128u : 0u) | (stable_edges ? 256u : 0u),
+        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u) | (temporal ? 64u : 0u) | (soft_smoothing ? 128u : 0u) | (stable_edges ? 256u : 0u) | (mip0_only ? 512u : 0u) | debug_flags.load(),
         smoothing_percent / 50.0f, layer, glass_percent / 100.0f, edge_fade_percent / 100.0f,
         edge_stretch_percent / 100.0f, detail_clamp_percent / 100.0f,
         angle_soften_percent / 100.0f, history_info, frame_index, bounds_reset.exchange(0)};
@@ -2745,6 +2747,8 @@ extern "C" __declspec(dllexport) void GlassFixTemporal(int on) { temporal_aa = o
 extern "C" __declspec(dllexport) void GlassFixGaussian(int on) { soft_smoothing = on ? 1 : 0; }
 extern "C" __declspec(dllexport) void GlassFixGlassStrength(int percent) { glass_percent = percent; }
 extern "C" __declspec(dllexport) void GlassFixStableEdges(int on) { stable_edges = on ? 1 : 0; }
+extern "C" __declspec(dllexport) void GlassFixFullSize(int on) { mip0_only = on != 0; }
+extern "C" __declspec(dllexport) void GlassFixDebugFlags(uint32_t bits) { debug_flags = bits; }
 // Offline test host: one call per frame stands in for the present event (cost window of 4 frames, reported 2 later).
 extern "C" __declspec(dllexport) void GlassFixCostTick(ID3D12CommandQueue* queue) {
     static uint64_t frame = 0;
