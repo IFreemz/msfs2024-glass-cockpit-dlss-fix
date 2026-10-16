@@ -20,7 +20,8 @@ cbuffer Constants : register(b0)
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
                              // bit 3: smooth lines, bit 4: dark screen fix, bit 5: UV seam fix, bit 6: temporal anti-aliasing,
-                             // bit 7: soft-edged line smoothing, bit 8: stable screen edges, bit 9: full-size sampling
+                             // bit 7: soft-edged line smoothing, bit 8: stable screen edges, bit 9: full-size sampling,
+                             // bit 10: steady glass layer
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -32,6 +33,7 @@ cbuffer Constants : register(b0)
                              // bit 1 = last frame's history belongs to this view and can be used
     uint frame_index;        // temporal anti-aliasing: picks this frame's sample position inside the pixel
     uint bounds_reset;       // stable screen edges: slots whose learnt edges are forgotten (another texture took the slot)
+    uint glass_frame;        // steady glass layer: frame counter (presents), to tell recent cells from stale ones
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -51,6 +53,10 @@ RWTexture2DArray<float2> history_uv : register(u7); // where the pixel was on it
 // Stable screen edges: per slot a 64x64 grid over the texture; per cell the smallest and largest u and v any render
 // pixel of the screen sampled there (24-bit fixed point; min > max = nothing seen). Kept until the slot changes texture.
 RWByteAddressBuffer edge_bounds : register(u8);
+// Steady glass layer (flags bit 10), after the edge bounds in the same buffer: per slot a 128x128 grid over the texture.
+// This frame's sums of the glass layer (remainder rgb, fixed point, and sample count) and the average over the last few
+// frames (rgb as float, w = glass_frame + 1 of its last update). The sim's glare and shadows differ from frame to frame
+// (DLSS smooths that out over time); kept in the texture, the average stays put on the screen while the camera moves.
 SamplerState display_sampler : register(s0);
 
 static const uint slot_count = 32;
@@ -59,6 +65,17 @@ static const float fixed_scale = 16777216.0;
 static const uint bounds_cells = 64;
 static const float3 luma = float3(0.2126, 0.7152, 0.0722);
 static const float bounds_scale = 16777215.0;
+static const uint glass_cells = 128;
+static const uint glass_sums_base = slot_count * bounds_cells * bounds_cells * 16;
+static const uint glass_average_base = glass_sums_base + slot_count * glass_cells * glass_cells * 16;
+static const float glass_scale = 256.0;
+static const float glass_blend = 0.1; // share of this frame in the average
+
+uint glass_cell(uint slot, float2 uv)
+{
+    uint2 c = uint2(clamp(uv, 0, 1) * glass_cells - 1e-4);
+    return slot * glass_cells * glass_cells + c.y * glass_cells + c.x;
+}
 
 float3 srgb_to_linear(float3 c)
 {
@@ -143,6 +160,7 @@ void zero(uint3 id : SV_DispatchThreadID)
     for (uint i = id.x; i < slot_count * terms; i += 64) sums.Store<uint64_t>(i * 8, 0);
     for (uint j = id.x; j < slot_count * 3; j += 64) params[j] = 0;
     for (uint c = id.x; c < slot_count * bounds_cells * bounds_cells; c += 64) edge_bounds.Store4(c * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
+    for (uint g = id.x; g < slot_count * glass_cells * glass_cells * 2; g += 64) edge_bounds.Store4(glass_sums_base + g * 16, 0);
 }
 
 uint bounds_address(uint slot, int2 cell) { return (slot * bounds_cells * bounds_cells + cell.y * bounds_cells + cell.x) * 16; }
@@ -275,6 +293,16 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     // Per-pixel remainder against last frame's gain (glass layer: dirt, glare, reflections, shadows).
     float4 gain = active ? params[slot * 3] : 0;
     if (all(p < int2(map_size))) residual[p] = active && gain.w > 0 ? float4(y - gain.rgb * x, slot + 1 + (outline ? 64 : 0)) : 0;
+    // Steady glass layer: add this pixel's remainder to its texture cell (not at outlines, like the composite).
+    if ((flags & 1024) && active && gain.w > 0 && !outline && all(p < int2(map_size)))
+    {
+        int3 v = int3(clamp(y - gain.rgb * x, -4096, 4096) * glass_scale);
+        uint address = glass_sums_base + glass_cell(slot, m.xy) * 16;
+        edge_bounds.InterlockedAdd(address, uint(v.x));
+        edge_bounds.InterlockedAdd(address + 4, uint(v.y));
+        edge_bounds.InterlockedAdd(address + 8, uint(v.z));
+        edge_bounds.InterlockedAdd(address + 12, 1);
+    }
     if (index == 0 && all(group.xy < (map_size + 7) / 8)) tiles[group.xy] = tile_slot < slot_count ? tile_slot + 1 : 0;
 
     // Stable screen edges: widen the bounds of the texture cell this render pixel sampled (one set of atomics per cell
@@ -320,6 +348,46 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
             }
         }
     }
+}
+
+// Steady glass layer: blend this frame's cell averages into the running ones and empty the sums. A cell's average is
+// forgotten when its slot takes another texture, or (in the composite) when it hasn't been seen for a while.
+[numthreads(64, 1, 1)]
+void glass(uint3 id : SV_DispatchThreadID)
+{
+    uint cell = id.x;
+    if (cell >= slot_count * glass_cells * glass_cells) return;
+    uint sums_address = glass_sums_base + cell * 16, average_address = glass_average_base + cell * 16;
+    if (bounds_reset & (1u << (cell / (glass_cells * glass_cells)))) edge_bounds.Store4(average_address, 0);
+    uint4 s = edge_bounds.Load4(sums_address);
+    if (s.w == 0) return;
+    edge_bounds.Store4(sums_address, 0);
+    float3 now = float3(int3(s.xyz)) / (glass_scale * s.w);
+    uint4 a = edge_bounds.Load4(average_address);
+    bool recent = a.w != 0 && glass_frame + 1 - a.w < 30;
+    float3 average = recent ? lerp(asfloat(a.xyz), now, glass_blend) : now;
+    edge_bounds.Store4(average_address, uint4(asuint(average), glass_frame + 1));
+}
+
+// Steady glass layer at a texture position: bilinear over the recent cells around it.
+bool steady_glass(uint slot, float2 uv, out float3 value)
+{
+    float2 g = clamp(uv, 0, 1) * glass_cells - 0.5;
+    int2 c0 = int2(floor(g));
+    float2 f = g - c0;
+    float3 sum = 0;
+    float weight = 0;
+    [unroll] for (uint k = 0; k < 4; ++k)
+    {
+        int2 c = clamp(c0 + int2(k & 1, k >> 1), 0, int(glass_cells) - 1);
+        float w = ((k & 1) ? f.x : 1 - f.x) * ((k >> 1) ? f.y : 1 - f.y);
+        uint4 a = edge_bounds.Load4(glass_average_base + (slot * glass_cells * glass_cells + c.y * glass_cells + c.x) * 16);
+        if (a.w == 0 || glass_frame + 1 - a.w >= 30) continue;
+        sum += w * asfloat(a.xyz);
+        weight += w;
+    }
+    value = weight > 0.05 ? sum / weight : 0;
+    return weight > 0.05;
 }
 
 [numthreads(slot_count, 1, 1)]
@@ -767,13 +835,14 @@ void composite(uint3 id : SV_DispatchThreadID)
     if (smooth_weight > 1e-3)
     {
         glass = smooth / smooth_weight;
-        if (flags & 4)
-        {
-            // DLSS output minus the clean content = sharp glass detail + ghost of old content. Keep it only within the
-            // local spread of this frame's glass layer (variance clipping, as in TAA); ghost trails fall outside.
-            float3 spread = sqrt(max(m2 / smooth_weight - glass * glass, 0)) + 0.002;
-            if (!(flags & 1024)) glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread); // bit 10: soft glass layer
-        }
+        // Steady glass layer: the centre is the glass layer averaged over the last few frames where this pixel is on
+        // its screen (this frame's alone changes with the sim's glare and shadows from frame to frame).
+        float3 spread = sqrt(max(m2 / smooth_weight - glass * glass, 0)) + 0.002, held;
+        if ((flags & 1024) && steady_glass(slot, uv, held)) glass = held;
+        // DLSS output minus the clean content = sharp glass detail + ghost of old content. Keep it only within the
+        // local spread of this frame's glass layer (variance clipping, as in TAA); ghost trails fall outside.
+        // (Debug bit 11: the steady glass layer without that detail.)
+        if ((flags & 4) && !((flags & 1024) && (flags & 2048))) glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread);
     }
     float3 colour = content + glass;
     // Detail clamp: the redrawn screen may not be brighter or darker than what the sim itself drew in the 5x5 render

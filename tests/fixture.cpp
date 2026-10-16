@@ -718,8 +718,8 @@ int main(int argc, char** argv) {
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
             struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; };
-            const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 1024}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
-                {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
+            const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-steady", 35, 0, 0, 0, 1, 100, 1024}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
+                {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"glass-steady", 35, 0, 0.0007f, 0, 1, 100, 1024}, {"glass-steady-only", 35, 0, 0.0007f, 0, 1, 100, 3072}, {"still-glass-steady-only", 35, 0, 0, 0, 1, 100, 3072}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
                 {"off-ls35", 35, 0}, {"gauss-ls35", 35, 0, 0.0007f, 1}, {"taa-ls0", 0, 1}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
