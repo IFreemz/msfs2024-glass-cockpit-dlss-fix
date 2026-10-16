@@ -379,15 +379,19 @@ int main(int argc, char** argv) {
         ComPtr<ID3D12PipelineState> accumulate_pso; check(device->CreateGraphicsPipelineState(&sum_desc, IID_PPV_ARGS(&accumulate_pso)));
 
         // Mesh, constants.
-        std::array<Vertex, 7> vertices{};
+        // Vertices 1-6: the display quad; 7-12 and 13-18: its top and bottom halves, each showing a whole texture (join test).
+        std::array<Vertex, 19> vertices{};
         const float positions[6][2]{{-0.7f, 0.7f}, {0.7f, 0.7f}, {-0.7f, -0.7f}, {-0.7f, -0.7f}, {0.7f, 0.7f}, {0.7f, -0.7f}};
-        for (size_t i = 0; i < 6; ++i) {
-            auto& v = vertices[i + 1];
-            v.position[0] = positions[i][0]; v.position[1] = positions[i][1]; v.position[2] = 0.4f; v.position[3] = 1;
-            v.tangent[0] = v.tangent[3] = v.normal[2] = 1;
-            v.uv[0] = (positions[i][0] + 0.7f) / 1.4f; v.uv[1] = (0.7f - positions[i][1]) / 1.4f;
-            std::fill(std::begin(v.color), std::end(v.color), 1.0f);
-        }
+        for (size_t half = 0; half < 3; ++half)
+            for (size_t i = 0; i < 6; ++i) {
+                auto& v = vertices[half * 6 + i + 1];
+                const float top = half == 2 ? 0.0f : 0.7f, bottom = half == 1 ? 0.0f : -0.7f;
+                const float y = positions[i][1] > 0 ? top : bottom;
+                v.position[0] = positions[i][0]; v.position[1] = y; v.position[2] = 0.4f; v.position[3] = 1;
+                v.tangent[0] = v.tangent[3] = v.normal[2] = 1;
+                v.uv[0] = (positions[i][0] + 0.7f) / 1.4f; v.uv[1] = (top - y) / (top - bottom);
+                std::fill(std::begin(v.color), std::end(v.color), 1.0f);
+            }
         auto vb = buffer(device.Get(), sizeof(vertices), D3D12_HEAP_TYPE_UPLOAD); upload(vb.Get(), vertices.data(), sizeof(vertices));
         constexpr UINT16 indices[]{0, 1, 2, 3, 4, 5};
         auto ib = buffer(device.Get(), sizeof(indices), D3D12_HEAP_TYPE_UPLOAD); upload(ib.Get(), indices, sizeof(indices));
@@ -415,15 +419,26 @@ int main(int argc, char** argv) {
         // Textures: 2x1 alpha texture (t0) and a 768x768 5-mip render-target display texture (t1).
         auto alpha = texture(device.Get(), 2, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
         auto display = texture(device.Get(), 768, 768, 5, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+        auto display2 = texture(device.Get(), 768, 768, 5, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
         // The display texture is rewritten whenever its content scrolls (like the sim's instrument renderer does).
         std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 5> display_fp{}; UINT64 display_total = 0;
         { const auto dd = display->GetDesc(); device->GetCopyableFootprints(&dd, 0, 5, 0, display_fp.data(), nullptr, nullptr, &display_total); }
         auto display_staging = buffer(device.Get(), display_total, D3D12_HEAP_TYPE_UPLOAD);
-        bool display_initialised = false;
-        auto upload_display = [&](UINT scroll) {
+        bool display_initialised = false, display2_initialised = false;
+        // second = the join test's bottom texture: the pattern's lower half, black in its top rows; the top texture then
+        // has a bright line along its bottom rows (as the E-Jet PFD's halves meet: brown, a light line, black).
+        auto upload_display = [&](UINT scroll, bool join = false, bool second = false) {
+            ID3D12Resource* const target = second ? display2.Get() : display.Get();
+            bool& initialised = second ? display2_initialised : display_initialised;
             std::vector<uint8_t> bytes(size_t(display_total), 0);
             std::vector<std::array<float, 4>> level(768 * 768);
-            for (UINT y = 0; y < 768; ++y) for (UINT x = 0; x < 768; ++x) { const auto p = pattern(x, (y + scroll) % 768); level[y * 768 + x] = {float(p[0]), float(p[1]), float(p[2]), float(p[3])}; }
+            for (UINT y = 0; y < 768; ++y) for (UINT x = 0; x < 768; ++x) {
+                auto p = pattern(x, (y + scroll + (second ? 384 : 0)) % 768);
+                if (join && !second && y >= 764) p = {230, 230, 230, 255};
+                if (join && !second && y >= 700 && y < 764 && p[0] + p[1] + p[2] == 0) p = {90, 50, 25, 255}; // brown above the join
+                if (join && second && y < 4) p = {0, 0, 0, 255};
+                level[y * 768 + x] = {float(p[0]), float(p[1]), float(p[2]), float(p[3])};
+            }
             UINT size = 768;
             for (UINT m = 0; m < 5; ++m) {
                 for (UINT y = 0; y < size; ++y) for (UINT x = 0; x < size; ++x)
@@ -436,17 +451,18 @@ int main(int argc, char** argv) {
             }
             upload(display_staging.Get(), bytes.data(), bytes.size());
             constexpr auto readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            if (display_initialised) transition(list.Get(), display.Get(), readable, D3D12_RESOURCE_STATE_COPY_DEST);
+            if (initialised) transition(list.Get(), target, readable, D3D12_RESOURCE_STATE_COPY_DEST);
             for (UINT m = 0; m < 5; ++m) {
-                D3D12_TEXTURE_COPY_LOCATION to{display.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{display_staging.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                D3D12_TEXTURE_COPY_LOCATION to{target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{display_staging.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
                 to.SubresourceIndex = m; from.PlacedFootprint = display_fp[m];
                 list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
             }
-            transition(list.Get(), display.Get(), D3D12_RESOURCE_STATE_COPY_DEST, readable);
-            display_initialised = true;
+            transition(list.Get(), target, D3D12_RESOURCE_STATE_COPY_DEST, readable);
+            initialised = true;
             submit();
         };
         upload_display(0);
+        upload_display(0, false, true);
         {
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT afp{}; UINT64 atotal = 0; const auto ad = alpha->GetDesc();
             device->GetCopyableFootprints(&ad, 0, 1, 0, &afp, nullptr, nullptr, &atotal);
@@ -487,6 +503,16 @@ int main(int argc, char** argv) {
         auto gpu_slot = gpu0; gpu_slot.ptr += 4 * inc; // table at slot 4
         device->CopyDescriptorsSimple(2, gpu_slot, cpu0, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto table = gpu_heap->GetGPUDescriptorHandleForHeapStart(); table.ptr += 4 * inc;
+        {
+            // Join test: the same table with the second display texture, at slots 6-7.
+            auto cpu6 = cpu0; cpu6.ptr += 6 * inc;
+            auto cpu7 = cpu0; cpu7.ptr += 7 * inc;
+            device->CreateShaderResourceView(screen_t0 ? display2.Get() : alpha.Get(), nullptr, cpu6);
+            device->CreateShaderResourceView(screen_t0 ? alpha.Get() : display2.Get(), nullptr, cpu7);
+            auto gpu6 = gpu0; gpu6.ptr += 6 * inc;
+            device->CopyDescriptorsSimple(2, gpu6, cpu6, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        auto table2 = table; table2.ptr += 2 * inc;
         if (bench) {
             // The sim makes millions of descriptor copies per second from several threads; with descriptor tracking
             // (--track) each goes through the add-on. Time them: 4 threads, 1M single-descriptor copies each, from a
@@ -650,6 +676,16 @@ int main(int argc, char** argv) {
             const auto set_temporal = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixTemporal"));
             require(set_temporal != nullptr, "exports missing");
             using Image = std::vector<std::array<float, 4>>;
+            bool join = false;
+            // The display as drawn: one quad, or (join) its two halves with their own textures.
+            auto draw_display = [&] {
+                if (!join) { list->DrawIndexedInstanced(6, 1, 0, 1, 0); return; }
+                list->SetGraphicsRootDescriptorTable(5, table);
+                list->DrawIndexedInstanced(6, 1, 0, 7, 0);
+                list->SetGraphicsRootDescriptorTable(5, table2);
+                list->DrawIndexedInstanced(6, 1, 0, 13, 0);
+                list->SetGraphicsRootDescriptorTable(5, table);
+            };
             auto truth = [&] {
                 const float zero[4]{};
                 list->ClearRenderTargetView(rtv(2), zero, 0, nullptr);
@@ -659,7 +695,7 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < 16; ++k) {
                     const D3D12_VIEWPORT vp{(k % 4 + 0.5f) / 4 - 0.5f, (k / 4 + 0.5f) / 4 - 0.5f, float(output_w), float(output_h), 0, 1};
                     list->RSSetViewports(1, &vp);
-                    list->DrawIndexedInstanced(6, 1, 0, 1, 0);
+                    draw_display();
                 }
                 transition(list.Get(), reference.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 auto rb = readback(device.Get(), reference.Get()); copy(list.Get(), reference.Get(), rb);
@@ -680,7 +716,7 @@ int main(int argc, char** argv) {
                 const D3D12_VIEWPORT vp{jx, jy, float(render_w), float(render_h), 0, 1}; const D3D12_RECT sc{0, 0, LONG(render_w), LONG(render_h)};
                 list->RSSetViewports(1, &vp); list->RSSetScissorRects(1, &sc);
                 auto r0 = rtv(0), d0 = dsv(0); list->OMSetRenderTargets(1, &r0, FALSE, &d0);
-                list->DrawIndexedInstanced(6, 1, 0, 1, 0);
+                draw_display();
                 transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 submit();
                 // The fake DLSS output: the ideal picture (no ghost); the fix redraws the screen over it.
@@ -717,11 +753,15 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; };
             const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 2048}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
                 {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
-                {"off-ls35", 35, 0}, {"gauss-ls35", 35, 0, 0.0007f, 1}, {"taa-ls0", 0, 1}};
+                {"off-ls35", 35, 0}, {"gauss-ls35", 35, 0, 0.0007f, 1}, {"taa-ls0", 0, 1},
+                // Two screen textures meeting within one display (FSS E-Jet PFD): "join" = error and flicker along the join.
+                {"still-join", 35, 0, 0, 0, 1, 0, 0, 1, true}, {"join", 35, 0, 0.0007f, 0, 1, 0, 0, 1, true},
+                {"still-join-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, true}, {"join-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, true},
+                {"join-glass", 35, 0, 0.0007f, 0, 1, 100, 0, 1, true}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
@@ -746,20 +786,44 @@ int main(int argc, char** argv) {
                 set_debug(m.debug);
                 set_full_size(m.full_size);
                 set_temporal(0);
-                upload_display(0);
+                join = m.join;
+                upload_display(0, join);
+                upload_display(0, join, true);
                 Image previous_out, previous_ideal;
                 std::vector<float> flicker_map(size_t(output_w) * output_h, 0.0f); // per pixel: summed frame-to-frame change beyond the ideal's
-                double error = 0, flicker = 0, after_change = 0, edge_error = 0, edge_flicker = 0;
-                uint64_t error_n = 0, flicker_n = 0, change_n = 0, edge_n = 0, edge_flicker_n = 0;
+                double error = 0, flicker = 0, after_change = 0, edge_error = 0, edge_flicker = 0, join_error = 0, join_flicker = 0;
+                uint64_t error_n = 0, flicker_n = 0, change_n = 0, edge_n = 0, edge_flicker_n = 0, join_n = 0, join_flicker_n = 0;
                 for (int t = 0; t < frame_count; ++t) {
                     if (t == 1) set_temporal(m.temporal); // the first frame without history (like switching it on)
-                    if (t == change_at) upload_display(8);
+                    if (t == change_at) { upload_display(8, join); upload_display(8, join, true); }
                     const auto c = constants(m.speed * t);
                     upload(globals[0].Get(), c.global.data(), sizeof(c.global));
                     const auto ideal = truth();
                     const auto out = run(ideal, jitters[t % 8][0], jitters[t % 8][1]);
+                    // The join's two ends on the monitor (output pixels).
+                    float ends[2][2]{};
+                    for (int e = 0; e < 2; ++e) {
+                        const float p[4]{e ? 0.7f : -0.7f, 0, 0.4f, 1};
+                        float clip[4]{};
+                        for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) clip[j] += p[k] * c.global[k][j];
+                        ends[e][0] = (clip[0] / clip[3] + 1) * 0.5f * output_w;
+                        ends[e][1] = (1 - clip[1] / clip[3]) * 0.5f * output_h;
+                    }
+                    const float jx_ = ends[1][0] - ends[0][0], jy_ = ends[1][1] - ends[0][1], jlen = std::sqrt(jx_ * jx_ + jy_ * jy_);
                     for (UINT y = 3; y + 3 < output_h; ++y) for (UINT x = 3; x + 3 < output_w; ++x) {
                         const size_t i = size_t(y) * output_w + x;
+                        if (join && t >= measure_from && t < change_at && ideal[i][3] >= 0.999f) {
+                            const float px = x + 0.5f - ends[0][0], py = y + 0.5f - ends[0][1];
+                            if (std::abs(px * jy_ - py * jx_) / jlen <= 2.0f) {
+                                double e = 0, f = 0;
+                                for (int k = 0; k < 3; ++k) {
+                                    e += std::abs(double(out[i][k]) - ideal[i][k]);
+                                    if (!previous_out.empty()) f += std::abs((double(out[i][k]) - previous_out[i][k]) - (double(ideal[i][k]) - previous_ideal[i][k]));
+                                }
+                                join_error += e / 3; ++join_n;
+                                if (!previous_out.empty()) { join_flicker += f / 3; ++join_flicker_n; }
+                            }
+                        }
                         if (ideal[i][3] > 0.001f && ideal[i][3] < 0.999f && t >= measure_from && t < change_at) {
                             // Screen edge: the pixel is partly on the screen.
                             double e = 0, f = 0;
@@ -791,9 +855,11 @@ int main(int argc, char** argv) {
                     if (t == change_at) save(out, std::string(m.name) + "-changed");
                     previous_out = out; previous_ideal = ideal;
                 }
-                std::printf("%-16s error=%.4f flicker=%.4f after_change=%.4f edge_error=%.4f edge_flicker=%.4f\n", m.name, error / std::max<uint64_t>(error_n, 1),
+                std::printf("%-16s error=%.4f flicker=%.4f after_change=%.4f edge_error=%.4f edge_flicker=%.4f", m.name, error / std::max<uint64_t>(error_n, 1),
                     flicker / std::max<uint64_t>(flicker_n, 1), after_change / std::max<uint64_t>(change_n, 1), edge_error / std::max<uint64_t>(edge_n, 1),
                     edge_flicker / std::max<uint64_t>(edge_flicker_n, 1));
+                if (m.join) std::printf(" join_error=%.4f join_flicker=%.4f", join_error / std::max<uint64_t>(join_n, 1), join_flicker / std::max<uint64_t>(join_flicker_n, 1));
+                std::printf("\n");
             }
             set_temporal(0); set_smooth(0);
             return 0;

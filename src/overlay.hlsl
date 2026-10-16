@@ -20,8 +20,7 @@ cbuffer Constants : register(b0)
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
                              // bit 3: smooth lines, bit 4: dark screen fix, bit 5: UV seam fix, bit 6: temporal anti-aliasing,
-                             // bit 7: soft-edged line smoothing, bit 8: stable screen edges, bit 9: full-size sampling,
-                             // bit 10: calm glass at symbols
+                             // bit 7: soft-edged line smoothing, bit 8: stable screen edges, bit 9: full-size sampling
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -556,6 +555,9 @@ void composite(uint3 id : SV_DispatchThreadID)
     float2 uv, dx, dy;
     float2 seam_uv = 0, seam_dx = 0, seam_dy = 0; // UV seam: the other side, and its share of this pixel
     float seam_share = 0, seam_upscaler = 0;
+    float2 join_uv = 0, join_dx = 0, join_dy = 0; // two screen textures meeting in this pixel: the other one, and its share
+    uint join_slot = slot_count;
+    float join_share = 0;
     bool filled = false;
     float coverage = 1; // stable screen edges: share of this pixel on the screen
     bool inside = covered && a.w == b.w && a.w == c.w && a.w == d.w;
@@ -572,8 +574,29 @@ void composite(uint3 id : SV_DispatchThreadID)
         if (k < 4)
         {
             continue_from(cell + int2(k & 1, k >> 1), taps[k], location, 0.02, uv, dx, dy);
-            float share = edge_coverage(map_slot(taps[k]), uv, dx, dy, location);
-            if (share > 0.5) { a = taps[k]; coverage = share; edge_pixel = true; }
+            uint other = 4;
+            [unroll] for (uint i2 = 0; i2 < 4; ++i2)
+                if (map_slot(taps[i2]) < slot_count && map_slot(taps[i2]) != map_slot(taps[k]) && (other == 4 || weights[i2] > weights[other])) other = i2;
+            if (other < 4)
+            {
+                // Two screen textures meet in this pixel within one display (e.g. the FSS E-Jet PFD's halves). Drawn
+                // from the nearest render pixel's texture alone, the pixel would flip between the two with the jitter:
+                // both instead, each by its share of the pixel from the learnt edges (which the jitter doesn't move).
+                continue_from(cell + int2(other & 1, other >> 1), taps[other], location, 0.02, join_uv, join_dx, join_dy);
+                float d_near, d_other;
+                float2 unused;
+                bool near_known = edge_distance(map_slot(taps[k]), uv, dx, dy, d_near, unused);
+                bool other_known = edge_distance(map_slot(taps[other]), join_uv, join_dx, join_dy, d_other, unused);
+                float near_share = near_known && other_known ? 0.5 * (saturate(0.5 + d_near) + saturate(0.5 - d_other))
+                                 : near_known ? saturate(0.5 + d_near) : other_known ? saturate(0.5 - d_other) : 0.5;
+                a = taps[k]; coverage = 1; edge_pixel = true;
+                join_slot = map_slot(taps[other]); join_share = 1 - near_share;
+            }
+            else
+            {
+                float share = edge_coverage(map_slot(taps[k]), uv, dx, dy, location);
+                if (share > 0.5) { a = taps[k]; coverage = share; edge_pixel = true; }
+            }
         }
     }
     if (edge_pixel) {}
@@ -737,6 +760,11 @@ void composite(uint3 id : SV_DispatchThreadID)
         float3 other_side = (flags & 8) ? sample_display_smooth(slot, seam_uv, seam_dx, seam_dy) : sample_display(slot, seam_uv, seam_dx, seam_dy);
         content = lerp(content, other_side * gain.rgb, seam_share);
     }
+    if (join_share > 0)
+    {
+        float4 join_gain = params[join_slot * 3];
+        if (join_gain.w > 0) content = lerp(content, sample_lines(join_slot, join_uv, join_dx, join_dy) * join_gain.rgb, join_share);
+    }
 
     // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder around this pixel: its soft average and
     // spread over the 5x5 render pixels around it (Gaussian weights, same display only, not at symbol outlines). A soft
@@ -786,10 +814,7 @@ void composite(uint3 id : SV_DispatchThreadID)
             // DLSS output minus the clean content = sharp glass detail + ghost of old content. Keep it only within the
             // local spread of this frame's glass layer (variance clipping, as in TAA); ghost trails fall outside.
             float3 spread = sqrt(max(m2 / smooth_weight - glass * glass, 0)) + 0.002;
-            // Calm glass at symbols (bit 10): not next to symbol outlines (their share around this pixel, Gaussian weighted,
-            // hardly changes with the jitter). Debug bit 11: the smooth part only, everywhere.
-            float detail = (flags & 2048) ? 0 : (flags & 1024) ? saturate(1 - 3 * outline_weight / (outline_weight + smooth_weight)) : 1;
-            glass = lerp(glass, clamp(output[id.xy].rgb - content, glass - spread, glass + spread), detail);
+            if (!(flags & 2048)) glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread); // debug bit 11: smooth part only
         }
     }
     float3 colour = content + glass;
