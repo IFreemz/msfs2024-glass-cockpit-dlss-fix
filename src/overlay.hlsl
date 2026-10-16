@@ -809,16 +809,18 @@ void composite(uint3 id : SV_DispatchThreadID)
     // average of the jittered render pixels hardly changes from frame to frame; the nearest few would, wherever the
     // remainder has fine detail. The sharp glass detail itself comes from the upscaler's (temporally stable) picture.
     float3 smooth = 0, m1 = 0, m2 = 0, scene_low = 1e9, scene_high = -1e9;
-    float smooth_weight = 0, count = 0;
+    float smooth_weight = 0, count = 0, outline_weight = 0;
     int2 centre = int2(floor(location));
     [loop] for (int j = 0; j < 64; ++j)
     {
         int2 q = centre + int2(j % 8 - 3, j / 8 - 3);
         if (any(q < 0) || any(q >= int2(map_size))) continue;
         float4 rv = residual[q];
-        if (uint(rv.w + 0.5) != slot + 1) continue;
+        uint tag = uint(rv.w + 0.5);
+        if ((tag & 63) != slot + 1) continue;
         float2 t = float2(q) - location;
         float w = exp(-dot(t, t) / (2 * 1.7 * 1.7));
+        if (tag & 64) { outline_weight += w; continue; }
         smooth += w * rv.rgb; m2 += w * rv.rgb * rv.rgb; smooth_weight += w; count += 1;
     }
     // Detail clamp range: what the sim drew in the 5x5 render pixels around this one (same display). A wider window
@@ -842,7 +844,12 @@ void composite(uint3 id : SV_DispatchThreadID)
         // DLSS output minus the clean content = sharp glass detail + ghost of old content. Keep it only within the
         // local spread of this frame's glass layer (variance clipping, as in TAA); ghost trails fall outside.
         // (Debug bit 11: the steady glass layer without that detail.)
-        if ((flags & 4) && !((flags & 1024) && (flags & 2048))) glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread);
+        // Steady glass layer: not near symbol outlines (share of them around this pixel, Gaussian weighted, so it
+        // hardly changes with the jitter). There, DLSS's lines sit slightly elsewhere than the redrawn ones, and the
+        // difference changes every frame.
+        float detail = (flags & 1024) ? saturate(1 - 3 * outline_weight / (outline_weight + smooth_weight)) : 1;
+        if ((flags & 4) && !((flags & 1024) && (flags & 2048)))
+            glass = lerp(glass, clamp(output[id.xy].rgb - content, glass - spread, glass + spread), detail);
     }
     float3 colour = content + glass;
     // Detail clamp: the redrawn screen may not be brighter or darker than what the sim itself drew in the 5x5 render
