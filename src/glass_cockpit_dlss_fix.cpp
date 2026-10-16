@@ -1289,7 +1289,7 @@ bool create_composite(DeviceState& d) {
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.sums)))) return false;
     buffer.Width = slot_count * 3 * 16;
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.params)))) return false;
-    buffer.Width = slot_count * bounds_cells * bounds_cells * 16 + 256;
+    buffer.Width = 2 * slot_count * bounds_cells * bounds_cells * 16 + 256; // two halves of learnt edges, call counters
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.edge_bounds)))) return false;
     D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -1997,7 +1997,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     history_view.Format = DXGI_FORMAT_R16G16_UNORM;
     d.native->CreateUnorderedAccessView(temporal ? map->history_uv.Get() : nullptr, nullptr, &history_view, at(uav_base + 6));
     D3D12_UNORDERED_ACCESS_VIEW_DESC raw{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
-    raw.Buffer = {0, slot_count * bounds_cells * bounds_cells * 4 + 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+    raw.Buffer = {0, 2 * slot_count * bounds_cells * bounds_cells * 4 + 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
     d.native->CreateUnorderedAccessView(d.edge_bounds.Get(), nullptr, &raw, at(uav_base + 7));
     D3D12_UNORDERED_ACCESS_VIEW_DESC glass_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
     glass_view.Texture2DArray = {0, 0, map->layers, 0};
@@ -2134,7 +2134,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         if (d.diag_ready == UINT64_MAX && now >= d.diag_next && d.diag_dumps < 400) {
             // The copy runs after this call's passes: counters of the last 63 calls (the next one was just zeroed).
             transition(native, d.edge_bounds.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            native->CopyBufferRegion(d.diag_readback.Get(), 0, d.edge_bounds.Get(), UINT64(slot_count) * bounds_cells * bounds_cells * 16, 256);
+            native->CopyBufferRegion(d.diag_readback.Get(), 0, d.edge_bounds.Get(), 2 * UINT64(slot_count) * bounds_cells * bounds_cells * 16, 256);
             transition(native, d.edge_bounds.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             d.diag_snapshot = d.diag_calls;
             d.diag_copied_at = d.diag_index + 1; // the copy holds calls up to diag_index

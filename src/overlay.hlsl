@@ -62,7 +62,12 @@ static const uint slot_count = 32;
 static const uint terms = 20;
 static const float fixed_scale = 16777216.0;
 static const uint bounds_cells = 64;
-static const uint diag_base = slot_count * bounds_cells * bounds_cells * 16; // after the edge bounds: 64 call counters
+// Learnt edges in two halves that take turns (a new one every 128 upscaler calls, about a second): each call learns into
+// the current half, which was emptied when its turn began, and uses what both halves have seen. So an edge the camera no
+// longer sees (a screen partly hidden behind its bezel from this angle) is forgotten within about two seconds.
+static const uint bounds_bytes = slot_count * bounds_cells * bounds_cells * 16;
+static const uint diag_base = 2 * bounds_bytes; // after the edge bounds: 64 call counters
+uint bounds_half(uint call) { return (call >> 7) & 1; }
 static const float3 luma = float3(0.2126, 0.7152, 0.0722);
 static const float bounds_scale = 16777215.0;
 
@@ -148,7 +153,7 @@ void zero(uint3 id : SV_DispatchThreadID)
 {
     for (uint i = id.x; i < slot_count * terms; i += 64) sums.Store<uint64_t>(i * 8, 0);
     for (uint j = id.x; j < slot_count * 3; j += 64) params[j] = 0;
-    for (uint c = id.x; c < slot_count * bounds_cells * bounds_cells; c += 64) edge_bounds.Store4(c * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
+    for (uint c = id.x; c < 2 * slot_count * bounds_cells * bounds_cells; c += 64) edge_bounds.Store4(c * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
 }
 
 uint bounds_address(uint slot, int2 cell) { return (slot * bounds_cells * bounds_cells + cell.y * bounds_cells + cell.x) * 16; }
@@ -158,7 +163,8 @@ bool cell_bounds(uint slot, int2 cell, out float4 b)
 {
     b = 0;
     if (any(cell < 0) || any(cell >= int(bounds_cells))) return false;
-    uint4 r = edge_bounds.Load4(bounds_address(slot, cell));
+    uint4 r = edge_bounds.Load4(bounds_address(slot, cell)), s = edge_bounds.Load4(bounds_bytes + bounds_address(slot, cell));
+    r = uint4(min(r.xy, s.xy), max(r.zw, s.zw)); // both halves
     b = float4(r) / bounds_scale;
     return r.x <= r.z && r.y <= r.w;
 }
@@ -204,6 +210,9 @@ bool edge_distance(uint slot, float2 uv, float2 dx, float2 dy, out float d, out 
     if (!found) return false;
     float2 gu = float2(dx.x, dy.x), gv = float2(dx.y, dy.y); // change of u and v per output pixel along x and y
     float su = max(length(gu), 1e-9), sv = max(length(gv), 1e-9);
+    // A small, distant screen: its cells are only a pixel or two on the monitor, too few samples land in each for an
+    // edge to be learnt reliably. Leave its edges to the usual handling.
+    if (min(1.0 / bounds_cells / su, 1.0 / bounds_cells / sv) < 3) return false;
     float4 unused;
     float e;
     if (!cell_bounds(slot, cell + sides[0], unused)) { e = (uv.x - b.x) / su; if (e < d) { d = e; toward = -gu / su; } }
@@ -304,7 +313,7 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
                     uint2 low = WaveActiveMin(q), high = WaveActiveMax(q);
                     if (WaveIsFirstLane())
                     {
-                        uint address = key * 16, unused;
+                        uint address = key * 16 + bounds_half(diag_index) * bounds_bytes, unused;
                         edge_bounds.InterlockedMin(address, low.x, unused);
                         edge_bounds.InterlockedMin(address + 4, low.y, unused);
                         edge_bounds.InterlockedMax(address + 8, high.x, unused);
@@ -625,6 +634,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     float2 uv, dx, dy;
     float2 seam_uv = 0, seam_dx = 0, seam_dy = 0; // UV seam: the other side, and its share of this pixel
     float seam_share = 0, seam_upscaler = 0;
+    float band_share = 0; // share of this pixel on a bezel band (all of it one texture spot): left to the upscaler
     float2 join_uv = 0, join_dx = 0, join_dy = 0; // two screen textures meeting in this pixel: the other one, and its share
     uint join_slot = slot_count;
     float join_share = 0;
@@ -669,12 +679,17 @@ void composite(uint3 id : SV_DispatchThreadID)
             }
         }
     }
-    if (edge_pixel) {}
+    if (edge_pixel)
+    {
+        if (length(dx) + length(dy) < 1e-7) return; // the edge of a bezel band (one texture spot): the upscaler's
+    }
     else if (inside)
     {
         uv = lerp(lerp(a.xy, b.xy, f.x), lerp(c.xy, d.xy, f.x), f.y);
         dx = lerp(b.xy - a.xy, d.xy - c.xy, f.y) * map_per_output.x;
         dy = lerp(c.xy - a.xy, d.xy - b.xy, f.x) * map_per_output.y;
+        // All four render pixels around point at one texture spot: a bezel band, not screen content (see below).
+        if ((flags & 32) && length(dx) + length(dy) < 1e-7) return;
         // UV seam: one screen mesh whose texture coordinates jump between neighbouring pixels (e.g. the FSS E-Jets'
         // bezel band points at the texture's corner, right next to the picture). Blending across the jump samples
         // whatever lies between in the texture: a thin line along the seam that the sim never draws. Continue the
@@ -723,6 +738,15 @@ void composite(uint3 id : SV_DispatchThreadID)
                             float picture = saturate(0.5 + d);
                             seam_share = picture_near ? 1 - picture : picture;
                             seam_upscaler = 0;
+                            // The other side is a bezel band pointing at one texture spot (e.g. the E-Jet ND's top
+                            // edge): not screen content, and whatever sits on that spot (a parked mouse cursor) would be
+                            // stretched across the band. Its share goes to the upscaler, the picture is drawn alone.
+                            float2 band_dx = picture_near ? seam_dx : dx, band_dy = picture_near ? seam_dy : dy;
+                            if (length(band_dx) + length(band_dy) < 1e-7)
+                            {
+                                band_share = picture_near ? seam_share : 1 - seam_share;
+                                seam_share = picture_near ? 0 : 1;
+                            }
                         }
                     }
                 }
@@ -917,6 +941,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     if (glass_strength < 1) colour -= (1 - glass_strength) * (glass - offset.rgb);
     if (flags & 2) colour = colour * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0);
     float keep = (blend < 1 ? blend * blend * (3 - 2 * blend) : 1) * coverage;
+    if (band_share > 0 && (flags & 4)) keep *= 1 - band_share;
     if (keep < 1) colour = lerp(output[id.xy].rgb, colour, keep);
     if (all(isfinite(colour))) output[id.xy] = float4(max(colour, 0), 1);
 }
@@ -925,8 +950,14 @@ void composite(uint3 id : SV_DispatchThreadID)
 void clear(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID)
 {
     uint index = id.y * map_size.x + id.x, cells = bounds_cells * bounds_cells;
-    if (bounds_reset && id.x < map_size.x && index < slot_count * cells && (bounds_reset & (1u << (index / cells))))
-        edge_bounds.Store4(index * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
+    if (id.x < map_size.x && index < slot_count * cells)
+    {
+        bool reset = bounds_reset & (1u << (index / cells));
+        uint next = bounds_half(diag_index + 1);
+        // The next call starts a new turn: empty that half. A slot that took another texture: empty both.
+        if (reset || next != bounds_half(diag_index)) edge_bounds.Store4(next * bounds_bytes + index * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
+        if (reset) edge_bounds.Store4((1 - next) * bounds_bytes + index * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
+    }
     if (all(id.xy < map_size) && all(group.xy < (map_size + 7) / 8) && tiles[group.xy]) map_rw[uint3(id.xy, layer)] = 0;
     if (all(id.xy == 0)) edge_bounds.Store(diag_base + ((diag_index + 1) & 63) * 4, 0);
 }

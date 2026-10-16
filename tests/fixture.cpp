@@ -120,7 +120,7 @@ struct Constants {
     std::array<std::array<float, 4>, 17> object{};
 };
 // Display quad turned 35 degrees around Y, 2 units in front of a 60-degree 16:9 camera (perspective-correct UVs).
-static Constants constants(float shift) {
+static Constants constants(float shift, float scale = 1.0f) {
     using M = std::array<std::array<float, 4>, 4>;
     auto multiply = [](const M& a, const M& b) {
         M r{};
@@ -128,7 +128,7 @@ static Constants constants(float shift) {
         return r;
     };
     const float angle = 0.61f, c = std::cos(angle), sn = std::sin(angle);
-    const M world{{{c, 0, -sn, 0}, {0, 1, 0, 0}, {sn, 0, c, 0}, {shift, 0, 2.0f, 1}}};
+    const M world{{{c * scale, 0, -sn * scale, 0}, {0, scale, 0, 0}, {sn, 0, c, 0}, {shift * scale, 0, 2.0f, 1}}};
     const float ys = 1.0f / std::tan(0.5236f), xs = ys / (16.0f / 9.0f), zn = 0.1f, zf = 100.0f;
     const M projection{{{xs, 0, 0, 0}, {0, ys, 0, 0}, {0, 0, zf / (zf - zn), 1}, {0, 0, -zn * zf / (zf - zn), 0}}};
     const auto view_projection = multiply(world, projection);
@@ -381,7 +381,7 @@ int main(int argc, char** argv) {
 
         // Mesh, constants.
         // Vertices 1-6: the display quad; 7-12 and 13-18: its top and bottom halves, each showing a whole texture (join test).
-        std::array<Vertex, 19> vertices{};
+        std::array<Vertex, 37> vertices{};
         const float positions[6][2]{{-0.7f, 0.7f}, {0.7f, 0.7f}, {-0.7f, -0.7f}, {-0.7f, -0.7f}, {0.7f, 0.7f}, {0.7f, -0.7f}};
         for (size_t half = 0; half < 3; ++half)
             for (size_t i = 0; i < 6; ++i) {
@@ -391,6 +391,26 @@ int main(int argc, char** argv) {
                 v.position[0] = positions[i][0]; v.position[1] = y; v.position[2] = 0.4f; v.position[3] = 1;
                 v.tangent[0] = v.tangent[3] = v.normal[2] = 1;
                 v.uv[0] = (positions[i][0] + 0.7f) / 1.4f; v.uv[1] = (top - y) / (top - bottom);
+                std::fill(std::begin(v.color), std::end(v.color), 1.0f);
+            }
+        // Inset test: the quad showing only part of its texture, its edges in the middle of the texture (like the E-Jet
+        // clock's windows, cut-outs of one texture): vertices 31-36.
+        for (size_t i = 0; i < 6; ++i) {
+            auto& v = vertices[31 + i];
+            v = vertices[1 + i];
+            v.uv[0] = 0.0371f + v.uv[0] * 0.9213f; v.uv[1] = 0.0529f + v.uv[1] * 0.8871f;
+        }
+        // Band test: a strip at the top edge (about two render pixels) whose texture coordinates all point at one spot.
+        constexpr float band_bottom = 0.692f;
+        for (size_t part = 0; part < 2; ++part)
+            for (size_t i = 0; i < 6; ++i) {
+                auto& v = vertices[19 + part * 6 + i];
+                const float top = part == 0 ? 0.7f : band_bottom, bottom = part == 0 ? band_bottom : -0.7f;
+                const float y = positions[i][1] > 0 ? top : bottom;
+                v.position[0] = positions[i][0]; v.position[1] = y; v.position[2] = 0.4f; v.position[3] = 1;
+                v.tangent[0] = v.tangent[3] = v.normal[2] = 1;
+                if (part == 0) { v.uv[0] = 0.004f; v.uv[1] = 0.06f; }
+                else { v.uv[0] = (positions[i][0] + 0.7f) / 1.4f; v.uv[1] = (top - y) / (top - bottom); }
                 std::fill(std::begin(v.color), std::end(v.color), 1.0f);
             }
         auto vb = buffer(device.Get(), sizeof(vertices), D3D12_HEAP_TYPE_UPLOAD); upload(vb.Get(), vertices.data(), sizeof(vertices));
@@ -428,6 +448,7 @@ int main(int argc, char** argv) {
         bool display_initialised = false, display2_initialised = false;
         // second = the join test's bottom texture: the pattern's lower half, black in its top rows; the top texture then
         // has a bright line along its bottom rows (as the E-Jet PFD's halves meet: brown, a light line, black).
+        bool cursor = false; // band test: a parked mouse cursor over the band's texture spot
         auto upload_display = [&](UINT scroll, bool join = false, bool second = false) {
             ID3D12Resource* const target = second ? display2.Get() : display.Get();
             bool& initialised = second ? display2_initialised : display_initialised;
@@ -438,6 +459,7 @@ int main(int argc, char** argv) {
                 if (join && !second && y >= 764) p = {230, 230, 230, 255};
                 if (join && !second && y >= 700 && y < 764 && p[0] + p[1] + p[2] == 0) p = {90, 50, 25, 255}; // brown above the join
                 if (join && second && y < 4) p = {0, 0, 0, 255};
+                if (cursor && !second && x < 14 && y >= 38 && y < 56) p = (x + (y - 38)) % 5 < 3 && x <= (y - 38) ? std::array<uint8_t, 4>{255, 255, 255, 255} : std::array<uint8_t, 4>{0, 0, 0, 255};
                 level[y * 768 + x] = {float(p[0]), float(p[1]), float(p[2]), float(p[3])};
             }
             UINT size = 768;
@@ -679,7 +701,10 @@ int main(int argc, char** argv) {
             using Image = std::vector<std::array<float, 4>>;
             bool join = false;
             // The display as drawn: one quad, or (join) its two halves with their own textures.
+            bool band = false, inset = false;
             auto draw_display = [&] {
+                if (band) { list->DrawIndexedInstanced(6, 1, 0, 19, 0); list->DrawIndexedInstanced(6, 1, 0, 25, 0); return; }
+                if (inset) { list->DrawIndexedInstanced(6, 1, 0, 31, 0); return; }
                 if (!join) { list->DrawIndexedInstanced(6, 1, 0, 1, 0); return; }
                 list->SetGraphicsRootDescriptorTable(5, table);
                 list->DrawIndexedInstanced(6, 1, 0, 7, 0);
@@ -767,7 +792,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; };
             const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 2048}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
                 {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
@@ -782,7 +807,17 @@ int main(int argc, char** argv) {
                 {"sun-sharp", 35, 0, 0, 0, 1, 100, 0, 1, false, true, 0}, {"sun-moving-sharp", 35, 0, 0.0007f, 0, 1, 100, 0, 1, false, true, 0},
                 {"sun-test12", 35, 0, 0, 0, 1, 100, 8192, 1, false, true, 0}, {"sun-moving-test12", 35, 0, 0.0007f, 0, 1, 100, 8192, 1, false, true, 0},
                 {"glass-test12", 35, 0, 0.0007f, 0, 1, 100, 8192, 1, false, false, 0}, {"still-glass-test12", 35, 0, 0, 0, 1, 100, 8192, 1, false, false, 0},
-                {"glass-sharp", 35, 0, 0.0007f, 0, 1, 100, 0, 1, false, false, 0}, {"still-glass-sharp", 35, 0, 0, 0, 1, 100, 0, 1, false, false, 0}};
+                {"glass-sharp", 35, 0, 0.0007f, 0, 1, 100, 0, 1, false, false, 0}, {"still-glass-sharp", 35, 0, 0, 0, 1, 100, 0, 1, false, false, 0},
+                // Bezel band with a parked cursor over its texture spot (FSS E-Jet ND): "band" = error and flicker on it.
+                {"still-band", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, true}, {"band", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, true},
+                // Small, distant screen (about 70 render pixels across, like the E-Jet clock).
+                {"still-small", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 0.12f}, {"small", 35, 0, 0.0002f, 0, 1, 0, 0, 1, false, false, 0, false, 0.12f},
+                {"still-small-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 0.12f}, {"small-edges-off", 35, 0, 0.0002f, 0, 0, 0, 0, 1, false, false, 0, false, 0.12f},
+                // Screen edges in the middle of the texture (cut-outs), small and full size.
+                {"still-inset-small", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 0.12f, true}, {"inset-small", 35, 0, 0.0002f, 0, 1, 0, 0, 1, false, false, 0, false, 0.12f, true},
+                {"still-inset-small-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 0.12f, true}, {"inset-small-edges-off", 35, 0, 0.0002f, 0, 0, 0, 0, 1, false, false, 0, false, 0.12f, true},
+                {"still-inset", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, true}, {"inset", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, true},
+                {"inset-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, false, false, 0, false, 1, true}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
@@ -798,7 +833,10 @@ int main(int argc, char** argv) {
             const auto set_calm = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixCalmGlass"));
             require(set_glass && set_full_size && set_debug && set_calm, "exports missing");
             Sleep(1500); // let the background PSO compile finish
+            const char* only = nullptr; // --only <text>: just the modes whose name contains it
+            for (int i = 1; i + 1 < argc; ++i) if (!std::strcmp(argv[i], "--only")) only = argv[i + 1];
             for (const auto& m : modes) {
+                if (only && !std::strstr(m.name, only)) continue;
                 set_smooth(m.smoothing);
                 set_gaussian(m.gaussian);
                 set_stable(m.stable);
@@ -809,7 +847,7 @@ int main(int argc, char** argv) {
                 set_calm(m.calm);
                 set_full_size(m.full_size);
                 set_temporal(0);
-                join = m.join;
+                join = m.join; band = m.band; cursor = m.band; inset = m.inset;
                 upload_display(0, join);
                 upload_display(0, join, true);
                 Image previous_out, previous_ideal;
@@ -819,7 +857,7 @@ int main(int argc, char** argv) {
                 for (int t = 0; t < frame_count; ++t) {
                     if (t == 1) set_temporal(m.temporal); // the first frame without history (like switching it on)
                     if (t == change_at) { upload_display(8, join); upload_display(8, join, true); }
-                    const auto c = constants(m.speed * t);
+                    const auto c = constants(m.speed * t, m.scale);
                     upload(globals[0].Get(), c.global.data(), sizeof(c.global));
                     // Sun modes: the ideal picture with the steady sun (what DLSS shows), the sim's frame with this frame's.
                     if (m.sun) {
@@ -843,12 +881,20 @@ int main(int argc, char** argv) {
                         ends[e][0] = (clip[0] / clip[3] + 1) * 0.5f * output_w;
                         ends[e][1] = (1 - clip[1] / clip[3]) * 0.5f * output_h;
                     }
+                    if (band)
+                        for (int e = 0; e < 2; ++e) {
+                            const float p[4]{e ? 0.7f : -0.7f, 0.696f, 0.4f, 1};
+                            float clip[4]{};
+                            for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) clip[j] += p[k] * c.global[k][j];
+                            ends[e][0] = (clip[0] / clip[3] + 1) * 0.5f * output_w;
+                            ends[e][1] = (1 - clip[1] / clip[3]) * 0.5f * output_h;
+                        }
                     const float jx_ = ends[1][0] - ends[0][0], jy_ = ends[1][1] - ends[0][1], jlen = std::sqrt(jx_ * jx_ + jy_ * jy_);
                     for (UINT y = 3; y + 3 < output_h; ++y) for (UINT x = 3; x + 3 < output_w; ++x) {
                         const size_t i = size_t(y) * output_w + x;
-                        if (join && t >= measure_from && t < change_at && ideal[i][3] >= 0.999f) {
+                        if ((join || band) && t >= measure_from && t < change_at && (band || ideal[i][3] >= 0.999f)) {
                             const float px = x + 0.5f - ends[0][0], py = y + 0.5f - ends[0][1];
-                            if (std::abs(px * jy_ - py * jx_) / jlen <= 2.0f) {
+                            if (std::abs(px * jy_ - py * jx_) / jlen <= (band ? 3.0f : 2.0f) && px > 0.15f * jlen && px < 0.85f * jlen) {
                                 double e = 0, f = 0;
                                 for (int k = 0; k < 3; ++k) {
                                     e += std::abs(double(out[i][k]) - ideal[i][k]);
@@ -892,7 +938,7 @@ int main(int argc, char** argv) {
                 std::printf("%-16s error=%.4f flicker=%.4f after_change=%.4f edge_error=%.4f edge_flicker=%.4f", m.name, error / std::max<uint64_t>(error_n, 1),
                     flicker / std::max<uint64_t>(flicker_n, 1), after_change / std::max<uint64_t>(change_n, 1), edge_error / std::max<uint64_t>(edge_n, 1),
                     edge_flicker / std::max<uint64_t>(edge_flicker_n, 1));
-                if (m.join) std::printf(" join_error=%.4f join_flicker=%.4f", join_error / std::max<uint64_t>(join_n, 1), join_flicker / std::max<uint64_t>(join_flicker_n, 1));
+                if (m.join || m.band) std::printf(" %s_error=%.4f %s_flicker=%.4f", m.band ? "band" : "join", join_error / std::max<uint64_t>(join_n, 1), m.band ? "band" : "join", join_flicker / std::max<uint64_t>(join_flicker_n, 1));
                 std::printf("\n");
             }
             set_temporal(0); set_smooth(0);
