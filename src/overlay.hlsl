@@ -51,6 +51,10 @@ RWTexture2DArray<float2> history_uv : register(u7); // where the pixel was on it
 // Stable screen edges: per slot a 64x64 grid over the texture; per cell the smallest and largest u and v any render
 // pixel of the screen sampled there (24-bit fixed point; min > max = nothing seen). Kept until the slot changes texture.
 RWByteAddressBuffer edge_bounds : register(u8);
+// Glass layer averaged over the last few frames, per render pixel and view (w = 1: valid). The sim draws its sun glare
+// and shadow edges a little differently every frame; DLSS averages that out, a single frame's glass layer flickers.
+RWTexture2DArray<float4> glass_history : register(u9);
+RWTexture2DArray<float2> glass_history_uv : register(u10); // where on its screen texture that render pixel was then
 SamplerState display_sampler : register(s0);
 
 static const uint slot_count = 32;
@@ -321,6 +325,67 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
             }
         }
     }
+}
+
+// Glass layer around a render pixel: Gaussian average (sigma 1.7 render pixels) of the remainder over the 8x8 render
+// pixels around `location`, from any screen's pixels (the glass is one sheet, also where two screen textures meet) and
+// not at symbol outlines; there only if hardly anything else is around (text in a small box). spread: its local
+// standard deviation. False: no screen pixels around.
+bool glass_around(float2 location, out float3 glass, out float3 spread, out float outline_share)
+{
+    float3 smooth = 0, m2 = 0, outline_sum = 0, outline_m2 = 0;
+    float smooth_weight = 0, outline_weight = 0;
+    int2 centre = int2(floor(location));
+    [loop] for (int j = 0; j < 64; ++j)
+    {
+        int2 q = centre + int2(j % 8 - 3, j / 8 - 3);
+        if (any(q < 0) || any(q >= int2(map_size))) continue;
+        float4 rv = residual[q];
+        uint tag = uint(rv.w + 0.5);
+        if ((tag & 63) == 0) continue;
+        float2 t = float2(q) - location;
+        float w = exp(-dot(t, t) / (2 * 1.7 * 1.7));
+        if (tag & 64) { outline_weight += w; outline_sum += w * rv.rgb; outline_m2 += w * rv.rgb * rv.rgb; continue; }
+        smooth += w * rv.rgb; m2 += w * rv.rgb * rv.rgb; smooth_weight += w;
+    }
+    outline_share = outline_weight / max(outline_weight + smooth_weight, 1e-6);
+    if (smooth_weight < 0.5 && outline_weight > 0)
+    {
+        float extra = outline_weight * saturate(1 - 2 * smooth_weight);
+        smooth += outline_sum * (extra / outline_weight); m2 += outline_m2 * (extra / outline_weight); smooth_weight += extra;
+    }
+    glass = smooth / max(smooth_weight, 1e-6);
+    spread = sqrt(max(m2 / max(smooth_weight, 1e-6) - glass * glass, 0)) + 0.002;
+    return smooth_weight > 1e-3;
+}
+
+// Steady glass: this frame's glass layer around each render pixel, blended into its average over the last few frames
+// (a fifth per frame). The average may differ from this frame's by the local spread plus a
+// quarter of the glass itself (the frame-to-frame wobble of the sim's glare); beyond that, the light really changed (or
+// the view moved) and the average follows at once, so there are no trails.
+static const float glass_blend = 0.2;
+[numthreads(8, 8, 1)]
+void glass_filter(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= map_size)) return;
+    uint3 h = uint3(id.xy, layer);
+    float3 now, spread;
+    float outline_share;
+    if ((uint(residual[id.xy].w + 0.5) & 63) == 0 || !glass_around(float2(id.xy), now, spread, outline_share)) { glass_history[h] = 0; return; }
+    // The view moved (the pixel shows another spot of its screen than last frame, by more than a quarter of a render
+    // pixel): start over, the average belongs elsewhere now.
+    float4 m = load_map(int2(id.xy)), r = load_map(int2(id.xy) + int2(1, 0)), d = load_map(int2(id.xy) + int2(0, 1));
+    float2 gx = r.w == m.w ? r.xy - m.xy : 0, gy = d.w == m.w ? d.xy - m.xy : 0;
+    float step = max(length(gx), length(gy));
+    // The map is drawn with this frame's camera jitter: the spot at the unjittered pixel position.
+    float2 here = saturate(m.xy + jitter.x * gx + jitter.y * gy);
+    float2 then = glass_history_uv[h];
+    bool same_spot = step > 0 && length(here - then) < 0.25 * step;
+    float4 old = glass_history[h];
+    float3 range = spread + 0.25 * abs(now) + 0.002;
+    float3 value = old.w > 0 && same_spot && !(flags & 8192) ? lerp(clamp(old.rgb, now - range, now + range), now, glass_blend) : now;
+    glass_history[h] = float4(value, 1);
+    glass_history_uv[h] = here;
 }
 
 [numthreads(slot_count, 1, 1)]
@@ -799,6 +864,17 @@ void composite(uint3 id : SV_DispatchThreadID)
             if (all(isfinite(y))) { scene_low = min(scene_low, y); scene_high = max(scene_high, y); }
         }
     float3 glass = offset.rgb;
+    // Steady glass (debug bit 13 off): the centre from the averaged glass layer of the 4 render pixels around.
+    float3 steady = 0;
+    float steady_weight = 0;
+    if (!(flags & 8192))
+        [unroll] for (uint k = 0; k < 4; ++k)
+        {
+            int2 q = cell + int2(k & 1, k >> 1);
+            float w = ((k & 1) ? f.x : 1 - f.x) * ((k >> 1) ? f.y : 1 - f.y);
+            float4 v = glass_history[uint3(q, layer)];
+            if (v.w > 0 && w > 0) { steady += w * v.rgb; steady_weight += w; }
+        }
     // Hardly any pixels away from outlines around (text in a small box): use the outline pixels too, rather than
     // a value from one or two pixels that changes every frame.
     if (smooth_weight < 0.5 && outline_weight > 0)
@@ -809,12 +885,18 @@ void composite(uint3 id : SV_DispatchThreadID)
     if (smooth_weight > 1e-3)
     {
         glass = smooth / smooth_weight;
+        float3 spread_now = sqrt(max(m2 / smooth_weight - glass * glass, 0)) + 0.002;
+        if (steady_weight > 0.05) glass = steady / steady_weight;
         if (flags & 4)
         {
             // DLSS output minus the clean content = sharp glass detail + ghost of old content. Keep it only within the
             // local spread of this frame's glass layer (variance clipping, as in TAA); ghost trails fall outside.
-            float3 spread = sqrt(max(m2 / smooth_weight - glass * glass, 0)) + 0.002;
-            if (!(flags & 2048)) glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread); // debug bit 11: smooth part only
+            float3 spread = spread_now;
+            // Bit 12, calm glass at symbols: not next to symbol outlines (their share around this pixel, Gaussian weighted,
+            // hardly changes with the jitter): DLSS's lines sit slightly elsewhere than the redrawn ones, differently every
+            // frame. Debug bit 11: the smooth part only, everywhere.
+            float detail = (flags & 2048) ? 0 : (flags & 4096) ? saturate(1 - 3 * outline_weight / (outline_weight + smooth_weight)) : 1;
+            glass = lerp(glass, clamp(output[id.xy].rgb - content, glass - spread, glass + spread), detail);
         }
     }
     float3 colour = content + glass;

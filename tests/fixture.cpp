@@ -709,6 +709,7 @@ int main(int argc, char** argv) {
                 for (auto& v : result) { for (int c = 0; c < 3; ++c) v[c] /= 16; v[3] /= 8; } // w: share of the pixel on the screen
                 return result;
             };
+            float dlss_shift[2]{};
             auto run = [&](const Image& ideal, float jx, float jy) {
                 list->ClearRenderTargetView(rtv(0), black.Color, 0, nullptr);
                 list->ClearDepthStencilView(dsv(0), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
@@ -721,6 +722,18 @@ int main(int argc, char** argv) {
                 submit();
                 // The fake DLSS output: the ideal picture (no ghost); the fix redraws the screen over it.
                 for (size_t i = 0; i < prefill.size(); ++i) prefill[i] = encode_r11g11b10({ideal[i][0], ideal[i][1], ideal[i][2]});
+                if (dlss_shift[0] != 0 || dlss_shift[1] != 0)
+                    for (UINT y = 1; y + 1 < output_h; ++y) for (UINT x = 1; x + 1 < output_w; ++x) {
+                        const float sx = x + dlss_shift[0], sy = y + dlss_shift[1];
+                        const UINT x0 = std::min(UINT(std::max(sx, 0.0f)), output_w - 2), y0 = std::min(UINT(std::max(sy, 0.0f)), output_h - 2);
+                        const float fx = std::clamp(sx - x0, 0.0f, 1.0f), fy = std::clamp(sy - y0, 0.0f, 1.0f);
+                        std::array<float, 3> v{};
+                        for (int k = 0; k < 3; ++k) {
+                            const auto at = [&](UINT xx, UINT yy) { return ideal[size_t(yy) * output_w + xx][k]; };
+                            v[k] = (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) + (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+                        }
+                        prefill[size_t(y) * output_w + x] = encode_r11g11b10(v);
+                    }
                 {
                     void* data = nullptr; check(prefill_upload->Map(0, nullptr, &data));
                     for (UINT y = 0; y < output_h; ++y)
@@ -753,7 +766,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; };
             const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 2048}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
                 {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
@@ -761,7 +774,14 @@ int main(int argc, char** argv) {
                 // Two screen textures meeting within one display (FSS E-Jet PFD): "join" = error and flicker along the join.
                 {"still-join", 35, 0, 0, 0, 1, 0, 0, 1, true}, {"join", 35, 0, 0.0007f, 0, 1, 0, 0, 1, true},
                 {"still-join-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, true}, {"join-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, true},
-                {"join-glass", 35, 0, 0.0007f, 0, 1, 100, 0, 1, true}};
+                {"join-glass", 35, 0, 0.0007f, 0, 1, 100, 0, 1, true},
+                {"sun", 35, 0, 0, 0, 1, 100, 0, 1, false, true}, {"sun-smooth-only", 35, 0, 0, 0, 1, 100, 2048, 1, false, true},
+                {"sun-no-glass", 35, 0, 0, 0, 1, 0, 0, 1, false, true},
+                {"sun-moving", 35, 0, 0.0007f, 0, 1, 100, 0, 1, false, true},
+                {"sun-sharp", 35, 0, 0, 0, 1, 100, 0, 1, false, true, 0}, {"sun-moving-sharp", 35, 0, 0.0007f, 0, 1, 100, 0, 1, false, true, 0},
+                {"sun-test12", 35, 0, 0, 0, 1, 100, 8192, 1, false, true, 0}, {"sun-moving-test12", 35, 0, 0.0007f, 0, 1, 100, 8192, 1, false, true, 0},
+                {"glass-test12", 35, 0, 0.0007f, 0, 1, 100, 8192, 1, false, false, 0}, {"still-glass-test12", 35, 0, 0, 0, 1, 100, 8192, 1, false, false, 0},
+                {"glass-sharp", 35, 0, 0.0007f, 0, 1, 100, 0, 1, false, false, 0}, {"still-glass-sharp", 35, 0, 0, 0, 1, 100, 0, 1, false, false, 0}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
@@ -774,16 +794,18 @@ int main(int argc, char** argv) {
             const auto set_glass = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGlassStrength"));
             const auto set_full_size = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixFullSize"));
             const auto set_debug = reinterpret_cast<void (*)(uint32_t)>(GetProcAddress(addon, "GlassFixDebugFlags"));
-            require(set_glass && set_full_size && set_debug, "exports missing");
+            const auto set_calm = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixCalmGlass"));
+            require(set_glass && set_full_size && set_debug && set_calm, "exports missing");
             Sleep(1500); // let the background PSO compile finish
             for (const auto& m : modes) {
                 set_smooth(m.smoothing);
                 set_gaussian(m.gaussian);
                 set_stable(m.stable);
                 // Glass modes: dirt on the screen and the glass layer on (the fake DLSS output still the ideal picture).
-                set_material({"motion", 0, true, true, 0, 0, 0, m.glass ? 0.06f : 0.0f, 0.0f, false, Frame::perfect, Frame::info});
+                set_material({"motion", 0, true, true, 0, 0, 0, m.glass || m.sun ? 0.06f : 0.0f, m.sun ? 0.55f : 0.0f, m.sun, Frame::perfect, Frame::info});
                 set_glass(m.glass);
                 set_debug(m.debug);
+                set_calm(m.calm);
                 set_full_size(m.full_size);
                 set_temporal(0);
                 join = m.join;
@@ -798,7 +820,18 @@ int main(int argc, char** argv) {
                     if (t == change_at) { upload_display(8, join); upload_display(8, join, true); }
                     const auto c = constants(m.speed * t);
                     upload(globals[0].Get(), c.global.data(), sizeof(c.global));
+                    // Sun modes: the ideal picture with the steady sun (what DLSS shows), the sim's frame with this frame's.
+                    if (m.sun) {
+                        material[4] = {0.25f, 0.3f, 0.15f, 0.8f}; material[5] = {0, 0, 0.06f, 0.55f};
+                        upload(materials[0].Get(), material.data(), sizeof(material));
+                    }
                     const auto ideal = truth();
+                    if (m.sun) {
+                        material[4] = {0.25f + 0.004f * std::sin(t * 2.1f), 0.3f, 0.15f, 0.8f * (1 + 0.08f * std::sin(t * 2.9f))};
+                        material[5] = {0, 0, 0.06f, 0.55f + 0.0015f * std::sin(t * 1.7f)};
+                        upload(materials[0].Get(), material.data(), sizeof(material));
+                    }
+                    dlss_shift[0] = m.sun ? 0.3f * std::sin(t * 1.3f) : 0.0f; dlss_shift[1] = m.sun ? 0.3f * std::cos(t * 1.9f) : 0.0f;
                     const auto out = run(ideal, jitters[t % 8][0], jitters[t % 8][1]);
                     // The join's two ends on the monitor (output pixels).
                     float ends[2][2]{};

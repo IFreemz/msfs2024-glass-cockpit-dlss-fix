@@ -43,7 +43,7 @@ try {
         if ($LASTEXITCODE) { throw "VR screen-t0 map shader $slot failed" }
         $headers += "map_ps_vr_t0_$slot.h"
     }
-    foreach ($pass in 'zero', 'fit', 'solve', 'composite', 'clear') {
+    foreach ($pass in 'zero', 'fit', 'solve', 'composite', 'clear', 'glass_filter') {
         & $dxc -T cs_6_6 -HV 2021 -E $pass -WX -O3 -Fh "cs_$pass.h" -Vn "cs_$pass" (Join-Path $root 'src\overlay.hlsl')
         if ($LASTEXITCODE) { throw "Compute pass $pass failed" }
         $headers += "cs_$pass.h"
