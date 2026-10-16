@@ -79,7 +79,10 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
 }
 // Per frame: map, scene colour, one SRV per display slot, then output, tiles, params, map, residual, the two temporal
 // anti-aliasing history UAVs and the learnt screen edges.
-constexpr unsigned slot_count = 32, ring_size = 8, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 10;
+// ring_size: descriptor sets in flight, one per upscaler call. With DLSS Frame Generation the sim calls the upscaler up to
+// three times per frame, and the GPU can be several frames behind the CPU (more so with the game in the background): a set
+// must not be rewritten while the GPU may still read it.
+constexpr unsigned slot_count = 32, ring_size = 32, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 10;
 constexpr unsigned bounds_cells = 64; // stable screen edges: cells per side of each screen texture's grid
 std::filesystem::path addon_directory;
 ID3D12Device* main_device = nullptr;
