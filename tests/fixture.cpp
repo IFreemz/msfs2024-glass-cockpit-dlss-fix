@@ -243,12 +243,13 @@ int main(int argc, char** argv) {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
         bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false,
-            ngx_proxy = false, extra_pass = false, motion = false;
+            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
             nested |= !std::strcmp(argv[i], "--nested");
             extra_pass |= !std::strcmp(argv[i], "--extra-pass");
+            fg_repeat |= !std::strcmp(argv[i], "--fg-repeat");
             optiscaler_fsr |= !std::strcmp(argv[i], "--optiscaler-fsr");
             ngx_proxy |= !std::strcmp(argv[i], "--ngx-proxy");
             motion |= !std::strcmp(argv[i], "--motion");
@@ -969,6 +970,16 @@ int main(int argc, char** argv) {
                     require(evaluate(list.Get(), nullptr, &extra, nullptr) == NVSDK_NGX_Result_Success, "evaluate (extra pass) failed");
                 }
                 require(evaluate(list.Get(), nullptr, &ngx, nullptr) == NVSDK_NGX_Result_Success, "evaluate failed");
+                // --fg-repeat: like the sim with DLSS Frame Generation, two more upscaler runs for the same frame into the
+                // same output, each replacing the picture (the fix must end up on the last one).
+                for (int again = 0; fg_repeat && again < 2; ++again) {
+                    transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION to{output.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{prefill_upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                    from.PlacedFootprint = out_rb.footprint;
+                    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                    transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    require(evaluate(list.Get(), nullptr, &ngx, nullptr) == NVSDK_NGX_Result_Success, "evaluate (repeat) failed");
+                }
             }
             transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             copy(list.Get(), output.Get(), out_rb);

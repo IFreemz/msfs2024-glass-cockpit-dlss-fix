@@ -39,6 +39,9 @@ try {
     # Another mod (RenoDX's DLSS add-on) runs an extra DLSS pass at the same render size first: the fix goes on the sim's own.
     & .\FlightSimulator2024.exe --extra-pass
     if ($LASTEXITCODE) { throw "Offline extra DLSS pass test failed ($LASTEXITCODE)" }
+    # DLSS Frame Generation: the sim runs the upscaler three times per frame into the same output; the fix must be on the last.
+    & .\FlightSimulator2024.exe --fg-repeat
+    if ($LASTEXITCODE) { throw "Offline frame generation repeat test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --fsr --vr --nested
     if ($LASTEXITCODE) { throw "Offline nested upscaler VR test failed ($LASTEXITCODE)" }
 } finally { Pop-Location }

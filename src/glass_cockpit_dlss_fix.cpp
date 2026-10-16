@@ -197,6 +197,7 @@ std::atomic<uint64_t> timestamp_frequency{0}; // of the queue the sim presents o
 constexpr UINT max_timed_calls = 256;
 
 struct Stats {
+    std::atomic<uint64_t> repeated_calls{0}; // upscaler calls repeated for a frame already fixed (frame generation)
     std::atomic<uint64_t> replays{0}, variant_pending{0}, unknown_texture{0}, unsupported_draw{0},
         composites{0}, composite_skipped{0}, evaluations{0}, fsr_dispatches{0}, display_draws{0}, display_pipelines{0},
         dlss_upscales{0}; // evaluations that upscale (have a render size); the others are DLSS Frame Generation
@@ -669,6 +670,14 @@ struct Map {
     UINT history_w = 0, history_h = 0;
     std::array<uint32_t, 8> history_parity{}, history_frames{};
     std::array<uint64_t, 8> history_present{}; // present count + 1 of each view's last history write (0 = none)
+    // With DLSS Frame Generation the sim runs the upscaler up to three times per frame into the same output, each run
+    // replacing the picture (and the fix with it). The map of the last fixed call is kept, and a repeated call for the
+    // same frame (same output, same camera jitter: a new frame always has another jitter) gets the fix again from it.
+    // Under composite_mutex; flat (one view) only.
+    ComPtr<ID3D12Resource> repeat_map;
+    const void* repeat_output = nullptr;
+    float repeat_jitter_x = 0, repeat_jitter_y = 0;
+    bool repeat_valid = false;
 };
 
 struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
@@ -1887,6 +1896,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
             return;
         }
     } while (!map->views.compare_exchange_weak(pending, pending - 1));
+    const bool fresh = pending > 0;
     const UINT layer = map->layers > 1 ? layer_for_call(map->layers - pending, map->layers, output) : 0; // VR: pending > 0 here
     const auto out = output->GetDesc(), in = colour->GetDesc();
     // Any float or UNORM colour output the compute pass can write (DLSS in MSFS: R11G11B10_FLOAT).
@@ -2031,6 +2041,16 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     }
     const UINT timed = measuring.load(std::memory_order_relaxed) && d.timestamps && d.timed_calls < max_timed_calls ? ++d.timed_calls : 0;
     if (timed) native->EndQuery(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2);
+    // Frame generation: a repeated upscaler call for the frame just fixed. Its screens were cleared from the map after the
+    // first call; put them back.
+    const bool repeat = !fresh && map->layers == 1 && map->repeat_valid && map->repeat_output == output &&
+        map->repeat_jitter_x == jitter_x && map->repeat_jitter_y == jitter_y;
+    if (repeat) {
+        transition(native, map->texture.Get(), map_resting, D3D12_RESOURCE_STATE_COPY_DEST);
+        native->CopyResource(map->texture.Get(), map->repeat_map.Get());
+        transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, map_resting);
+        if (stats.repeated_calls++ == 0) log("milestone repeated %s call for the same frame (frame generation): the fix is drawn again on it", u.name);
+    }
     if (!d.accumulators_zeroed) {
         native->SetPipelineState(d.passes[0].Get());
         native->Dispatch(1, 1, 1);
@@ -2060,6 +2080,26 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     }
     native->SetPipelineState(d.passes[3].Get());
     native->Dispatch((out_w + 7) / 8, (out_h + 7) / 8, 1);
+    if (fresh && map->layers == 1) {
+        if (!map->repeat_map) {
+            auto desc = map->texture->GetDesc();
+            desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&map->repeat_map))))
+                map->repeat_map = nullptr;
+        }
+        if (map->repeat_map) {
+            transition(native, map->texture.Get(), map_resting, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(native, map->repeat_map.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            native->CopyResource(map->repeat_map.Get(), map->texture.Get());
+            transition(native, map->repeat_map.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, map_resting);
+            map->repeat_valid = true;
+            map->repeat_output = output;
+            map->repeat_jitter_x = jitter_x;
+            map->repeat_jitter_y = jitter_y;
+        }
+    }
     transition(native, map->texture.Get(), map_resting, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     uav_barrier(native);
     native->SetPipelineState(d.passes[4].Get());
