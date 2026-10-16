@@ -226,11 +226,15 @@ bool edge_distance(uint slot, float2 uv, float2 dx, float2 dy, out float d, out 
 // learnt edges. Only where the screen really ends on the monitor: the picture can also end at a UV seam inside one
 // screen mesh (e.g. the FSS E-Jets' bezel band), where the screen goes on beyond it (the seam handling blends those).
 // -1: unknown (no learnt edges around).
-float edge_coverage(uint slot, float2 uv, float2 dx, float2 dy, float2 location)
+float edge_coverage(uint slot, float2 uv, float2 dx, float2 dy, float2 location, bool mixed)
 {
     float d;
     float2 toward;
     if (!edge_distance(slot, uv, dx, dy, d, toward)) return -1;
+    // A pixel partly off the screen on the monitor lies within about a render pixel of where the screen ends. No learnt
+    // edge that close: the screen's end isn't one in its texture (several screens share one texture, e.g. the A220, A340
+    // and A380 displays, and the texture beyond this one's edge belongs to another): leave the pixel to the usual handling.
+    if (mixed && d > 1 / min(map_per_output.x, map_per_output.y) + 0.5) return -1;
     if (d > 1.5) return 1;
     // One render pixel past the edge on the monitor: still this screen there means a seam, not its end; another
     // screen there means two textures meet within one display (e.g. the E-Jet PFD's halves): no gap to blend into.
@@ -674,7 +678,7 @@ void composite(uint3 id : SV_DispatchThreadID)
             }
             else
             {
-                float share = edge_coverage(map_slot(taps[k]), uv, dx, dy, location);
+                float share = edge_coverage(map_slot(taps[k]), uv, dx, dy, location, true);
                 if (share > 0.5) { a = taps[k]; coverage = share; edge_pixel = true; }
             }
         }
@@ -754,7 +758,7 @@ void composite(uint3 id : SV_DispatchThreadID)
         }
         if ((flags & 256) && seam_share == 0)
         {
-            float share = edge_coverage(map_slot(a), uv, dx, dy, location);
+            float share = edge_coverage(map_slot(a), uv, dx, dy, location, false);
             if (share >= 0) coverage = share;
         }
     }

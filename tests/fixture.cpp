@@ -381,7 +381,7 @@ int main(int argc, char** argv) {
 
         // Mesh, constants.
         // Vertices 1-6: the display quad; 7-12 and 13-18: its top and bottom halves, each showing a whole texture (join test).
-        std::array<Vertex, 37> vertices{};
+        std::array<Vertex, 61> vertices{};
         const float positions[6][2]{{-0.7f, 0.7f}, {0.7f, 0.7f}, {-0.7f, -0.7f}, {-0.7f, -0.7f}, {0.7f, 0.7f}, {0.7f, -0.7f}};
         for (size_t half = 0; half < 3; ++half)
             for (size_t i = 0; i < 6; ++i) {
@@ -400,6 +400,20 @@ int main(int argc, char** argv) {
             v = vertices[1 + i];
             v.uv[0] = 0.0371f + v.uv[0] * 0.9213f; v.uv[1] = 0.0529f + v.uv[1] * 0.8871f;
         }
+        // Atlas test: four screens cut from one texture (2 x 2, with gaps between them on the monitor), like the A220,
+        // A340 and A380, whose displays share one texture: every screen edge runs into texture another screen shows.
+        // Vertices 37-60.
+        for (size_t q = 0; q < 4; ++q)
+            for (size_t i = 0; i < 6; ++i) {
+                auto& v = vertices[37 + q * 6 + i];
+                const bool right = q & 1, lower = q >> 1;
+                const float x0 = right ? 0.05f : -0.7f, x1 = right ? 0.7f : -0.05f, y0 = lower ? -0.7f : 0.05f, y1 = lower ? -0.05f : 0.7f;
+                const float x = positions[i][0] > 0 ? x1 : x0, y = positions[i][1] > 0 ? y1 : y0;
+                v.position[0] = x; v.position[1] = y; v.position[2] = 0.4f; v.position[3] = 1;
+                v.tangent[0] = v.tangent[3] = v.normal[2] = 1;
+                v.uv[0] = (right ? 0.5f : 0.0f) + 0.5f * (x - x0) / (x1 - x0); v.uv[1] = (lower ? 0.5f : 0.0f) + 0.5f * (y1 - y) / (y1 - y0);
+                std::fill(std::begin(v.color), std::end(v.color), 1.0f);
+            }
         // Band test: a strip at the top edge (about two render pixels) whose texture coordinates all point at one spot.
         constexpr float band_bottom = 0.692f;
         for (size_t part = 0; part < 2; ++part)
@@ -701,10 +715,11 @@ int main(int argc, char** argv) {
             using Image = std::vector<std::array<float, 4>>;
             bool join = false;
             // The display as drawn: one quad, or (join) its two halves with their own textures.
-            bool band = false, inset = false;
+            bool band = false, inset = false, atlas = false;
             auto draw_display = [&] {
                 if (band) { list->DrawIndexedInstanced(6, 1, 0, 19, 0); list->DrawIndexedInstanced(6, 1, 0, 25, 0); return; }
                 if (inset) { list->DrawIndexedInstanced(6, 1, 0, 31, 0); return; }
+                if (atlas) { for (int q = 0; q < 4; ++q) list->DrawIndexedInstanced(6, 1, 0, 37 + q * 6, 0); return; }
                 if (!join) { list->DrawIndexedInstanced(6, 1, 0, 1, 0); return; }
                 list->SetGraphicsRootDescriptorTable(5, table);
                 list->DrawIndexedInstanced(6, 1, 0, 7, 0);
@@ -792,7 +807,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; };
             const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 2048}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
                 {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
@@ -817,7 +832,10 @@ int main(int argc, char** argv) {
                 {"still-inset-small", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 0.12f, true}, {"inset-small", 35, 0, 0.0002f, 0, 1, 0, 0, 1, false, false, 0, false, 0.12f, true},
                 {"still-inset-small-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 0.12f, true}, {"inset-small-edges-off", 35, 0, 0.0002f, 0, 0, 0, 0, 1, false, false, 0, false, 0.12f, true},
                 {"still-inset", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, true}, {"inset", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, true},
-                {"inset-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, false, false, 0, false, 1, true}};
+                {"inset-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, false, false, 0, false, 1, true},
+                // Screens sharing one texture (A220, A340, A380).
+                {"still-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true}, {"atlas", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true},
+                {"still-atlas-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, true}, {"atlas-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, true}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
@@ -847,7 +865,7 @@ int main(int argc, char** argv) {
                 set_calm(m.calm);
                 set_full_size(m.full_size);
                 set_temporal(0);
-                join = m.join; band = m.band; cursor = m.band; inset = m.inset;
+                join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas;
                 upload_display(0, join);
                 upload_display(0, join, true);
                 Image previous_out, previous_ideal;
