@@ -810,6 +810,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     // remainder has fine detail. The sharp glass detail itself comes from the upscaler's (temporally stable) picture.
     float3 smooth = 0, m1 = 0, m2 = 0, scene_low = 1e9, scene_high = -1e9;
     float smooth_weight = 0, count = 0, outline_weight = 0;
+    float3 outline_sum = 0, outline_m2 = 0;
     int2 centre = int2(floor(location));
     [loop] for (int j = 0; j < 64; ++j)
     {
@@ -817,10 +818,12 @@ void composite(uint3 id : SV_DispatchThreadID)
         if (any(q < 0) || any(q >= int2(map_size))) continue;
         float4 rv = residual[q];
         uint tag = uint(rv.w + 0.5);
-        if ((tag & 63) != slot + 1) continue;
+        // Any screen's pixels: the glass is one sheet, also where two screen textures meet within one display (e.g.
+        // the E-Jet PFD's halves); taken from this slot's alone, a small box at such a join has almost none.
+        if ((tag & 63) == 0) continue;
         float2 t = float2(q) - location;
         float w = exp(-dot(t, t) / (2 * 1.7 * 1.7));
-        if (tag & 64) { outline_weight += w; continue; }
+        if (tag & 64) { outline_weight += w; outline_sum += w * rv.rgb; outline_m2 += w * rv.rgb * rv.rgb; continue; }
         smooth += w * rv.rgb; m2 += w * rv.rgb * rv.rgb; smooth_weight += w; count += 1;
     }
     // Detail clamp range: what the sim drew in the 5x5 render pixels around this one (same display). A wider window
@@ -834,6 +837,13 @@ void composite(uint3 id : SV_DispatchThreadID)
             if (all(isfinite(y))) { scene_low = min(scene_low, y); scene_high = max(scene_high, y); }
         }
     float3 glass = offset.rgb;
+    // Hardly any pixels away from outlines around (text in a small box): use the outline pixels too, rather than
+    // a value from one or two pixels that changes every frame.
+    if (smooth_weight < 0.5 && outline_weight > 0)
+    {
+        float extra = outline_weight * saturate(1 - 2 * smooth_weight);
+        smooth += outline_sum * (extra / outline_weight); m2 += outline_m2 * (extra / outline_weight); smooth_weight += extra;
+    }
     if (smooth_weight > 1e-3)
     {
         glass = smooth / smooth_weight;
