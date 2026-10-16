@@ -1,0 +1,18 @@
+; Exports of the system's dxgi.dll that the fix passes through when installed as dxgi.dll (see dxgi_proxy.cpp).
+EXPORTS
+    CreateDXGIFactory PRIVATE
+    CreateDXGIFactory1 PRIVATE
+    CreateDXGIFactory2 PRIVATE
+
+    DXGID3D10CreateDevice PRIVATE
+    DXGID3D10CreateLayeredDevice PRIVATE
+    DXGID3D10ETWRundown PRIVATE
+    DXGID3D10GetLayeredDeviceSize PRIVATE
+    DXGID3D10RegisterLayers PRIVATE
+
+    CompatValue PRIVATE
+    CompatString PRIVATE
+    DXGIDumpJournal PRIVATE
+    DXGIDeclareAdapterRemovalSupport PRIVATE
+    DXGIGetDebugInterface1 PRIVATE
+    DXGIReportAdapterConfiguration PRIVATE

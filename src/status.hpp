@@ -1,10 +1,10 @@
-// State shared between the add-on and its ReShade status panel (status_panel.cpp).
+// State shared between the fix, its status file (status_report.cpp) and the add-on's ReShade overlay tab (status_panel.cpp).
 #pragma once
 #include <cstdint>
 #include <string>
 
 namespace glass {
-// Experimental fixes (panel section of the same name).
+// Experimental fixes ([experimental] in the settings file, a section of the overlay tab).
 struct Experimental {
     int detail_clamp = 0, edge_fade = 0, angle_softening = 0, edge_stretch = 0; // percent / hundredths of a render pixel
     int dark_screens = 0; // dark screen fix on/off
@@ -20,6 +20,7 @@ struct Experimental {
 };
 
 struct Status {
+    bool addon = false; // the ReShade add-on (settings also in its overlay tab), not the standalone dxgi.dll
     std::string gpu, driver, dlss_version, fsr_version;
     bool gpu_known = false, nvidia = false, dlss_loaded = false, fsr_loaded = false, shader_found = false;
     bool enabled = false, tint = false, jitter_positive = false, active = false, extra_smoothing = false;
@@ -37,13 +38,20 @@ void set_enabled(bool on);
 void set_tint(bool on);
 void request_capture();
 void request_pixel_probe();
+// Changed in the overlay tab; saved to the settings file.
 void set_jitter_positive(bool on);
 void set_line_smoothing(int percent);
 void set_extra_smoothing(bool on);
 void set_glass_strength(int percent);
 void set_experimental(const Experimental& e);
 
-// The panel only needs ReShade's Dear ImGui; if this ReShade build has no compatible ImGui, the fix still runs.
+// One line on what the fix is doing ("Working: fixing 4 screens ..."), and the report to paste into bug reports.
+std::string status_summary(const Status& s);
+std::string status_report(const Status& s);
+// The text of glass-cockpit-dlss-fix-status.txt: summary, checks, settings and the report.
+std::string status_text(const Status& s);
+
+// The overlay tab only needs ReShade's Dear ImGui; if this ReShade build has no compatible ImGui, the fix still runs.
 bool init_status_panel(void* reshade_module);
 void uninit_status_panel();
 }

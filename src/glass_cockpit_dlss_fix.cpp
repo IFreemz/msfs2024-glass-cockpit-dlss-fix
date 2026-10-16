@@ -1,6 +1,11 @@
-// Glass Cockpit DLSS Fix - ReShade add-on for Microsoft Flight Simulator 2024.
-// Removes DLSS ghosting/smearing from glass cockpit displays by redrawing their content after DLSS.
+// Glass Cockpit DLSS Fix for Microsoft Flight Simulator 2024. Removes DLSS ghosting/smearing from glass cockpit displays
+// by redrawing their content after DLSS.
 // https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix  (MIT license)
+//
+// This file is the fix itself. It is built two ways, which differ only in how the fix gets loaded (host.hpp):
+// - standalone: dxgi.dll next to the sim, no ReShade needed (dxgi_proxy.cpp);
+// - ReShade add-on: glass-cockpit-dlss-fix.addon64, with a status and settings tab in ReShade's overlay
+//   (reshade_addon.cpp, status_panel.cpp).
 //
 // 1. Every cockpit display draw (MSFS display shader, VS f102f1e3f5d9f66f / PS 37e87c938bc76310) is drawn once more
 //    into a private render-resolution "UV map" (uv, depth, display slot) using the game's own vertex shader,
@@ -9,15 +14,16 @@
 //    DLSS input colour, sample the clean display texture at output resolution (jitter removed) and write it over the
 //    DLSS output. Dirt, glare and shadows on the glass come from the DLSS output itself, clamped to this frame's
 //    local range so that trails of old screen content are removed.
-// Hotkeys: Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint (shows coverage). Flip jitter direction is in the panel only
-// (a hotkey between those two was too easy to hit by accident).
+// The draws, bindings and views it needs are followed with hooks on the D3D12 runtime's own functions (see "D3D12
+// hooks" below), the same in both builds: under ReShade they sit below ReShade's own wrappers.
+// Hotkeys: Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint (shows coverage), Ctrl+Shift+F8 capture. Everything else is
+// in glass-cockpit-dlss-fix.ini next to the DLL, re-read while the sim runs (and in the overlay tab of the add-on).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <psapi.h>
-#include <reshade.hpp>
 #include <MinHook.h>
 #include "ngx_interface.hpp"
 #include "ffx_interface.hpp"
@@ -48,10 +54,10 @@
 #include <vector>
 #include "pipeline_clone.hpp"
 #include "overlay_shaders.h"
+#include "host.hpp"
 #include "status.hpp"
 #include "version.h"
 
-namespace api = reshade::api;
 using Microsoft::WRL::ComPtr;
 
 size_t graphics_pipeline_slot();
@@ -59,6 +65,33 @@ size_t pipeline_stream_slot();
 size_t copy_descriptors_slot();
 size_t copy_descriptors_simple_slot();
 size_t create_descriptor_heap_slot();
+size_t create_root_signature_slot();
+size_t create_srv_slot();
+size_t create_uav_slot();
+size_t create_rtv_slot();
+size_t create_command_list_slot();
+size_t create_command_list1_slot();
+size_t create_command_signature_slot();
+size_t list_reset_slot();
+size_t list_clear_state_slot();
+size_t list_draw_slot();
+size_t list_draw_indexed_slot();
+size_t list_copy_texture_region_slot();
+size_t list_set_pipeline_state_slot();
+size_t list_set_graphics_root_signature_slot();
+size_t list_set_graphics_root_table_slot();
+size_t list_set_render_targets_slot();
+size_t list_begin_render_pass_slot();
+size_t list_end_render_pass_slot();
+size_t list_set_scissor_rects_slot();
+size_t list_execute_indirect_slot();
+size_t factory_create_swapchain_slot();
+size_t factory_create_swapchain_hwnd_slot();
+size_t factory_create_swapchain_core_window_slot();
+size_t factory_create_swapchain_composition_slot();
+size_t swapchain_present_slot();
+size_t swapchain_present1_slot();
+
 
 namespace {
 // MSFS 2024 cockpit display shader pair (replaced by the stand-in shaders' hashes in the offline test host).
@@ -84,13 +117,22 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
 // must not be rewritten while the GPU may still read it.
 constexpr unsigned slot_count = 32, ring_size = 32, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 12; // + depth (t34), capture (u11)
 constexpr unsigned bounds_cells = 64; // stable screen edges: cells per side of each screen texture's grid
-std::filesystem::path addon_directory;
+std::filesystem::path addon_directory; // the folder this DLL is in (the sim's): log, settings, captures
 ID3D12Device* main_device = nullptr;
 struct DeviceState;
 DeviceState* main_state = nullptr; // the main device's state (the offline test host's cost tick)
 uint64_t init_tick = 0;
 
+// Loaded by ReShade as its add-on (reshade_addon.cpp) rather than as dxgi.dll (dxgi_proxy.cpp).
+bool reshade_addon = false;
+const char* edition() { return reshade_addon ? "ReShade add-on" : "standalone"; }
+
 std::atomic<bool> enabled{true}, jitter_positive{true}, tint{false};
+// Standalone: the ReShade add-on build of this fix is loaded as well. It does the work, this copy stays off.
+std::atomic<bool> duplicate_fix{false};
+// The process is exiting (DLL_PROCESS_DETACH): the hooks pass everything straight through from then on, since the
+// fix's own state is being torn down while other modules may still release Direct3D objects.
+std::atomic<bool> shutting_down{false};
 // Experimental fixes (panel section of the same name): detail clamp and angle softening in percent, edge fade and edge
 // stretcher and edge trim in hundredths of a render pixel.
 constexpr int default_detail_clamp = 0, max_edge_fade = 250, max_edge_stretch = 400, max_edge_trim = 400;
@@ -132,18 +174,21 @@ std::atomic<uint32_t> generation{1};
 FILE* logfile = nullptr;
 std::filesystem::path log_file_path; // the log this session writes (glass-cockpit-dlss-fix.log, or a fallback name)
 std::mutex log_mutex;
-void log(const char* format, ...) {
+void log_args(const char* format, va_list args) {
     std::lock_guard lock(log_mutex);
     if (!logfile) return;
     SYSTEMTIME t; GetLocalTime(&t);
     fprintf(logfile, "%02u:%02u:%02u ", t.wHour, t.wMinute, t.wSecond);
-    va_list args; va_start(args, format); vfprintf(logfile, format, args); va_end(args);
+    vfprintf(logfile, format, args);
     fputc('\n', logfile); fflush(logfile);
+}
+void log(const char* format, ...) {
+    va_list args; va_start(args, format); log_args(format, args); va_end(args);
 }
 
 constexpr const char* overlay_version = GLASS_VERSION_STRING;
 
-// Shown in the ReShade status panel.
+// Shown in the status file (glass-cockpit-dlss-fix-status.txt).
 std::mutex info_mutex;
 std::string gpu_name, gpu_driver, dlss_version, fsr_version;
 std::atomic<const char*> last_upscaler{"DLSS"};
@@ -164,7 +209,7 @@ void note(std::atomic<uint64_t>& counter, const char* reason) {
 // Logs a message only the first time (milestones and one-off warnings).
 #define LOG_ONCE(...) do { static std::atomic<bool> logged_{false}; if (!logged_.exchange(true)) log(__VA_ARGS__); } while (0)
 
-// Cost diagnostics: every 10 s the add-on's own CPU time (inside ReShade's events and the D3D12/upscaler hooks) and GPU
+// Cost diagnostics: every 10 s the fix's own CPU time (inside the D3D12/upscaler hooks) and GPU
 // time (the passes after the upscaler) are measured over 120 frames and logged. Off in between: one relaxed load per event.
 enum CpuSlot { cpu_draws, cpu_binds, cpu_targets, cpu_passes, cpu_views, cpu_copies, cpu_descriptors, cpu_composite, cpu_slots };
 constexpr const char* cpu_slot_names[cpu_slots]{"draws", "binds", "targets", "passes", "views", "copies", "descriptors", "composite"};
@@ -408,10 +453,17 @@ ID3D12PipelineState* variant(DisplayPipeline* pipeline, unsigned slot) {
     return nullptr;
 }
 
+std::shared_mutex hashes_mutex;
+std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> pipeline_hashes; // pso -> vs, ps (probes)
+
 void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D12PipelineState* pso,
     const D3D12_VIEW_INSTANCING_DESC& views = {}) noexcept try {
     if (!desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode) return;
     const auto ps = shader_hash(desc.PS.pShaderBytecode, desc.PS.BytecodeLength), vs = shader_hash(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
+    {
+        std::unique_lock lock(hashes_mutex);
+        if (pipeline_hashes.size() < 65536) pipeline_hashes[reinterpret_cast<uint64_t>(pso)] = {vs, ps};
+    }
     if (views.ViewInstanceCount > 1) return; // view-instanced pipelines: not how MSFS draws its displays
     const bool vr = vs == vr_display_vs && (ps == vr_display_ps || ps == vr_display_ps_t0);
     const bool screen_t0 = (ps == display_ps_t0 && vs == display_vs) || (ps == vr_display_ps_t0 && vs == vr_display_vs);
@@ -621,14 +673,55 @@ void track_copy(uintptr_t dest, uintptr_t source, UINT count) {
     if (out < in || out >= in + count) for (UINT i = 0; i < count; ++i) out[i].store(in[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
     else for (UINT i = count; i-- > 0;) out[i].store(in[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
 }
+
+// Render target views: the texture each RTV descriptor points at (a draw's render target size and layers).
+std::shared_mutex rtv_mutex;
+std::unordered_map<SIZE_T, ID3D12Resource*> rtv_resources;
+UINT rtv_size = 0; // RTV descriptor increment of the main device
+ID3D12Resource* rtv_resource(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    std::shared_lock lock(rtv_mutex);
+    const auto found = rtv_resources.find(handle.ptr);
+    return found != rtv_resources.end() ? found->second : nullptr;
+}
+void copy_rtvs(SIZE_T dest, SIZE_T source, UINT count) {
+    std::unique_lock lock(rtv_mutex);
+    for (UINT i = 0; i < count; ++i) {
+        const auto found = rtv_resources.find(source + SIZE_T(i) * rtv_size);
+        rtv_resources[dest + SIZE_T(i) * rtv_size] = found != rtv_resources.end() ? found->second : nullptr;
+    }
+}
+
+// Shader-visible CBV/SRV/UAV heaps by GPU address: where the descriptors of a bound descriptor table are.
+struct GpuHeap { uint64_t gpu_end = 0; SIZE_T cpu_start = 0; };
+std::shared_mutex gpu_heaps_mutex;
+std::map<uint64_t, GpuHeap> gpu_heaps; // GPU start -> end, CPU start
+void register_gpu_heap(ID3D12DescriptorHeap* heap, UINT count) {
+    const uint64_t start = heap->GetGPUDescriptorHandleForHeapStart().ptr, end = start + uint64_t(count) * descriptor_size;
+    std::unique_lock lock(gpu_heaps_mutex);
+    std::erase_if(gpu_heaps, [&](const auto& h) { return h.first < end && h.second.gpu_end > start; }); // released heaps there
+    gpu_heaps[start] = {end, heap->GetCPUDescriptorHandleForHeapStart().ptr};
+}
+// CPU address of the descriptor at `offset` in the descriptor table that starts at GPU handle `table`, or 0.
+uintptr_t descriptor_address(uint64_t table, uint32_t offset) {
+    std::shared_lock lock(gpu_heaps_mutex);
+    auto it = gpu_heaps.upper_bound(table);
+    if (it == gpu_heaps.begin()) return 0;
+    --it;
+    const uint64_t at = table + uint64_t(offset) * descriptor_size;
+    if (at >= it->second.gpu_end) return 0;
+    return uintptr_t(it->second.cpu_start + SIZE_T(at - it->first));
+}
+
 using CreateHeap = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*, REFIID, void**);
 CreateHeap original_create_heap = nullptr;
 HRESULT STDMETHODCALLTYPE create_heap_hook(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** heap) {
     const HRESULT hr = original_create_heap(device, desc, riid, heap);
-    if (SUCCEEDED(hr) && heap && *heap && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device == main_device) {
+    if (SUCCEEDED(hr) && !shutting_down.load(std::memory_order_relaxed) && heap && *heap && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device == main_device) {
         ComPtr<ID3D12DescriptorHeap> created;
-        if (SUCCEEDED(static_cast<IUnknown*>(*heap)->QueryInterface(IID_PPV_ARGS(&created))))
-            register_heap(created->GetCPUDescriptorHandleForHeapStart().ptr, desc->NumDescriptors);
+        if (SUCCEEDED(static_cast<IUnknown*>(*heap)->QueryInterface(IID_PPV_ARGS(&created)))) {
+            if (track_descriptors.load(std::memory_order_relaxed)) register_heap(created->GetCPUDescriptorHandleForHeapStart().ptr, desc->NumDescriptors);
+            if (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) register_gpu_heap(created.Get(), desc->NumDescriptors);
+        }
     }
     return hr;
 }
@@ -640,6 +733,8 @@ Copy original_copy = nullptr;
 void STDMETHODCALLTYPE copy_simple_hook(ID3D12Device* device, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE dest, D3D12_CPU_DESCRIPTOR_HANDLE source,
     D3D12_DESCRIPTOR_HEAP_TYPE type) {
     original_copy_simple(device, count, dest, source, type);
+    if (shutting_down.load(std::memory_order_relaxed)) return;
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV) { if (device == main_device) copy_rtvs(dest.ptr, source.ptr, count); return; }
     if (!track_descriptors.load(std::memory_order_relaxed)) return; // NVIDIA: screens are identified without tracking
     CpuScope scope(cpu_descriptors);
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device == main_device) track_copy(dest.ptr, source.ptr, count);
@@ -647,15 +742,19 @@ void STDMETHODCALLTYPE copy_simple_hook(ID3D12Device* device, UINT count, D3D12_
 void STDMETHODCALLTYPE copy_hook(ID3D12Device* device, UINT dest_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts, const UINT* dest_sizes,
     UINT source_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* source_starts, const UINT* source_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     original_copy(device, dest_ranges, dest_starts, dest_sizes, source_ranges, source_starts, source_sizes, type);
-    if (!track_descriptors.load(std::memory_order_relaxed)) return; // NVIDIA: screens are identified without tracking
+    if (shutting_down.load(std::memory_order_relaxed)) return;
+    const bool rtv = type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    if (!rtv && !track_descriptors.load(std::memory_order_relaxed)) return; // NVIDIA: screens are identified without tracking
     CpuScope scope(cpu_descriptors);
-    if (type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || device != main_device || !dest_starts || !source_starts) return;
+    if ((!rtv && type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) || device != main_device || !dest_starts || !source_starts) return;
+    const SIZE_T size = rtv ? rtv_size : descriptor_size;
     // Both sides are lists of ranges with the same total length; walk them together.
     UINT d = 0, s = 0, d_done = 0, s_done = 0;
     while (d < dest_ranges && s < source_ranges) {
         const UINT d_size = dest_sizes ? dest_sizes[d] : 1, s_size = source_sizes ? source_sizes[s] : 1;
         const UINT n = std::min(d_size - std::min(d_done, d_size), s_size - std::min(s_done, s_size));
-        if (n) track_copy(dest_starts[d].ptr + SIZE_T(d_done) * descriptor_size, source_starts[s].ptr + SIZE_T(s_done) * descriptor_size, n);
+        if (n && rtv) copy_rtvs(dest_starts[d].ptr + SIZE_T(d_done) * size, source_starts[s].ptr + SIZE_T(s_done) * size, n);
+        else if (n) track_copy(dest_starts[d].ptr + SIZE_T(d_done) * size, source_starts[s].ptr + SIZE_T(s_done) * size, n);
         d_done += n; s_done += n;
         if (d_done >= d_size) { ++d; d_done = 0; }
         if (s_done >= s_size) { ++s; s_done = 0; }
@@ -673,13 +772,31 @@ bool read_bytes(const void* source, void* destination, size_t size) {
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-bool rgba8(api::format format) {
+bool rgba8(DXGI_FORMAT format) {
     switch (format) {
-    case api::format::r8g8b8a8_typeless: case api::format::r8g8b8a8_unorm: case api::format::r8g8b8a8_unorm_srgb:
-    case api::format::b8g8r8a8_typeless: case api::format::b8g8r8a8_unorm: case api::format::b8g8r8a8_unorm_srgb: return true;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return true;
     default: return false;
     }
 }
+// The typed format a typeless one is read as ("unorm" or "float"); typed formats stay as they are (sRGB too).
+DXGI_FORMAT typed(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_FLOAT;
+    case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
+    case DXGI_FORMAT_R32G32B32_TYPELESS: return DXGI_FORMAT_R32G32B32_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    default: return format;
+    }
+}
+bool typeless(DXGI_FORMAT format) { return typed(format) != format; }
 
 int slot_of(ID3D12Resource* resource, DXGI_FORMAT format) {
     const auto now = present_count.load(std::memory_order_relaxed);
@@ -778,8 +895,8 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
 };
 
 struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
-    api::command_list* list = nullptr;
-    DeviceState* device = nullptr;
+    ID3D12GraphicsCommandList* native = nullptr;
+    DeviceState* device = nullptr; // null: a list of another device (e.g. the sim's software device), not followed
     DisplayPipeline* display = nullptr;
     uint64_t pso = 0, layout = 0;
     std::array<uint64_t, 64> tables{};
@@ -839,12 +956,32 @@ void install_ngx_proxies();
 void install_ffx();
 
 // ---------------------------------------------------------------------------------------------------------------
-// ReShade events.
-void on_init_device(api::device* device) {
-    if (device->get_api() != api::device_api::d3d12) return;
+// D3D12 hooks. What the sim records (pipelines, root signatures, views, bindings, render targets, draws) is followed
+// through hooks on the D3D12 runtime's own functions, installed when the sim creates its device. Every caller goes
+// through them, other mods' wrappers included: under ReShade (the add-on build, or ReShade installed for its effects)
+// they see what ReShade's wrappers pass on to the runtime. They took the place of ReShade's add-on events, which earlier
+// versions of the add-on used; the handlers below behave as those did.
+void install_d3d12_hooks(ID3D12Device* device);
+void install_dxgi_hooks(IUnknown* factory);
+void install_upscaler_hooks();
+
+// The fix's own D3D12 calls (the map draw, its views, the compute passes, captures) go through the same hooked
+// functions: they pass straight through while this is set on the calling thread.
+thread_local int internal_calls = 0;
+bool passthrough() { return internal_calls || shutting_down.load(std::memory_order_relaxed); }
+struct Internal {
+    Internal() { ++internal_calls; }
+    ~Internal() { --internal_calls; }
+    Internal(const Internal&) = delete;
+    Internal& operator=(const Internal&) = delete;
+};
+
+std::mutex device_mutex;
+void device_created(ID3D12Device* native) noexcept try {
+    std::lock_guard lock(device_mutex);
+    if (native == main_device) return; // the same device again: D3D12 keeps one device per adapter
     // Only the game's hardware device: MSFS also creates a WARP (software) device for a helper window,
     // whose descriptors have a different size and must not be mixed with the GPU's.
-    const auto native = reinterpret_cast<ID3D12Device*>(device->get_native());
     const auto size = native->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     bool software = false;
     ComPtr<IDXGIFactory4> factory; ComPtr<IDXGIAdapter1> adapter; DXGI_ADAPTER_DESC1 adapter_desc{};
@@ -858,7 +995,7 @@ void on_init_device(api::device* device) {
             known ? HIWORD(driver.HighPart) : 0, known ? LOWORD(driver.HighPart) : 0, known ? HIWORD(driver.LowPart) : 0, known ? LOWORD(driver.LowPart) : 0);
         if (adapter_desc.VendorId != 0x10de) log("note not an NVIDIA GPU: DLSS is unavailable, select FSR in the sim's graphics settings");
         {
-            std::lock_guard lock(info_mutex);
+            std::lock_guard info_lock(info_mutex);
             gpu_name = utf8(adapter_desc.Description);
             char text[64]{};
             if (known) snprintf(text, sizeof(text), "%u.%u.%u.%u", HIWORD(driver.HighPart), LOWORD(driver.HighPart), HIWORD(driver.LowPart), LOWORD(driver.LowPart));
@@ -871,171 +1008,77 @@ void on_init_device(api::device* device) {
         log("device_ignored native=%p software=%d descriptor_size=%u", native, software, size);
         return;
     }
-    auto state = device->create_private_data<DeviceState>();
+    // Kept for the session, like the device itself (the fix's own objects on it keep it alive).
+    auto state = new DeviceState;
     state->native = native;
     descriptor_size = size;
-    main_device = native;
-    main_state = state;
-    D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
-    state->native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&state->scratch));
-    const auto table = *reinterpret_cast<void***>(state->native);
-    bool hooked = hook(table[graphics_pipeline_slot()], reinterpret_cast<void*>(&graphics_hook), original_graphics);
-    ComPtr<ID3D12Device2> device2;
-    if (SUCCEEDED(state->native->QueryInterface(IID_PPV_ARGS(&device2))))
-        hooked &= hook((*reinterpret_cast<void***>(device2.Get()))[pipeline_stream_slot()], reinterpret_cast<void*>(&stream_hook), original_stream);
-    track_descriptors = !gpu_nvidia || force_tracking;
-    if (track_descriptors) {
-        if (!texture_ids) texture_ids = std::make_unique<TextureId[]>(max_texture_ids);
-        const bool tracking = hook(table[create_descriptor_heap_slot()], reinterpret_cast<void*>(&create_heap_hook), original_create_heap) &&
-            hook(table[copy_descriptors_slot()], reinterpret_cast<void*>(&copy_hook), original_copy) &&
-            hook(table[copy_descriptors_simple_slot()], reinterpret_cast<void*>(&copy_simple_hook), original_copy_simple);
-        log("descriptor tracking hooks=%d (screen textures are followed through descriptor copies)", tracking);
-    }
-    log("device native=%p pso_hooks=%d descriptor_size=%u", state->native, hooked, descriptor_size);
-    install_ngx();
-    install_ngx_proxies();
-    install_ffx();
-}
-std::shared_mutex hashes_mutex;
-std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> pipeline_hashes; // pso -> vs, ps (VR probe)
-
-void on_init_pipeline(api::device*, api::pipeline_layout, uint32_t count, const api::pipeline_subobject* subobjects, api::pipeline pipeline) {
-    uint64_t vs = 0, ps = 0;
-    for (uint32_t i = 0; i < count; ++i) {
-        const auto& o = subobjects[i];
-        if (!o.data || !o.count) continue;
-        const auto& shader = *static_cast<const api::shader_desc*>(o.data);
-        if (o.type == api::pipeline_subobject_type::vertex_shader && shader.code) vs = shader_hash(shader.code, shader.code_size);
-        if (o.type == api::pipeline_subobject_type::pixel_shader && shader.code) ps = shader_hash(shader.code, shader.code_size);
-    }
-    if (vs || ps) {
-        std::unique_lock lock(hashes_mutex);
-        if (pipeline_hashes.size() < 65536) pipeline_hashes[pipeline.handle] = {vs, ps};
-    }
-    if (ps != display_ps || find_pipeline(pipeline.handle)) return;
-    static std::atomic<int> logged{0};
-    if (logged++ >= 16) return;
-    char types[128]{};
-    for (uint32_t i = 0; i < count && i < 24; ++i) snprintf(types + strlen(types), sizeof(types) - strlen(types), " %u", unsigned(subobjects[i].type));
-    log("display_pipeline_missed pso=%p vs=%016llx display_vs=%d subobjects:%s", reinterpret_cast<void*>(pipeline.handle), vs, vs == display_vs, types);
-}
-
-void on_destroy_device(api::device* device) {
-    if (auto state = device->get_private_data<DeviceState>()) {
-        if (main_state == state) main_state = nullptr;
-        device->destroy_private_data<DeviceState>();
-    }
-}
-
-void on_init_layout(api::device* device, uint32_t count, const api::pipeline_layout_param* params, api::pipeline_layout layout) {
-    auto state = device->get_private_data<DeviceState>();
-    if (!state) return;
+    rtv_size = native->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     {
-        std::vector<DeviceState::SrvRange> found;
-        for (uint32_t i = 0; i < count && i < 64; ++i) {
-            const api::descriptor_range* ranges = nullptr; uint32_t range_count = 0;
-            if (params[i].type == api::pipeline_layout_param_type::descriptor_table) { ranges = params[i].descriptor_table.ranges; range_count = params[i].descriptor_table.count; }
-            else if (params[i].type == api::pipeline_layout_param_type::descriptor_table_with_static_samplers) {
-                ranges = params[i].descriptor_table_with_static_samplers.ranges; range_count = params[i].descriptor_table_with_static_samplers.count;
-            } else continue;
-            for (uint32_t j = 0; j < range_count; ++j)
-                if (ranges[j].type == api::descriptor_type::texture_shader_resource_view && (ranges[j].visibility & api::shader_stage::pixel) != api::shader_stage{})
-                    found.push_back({i, ranges[j].binding, ranges[j].dx_register_index, ranges[j].dx_register_space, std::min<uint32_t>(ranges[j].count, 16)});
-        }
-        if (!found.empty()) { std::unique_lock lock(state->layouts_mutex); state->srv_ranges[layout.handle] = std::move(found); }
+        Internal internal;
+        D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&state->scratch));
     }
+    track_descriptors = !gpu_nvidia || force_tracking;
+    if (track_descriptors && !texture_ids) texture_ids = std::make_unique<TextureId[]>(max_texture_ids);
+    main_state = state;
+    main_device = native;
+    install_d3d12_hooks(native);
+    if (track_descriptors) log("descriptor tracking on (screen textures are followed through descriptor copies)");
+    log("device native=%p descriptor_size=%u", native, descriptor_size);
+    install_upscaler_hooks();
+} catch (...) { log("device_exception"); }
+
+// Root signatures: where each one has the display shader's screen texture (t0, t1) and the pixel shader's other
+// texture ranges (screen probe). Version 1.0 and 1.1+ root signatures differ only in their range and parameter types.
+template <class Parameter> void layout_created(DeviceState& state, uint64_t layout, UINT count, const Parameter* params) {
+    std::vector<DeviceState::SrvRange> found;
     // Where t0 and t1 (pixel shader, space 0) sit: the display shader reads its screen from t1, the variant from t0.
     std::array<std::pair<uint32_t, uint32_t>, 2> bindings{};
-    std::array<bool, 2> found{};
-    for (uint32_t i = 0; i < count && i < 64; ++i) {
-        const api::descriptor_range* ranges = nullptr; uint32_t range_count = 0;
-        if (params[i].type == api::pipeline_layout_param_type::descriptor_table || params[i].type == api::pipeline_layout_param_type::push_descriptors_with_ranges) {
-            ranges = params[i].descriptor_table.ranges; range_count = params[i].descriptor_table.count;
-        } else if (params[i].type == api::pipeline_layout_param_type::descriptor_table_with_static_samplers) {
-            ranges = params[i].descriptor_table_with_static_samplers.ranges; range_count = params[i].descriptor_table_with_static_samplers.count;
-        } else continue;
-        for (uint32_t j = 0; j < range_count; ++j) {
-            const auto& r = ranges[j];
-            if (r.type != api::descriptor_type::texture_shader_resource_view || r.dx_register_space || (r.visibility & api::shader_stage::pixel) == api::shader_stage{}) continue;
+    std::array<bool, 2> have{};
+    for (UINT i = 0; i < count && i < 64; ++i) {
+        const auto& p = params[i];
+        if (p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
+            (p.ShaderVisibility != D3D12_SHADER_VISIBILITY_ALL && p.ShaderVisibility != D3D12_SHADER_VISIBILITY_PIXEL)) continue;
+        uint32_t next = 0; // where a range declared with D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND starts
+        for (UINT j = 0; j < p.DescriptorTable.NumDescriptorRanges; ++j) {
+            const auto& r = p.DescriptorTable.pDescriptorRanges[j];
+            const uint32_t offset = r.OffsetInDescriptorsFromTableStart == UINT(D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND) ? next : r.OffsetInDescriptorsFromTableStart;
+            if (r.NumDescriptors != UINT_MAX) next = offset + r.NumDescriptors; // only the last range of a table may be unbounded
+            if (r.RangeType != D3D12_DESCRIPTOR_RANGE_TYPE_SRV) continue;
+            found.push_back({i, offset, r.BaseShaderRegister, r.RegisterSpace, std::min<uint32_t>(r.NumDescriptors, 16)});
+            if (r.RegisterSpace) continue;
             for (uint32_t reg = 0; reg < 2; ++reg)
-                if (!found[reg] && r.dx_register_index <= reg && uint64_t(r.dx_register_index) + r.count > reg) {
-                    bindings[reg] = {i, r.binding + reg - r.dx_register_index};
-                    found[reg] = true;
+                if (!have[reg] && r.BaseShaderRegister <= reg && uint64_t(r.BaseShaderRegister) + r.NumDescriptors > reg) {
+                    bindings[reg] = {i, offset + reg - r.BaseShaderRegister};
+                    have[reg] = true;
                 }
         }
     }
-    if (found[1]) { // every cockpit display layout has t1; t0 is checked when used
-        std::unique_lock lock(state->layouts_mutex);
-        state->display_bindings[layout.handle] = found[0] ? bindings : std::array<std::pair<uint32_t, uint32_t>, 2>{{{UINT32_MAX, 0}, bindings[1]}};
+    if (!found.empty()) { std::unique_lock lock(state.layouts_mutex); state.srv_ranges[layout] = std::move(found); }
+    if (have[1]) { // every cockpit display layout has t1; t0 is checked when used
+        std::unique_lock lock(state.layouts_mutex);
+        state.display_bindings[layout] = have[0] ? bindings : std::array<std::pair<uint32_t, uint32_t>, 2>{{{UINT32_MAX, 0}, bindings[1]}};
     }
 }
+void root_signature_created(const void* blob, SIZE_T size, ID3D12RootSignature* root) noexcept try {
+    auto state = main_state;
+    if (!state) return;
+    ComPtr<ID3D12VersionedRootSignatureDeserializer> reader;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
+    if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&reader)))) desc = reader->GetUnconvertedRootSignatureDesc();
+    if (!desc) {
+        LOG_ONCE("note a root signature could not be read (its draws are not inspected)");
+        return;
+    }
+    const auto layout = reinterpret_cast<uint64_t>(root);
+    // Versions 1.1 and 1.2 have the same parameters (1.2 only adds to static samplers).
+    if (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) layout_created(*state, layout, desc->Desc_1_0.NumParameters, desc->Desc_1_0.pParameters);
+    else layout_created(*state, layout, desc->Desc_1_1.NumParameters, desc->Desc_1_1.pParameters);
+} catch (...) {}
 
-void on_init_view(api::device* device, api::resource resource, api::resource_usage usage, const api::resource_view_desc& desc, api::resource_view view) {
-    CpuScope scope(cpu_views);
-    if (track_descriptors.load(std::memory_order_relaxed) && view.handle) set_tracked(uintptr_t(view.handle), 0); // a new view replaces what was there
-    // A default view (null D3D12 view desc) arrives with type/format "unknown".
-    if (usage != api::resource_usage::shader_resource || !resource.handle ||
-        (desc.type != api::resource_view_type::unknown && desc.type != api::resource_view_type::texture_2d &&
-         desc.type != api::resource_view_type::texture_2d_array)) return;
-    auto state = device->get_private_data<DeviceState>();
-    if (!state || !state->scratch || descriptor_size > 32) return;
-    const auto r = device->get_resource_desc(resource);
-    if (r.type == api::resource_type::texture_2d && view.handle) {
-        Signature d{};
-        if (read_bytes(reinterpret_cast<const void*>(view.handle), d.bytes.data(), descriptor_size)) {
-            std::lock_guard lock(diag_mutex);
-            if (diag_views.size() >= 262144) diag_views.clear();
-            diag_views[d] = {uint32_t(r.texture.width), r.texture.height, uint32_t(r.texture.format), uint32_t(r.usage),
-                uint16_t(r.texture.depth_or_layers), uint16_t(r.texture.samples), uint16_t(r.texture.levels)};
-        }
-    }
-    // Cockpit screens are plain single-sample 2D textures.
-    if (r.type != api::resource_type::texture_2d || r.texture.samples != 1 || r.texture.depth_or_layers != 1 ||
-        r.texture.width < 64 || r.texture.height < 64) return;
-    // Only RGBA8 colour textures the GPU writes (render target or UAV), the kind cockpit screens are. Recreating views
-    // of other textures (depth/stencil planes, video, streamed material textures) at sim startup removed the device.
-    const bool written = (r.usage & (api::resource_usage::render_target | api::resource_usage::unordered_access)) != api::resource_usage{};
-    if (!written || !rgba8(r.texture.format) || (r.usage & api::resource_usage::depth_stencil) != api::resource_usage{}) return;
-    // Recreate exactly the view the game made (a null desc stays null), so the call is valid by construction.
-    const bool default_view = desc.type == api::resource_view_type::unknown;
-    auto native = reinterpret_cast<ID3D12Resource*>(resource.handle);
-    const auto view_format = default_view ? r.texture.format : desc.format;
-    if (view_format == api::format::unknown ||
-        (view_format == api::format_to_typeless(view_format) && view_format != api::format_to_default_typed(view_format))) return;
-    const auto format = DXGI_FORMAT(view_format);
-    // Any size: Fenix PFD 768x768; the A220 draws its main screens side by side into one 7410x1110 texture.
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
-    if (!default_view) {
-        const uint32_t first = desc.texture.first_level, count = desc.texture.level_count;
-        if (first >= r.texture.levels || (count != UINT32_MAX && (count == 0 || uint64_t(first) + count > r.texture.levels))) return;
-        srv.Texture2D.MostDetailedMip = first;
-        srv.Texture2D.MipLevels = count == UINT32_MAX ? UINT(-1) : count;
-    }
-    {
-        // The game's mip range for this texture; a second, different view of it is logged (the first one is used).
-        const std::pair<UINT, UINT> mips = default_view ? std::pair<UINT, UINT>{0, UINT(-1)}
-            : std::pair<UINT, UINT>{desc.texture.first_level, desc.texture.level_count == UINT32_MAX ? UINT(-1) : desc.texture.level_count};
-        std::lock_guard view_lock(view_mips_mutex);
-        const auto [it, added] = view_mips.try_emplace(native, mips);
-        static std::atomic<int> logged{0};
-        if (!added && it->second != mips && logged++ < 16)
-            log("note screen texture %p has views with different mips: %u+%d and %u+%d (the first is used)", native, it->second.first, int(it->second.second), mips.first, int(mips.second));
-    }
-    if (track_descriptors.load(std::memory_order_relaxed) && view.handle) set_tracked(uintptr_t(view.handle), texture_id(native, format));
-    const auto slot = state->scratch->GetCPUDescriptorHandleForHeapStart();
-    std::unique_lock lock(textures_mutex);
-    state->native->CreateShaderResourceView(native, default_view ? nullptr : &srv, slot);
-    Signature s{};
-    if (read_bytes(reinterpret_cast<const void*>(slot.ptr), s.bytes.data(), descriptor_size) && signatures.size() < 16384) {
-        signatures[s] = {native, format};
-        static std::atomic<int> logged{0};
-        if (logged++ < 40) log("texture_candidate resource=%p w=%llu h=%u mips=%u format=%u default_view=%d", native, r.texture.width, r.texture.height,
-            unsigned(r.texture.levels), unsigned(format), default_view);
-    }
-    known_textures.insert(native);
-}
-void on_destroy_resource(api::device*, api::resource resource) {
-    auto native = reinterpret_cast<ID3D12Resource*>(resource.handle);
+// Destruction of screen texture candidates: a small COM object is attached to each and released by the runtime when the
+// texture is destroyed.
+void texture_destroyed(ID3D12Resource* native) {
     { std::shared_lock lock(textures_mutex); if (!known_textures.contains(native)) return; }
     std::unique_lock lock(textures_mutex);
     known_textures.erase(native);
@@ -1044,69 +1087,229 @@ void on_destroy_resource(api::device*, api::resource resource) {
     if (track_descriptors.load(std::memory_order_relaxed)) forget_texture_ids(native);
     for (auto& slot : slot_resources) { auto expected = native; slot.compare_exchange_strong(expected, nullptr); }
 }
+struct __declspec(uuid("5C0E6A2D-3B1F-4E8A-9D47-0F2B8C61A3E9")) ReleaseNotifier final : IUnknown {
+    ID3D12Resource* resource;
+    bool attached = true;
+    std::atomic<ULONG> references{1};
+    explicit ReleaseNotifier(ID3D12Resource* r) : resource(r) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        if (iid == __uuidof(IUnknown)) { *out = static_cast<IUnknown*>(this); AddRef(); return S_OK; }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --references;
+        if (!left) {
+            if (attached && !shutting_down) texture_destroyed(resource);
+            delete this;
+        }
+        return left;
+    }
+};
+void notify_on_destroy(ID3D12Resource* native) {
+    auto notifier = new ReleaseNotifier(native);
+    if (FAILED(native->SetPrivateDataInterface(__uuidof(ReleaseNotifier), notifier))) notifier->attached = false;
+    notifier->Release(); // the texture holds the only reference now
+}
 
-void on_init_list(api::command_list* list) {
-    auto device = list->get_device()->get_private_data<DeviceState>();
-    if (!device) return;
-    auto state = list->create_private_data<ListState>();
-    state->list = list; state->device = device; state->generation = generation;
-    auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native());
-    native->SetPrivateData(__uuidof(ListState), sizeof(list), &list);
+// Shader resource views of the sim's textures: which ones are screen texture candidates, and their descriptor bytes.
+void view_created(ID3D12Resource* native, const D3D12_SHADER_RESOURCE_VIEW_DESC* view, D3D12_CPU_DESCRIPTOR_HANDLE handle) noexcept try {
+    CpuScope scope(cpu_views);
+    if (track_descriptors.load(std::memory_order_relaxed) && handle.ptr) set_tracked(uintptr_t(handle.ptr), 0); // a new view replaces what was there
+    // A default view (no view description) shows the texture as it is.
+    if (!native || (view && view->ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D && view->ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DARRAY)) return;
+    auto state = main_state;
+    if (!state || !state->scratch || descriptor_size > 32) return;
+    const auto r = native->GetDesc();
+    if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && handle.ptr) {
+        Signature d{};
+        if (read_bytes(reinterpret_cast<const void*>(handle.ptr), d.bytes.data(), descriptor_size)) {
+            std::lock_guard lock(diag_mutex);
+            if (diag_views.size() >= 262144) diag_views.clear();
+            diag_views[d] = {uint32_t(r.Width), r.Height, uint32_t(r.Format), uint32_t(r.Flags), r.DepthOrArraySize, uint16_t(r.SampleDesc.Count), r.MipLevels};
+        }
+    }
+    // Cockpit screens are plain single-sample 2D textures.
+    if (r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || r.SampleDesc.Count != 1 || r.DepthOrArraySize != 1 || r.Width < 64 || r.Height < 64) return;
+    // Only RGBA8 colour textures the GPU writes (render target or UAV), the kind cockpit screens are. Recreating views
+    // of other textures (depth/stencil planes, video, streamed material textures) at sim startup removed the device.
+    const bool written = (r.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0;
+    if (!written || !rgba8(r.Format) || (r.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return;
+    // Recreate exactly the view the game made (a null desc stays null), so the call is valid by construction.
+    const bool default_view = view == nullptr;
+    const auto format = default_view ? r.Format : view->Format;
+    if (format == DXGI_FORMAT_UNKNOWN || typeless(format)) return;
+    // Any size: Fenix PFD 768x768; the A220 draws its main screens side by side into one 7410x1110 texture.
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    if (!default_view) {
+        const bool array = view->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        const uint32_t first = array ? view->Texture2DArray.MostDetailedMip : view->Texture2D.MostDetailedMip;
+        const uint32_t count = array ? view->Texture2DArray.MipLevels : view->Texture2D.MipLevels;
+        if (first >= r.MipLevels || (count != UINT32_MAX && (count == 0 || uint64_t(first) + count > r.MipLevels))) return;
+        srv.Texture2D.MostDetailedMip = first;
+        srv.Texture2D.MipLevels = count; // UINT(-1): all from the first
+    }
+    {
+        // The game's mip range for this texture; a second, different view of it is logged (the first one is used).
+        const std::pair<UINT, UINT> mips = default_view ? std::pair<UINT, UINT>{0, UINT(-1)}
+            : std::pair<UINT, UINT>{srv.Texture2D.MostDetailedMip, srv.Texture2D.MipLevels};
+        std::lock_guard view_lock(view_mips_mutex);
+        const auto [it, added] = view_mips.try_emplace(native, mips);
+        static std::atomic<int> logged{0};
+        if (!added && it->second != mips && logged++ < 16)
+            log("note screen texture %p has views with different mips: %u+%d and %u+%d (the first is used)", native, it->second.first, int(it->second.second), mips.first, int(mips.second));
+    }
+    if (track_descriptors.load(std::memory_order_relaxed) && handle.ptr) set_tracked(uintptr_t(handle.ptr), texture_id(native, format));
+    const auto slot = state->scratch->GetCPUDescriptorHandleForHeapStart();
+    Signature s{};
+    bool readable = false;
+    {
+        // One scratch descriptor: its own lock, so that the texture tables' lock (also taken when a texture is destroyed,
+        // inside the runtime) is never held across a D3D12 call.
+        static std::mutex scratch_mutex;
+        std::lock_guard scratch_lock(scratch_mutex);
+        Internal internal;
+        state->native->CreateShaderResourceView(native, default_view ? nullptr : &srv, slot);
+        readable = read_bytes(reinterpret_cast<const void*>(slot.ptr), s.bytes.data(), descriptor_size);
+    }
+    bool first_view = false;
+    {
+        std::unique_lock lock(textures_mutex);
+        if (readable && signatures.size() < 16384) {
+            signatures[s] = {native, format};
+            static std::atomic<int> logged{0};
+            if (logged++ < 40) log("texture_candidate resource=%p w=%llu h=%u mips=%u format=%u default_view=%d", native, r.Width, r.Height,
+                unsigned(r.MipLevels), unsigned(format), default_view);
+        }
+        first_view = known_textures.insert(native).second;
+    }
+    if (first_view) notify_on_destroy(native);
+} catch (...) {}
+
+// Command lists: the state each one has bound (what ReShade kept per list). Looked up on every hooked call, so first a
+// thread-local cache of the last list, then a lock-free open-addressing table. Entries are never removed: a list
+// created later at the same address gets the same entry, and its creation resets the state.
+constexpr size_t list_table_size = size_t(1) << 16;
+struct ListEntry { std::atomic<ID3D12GraphicsCommandList*> list{nullptr}; std::atomic<ListState*> state{nullptr}; };
+std::unique_ptr<ListEntry[]> list_table = std::make_unique<ListEntry[]>(list_table_size);
+std::mutex list_table_mutex;
+size_t list_table_count = 0;
+size_t list_slot(const void* list) { return size_t((uint64_t(reinterpret_cast<uintptr_t>(list)) >> 4) * 0x9E3779B97F4A7C15ull >> 48) & (list_table_size - 1); }
+ListState* find_list(ID3D12GraphicsCommandList* list) {
+    for (size_t i = list_slot(list), n = 0; n < list_table_size; i = (i + 1) & (list_table_size - 1), ++n) {
+        const auto key = list_table[i].list.load(std::memory_order_acquire);
+        if (key == list) return list_table[i].state.load(std::memory_order_acquire);
+        if (!key) return nullptr;
+    }
+    return nullptr;
 }
-void on_destroy_list(api::command_list* list) {
-    if (!list->get_private_data<ListState>()) return;
-    reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native())->SetPrivateData(__uuidof(ListState), 0, nullptr);
-    list->destroy_private_data<ListState>();
+ListState* add_list(ID3D12GraphicsCommandList* list) {
+    std::lock_guard lock(list_table_mutex);
+    if (auto state = find_list(list)) return state;
+    if (list_table_count >= list_table_size * 3 / 4) { LOG_ONCE("WARNING command list table full: lists created from now on are not followed"); return nullptr; }
+    auto state = new ListState;
+    state->native = list;
+    ComPtr<ID3D12Device> device;
+    if (SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&device))) && device.Get() == main_device) state->device = main_state;
+    state->generation = generation;
+    // The upscaler hooks find a list's state through this, also when another mod hands them its own wrapper of the list.
+    list->SetPrivateData(__uuidof(ListState), sizeof(state), &state);
+    size_t i = list_slot(list);
+    while (list_table[i].list.load(std::memory_order_relaxed)) i = (i + 1) & (list_table_size - 1);
+    list_table[i].state.store(state, std::memory_order_release);
+    list_table[i].list.store(list, std::memory_order_release);
+    ++list_table_count;
+    return state;
 }
-void on_reset_list(api::command_list* list) {
+// A list's entry, whichever device it belongs to (null only when the table is full).
+ListState* list_entry(ID3D12GraphicsCommandList* list) {
+    thread_local ID3D12GraphicsCommandList* cached_list = nullptr;
+    thread_local ListState* cached_state = nullptr;
+    if (list != cached_list) {
+        auto state = find_list(list);
+        if (!state) state = add_list(list);
+        if (!state) return nullptr;
+        cached_list = list; cached_state = state;
+    }
+    return cached_state;
+}
+// The state of a list of the sim's device, or null.
+ListState* list_state(ID3D12GraphicsCommandList* list) {
+    auto state = list_entry(list);
+    return state && state->device ? state : nullptr;
+}
+
+void bind_pipeline(ListState& state, ID3D12PipelineState* pipeline) {
+    state.pso = reinterpret_cast<uint64_t>(pipeline); state.display = find_pipeline(state.pso);
+}
+void restart(ListState& state, DeviceState* device, ID3D12PipelineState* initial) {
+    const auto list = state.native;
+    state = ListState{}; state.native = list; state.device = device; state.generation = generation;
+    if (device && initial && enabled.load(std::memory_order_relaxed)) bind_pipeline(state, initial);
+}
+// A new list (possibly at the address of a destroyed one): nothing bound yet, and which device it belongs to.
+void list_created(ID3D12GraphicsCommandList* list, ID3D12Device* device, ID3D12PipelineState* initial) {
     CpuScope scope(cpu_passes);
-    if (auto state = list->get_private_data<ListState>()) {
-        const auto device = state->device;
-        *state = ListState{}; state->list = list; state->device = device; state->generation = generation;
-    }
-}
-void on_bind_pipeline(api::command_list* list, api::pipeline_stage stages, api::pipeline pipeline) {
-    CpuScope scope(cpu_binds);
-    if (!enabled.load(std::memory_order_relaxed) || (stages & api::pipeline_stage::all_graphics) == api::pipeline_stage{}) return;
-    if (auto state = list->get_private_data<ListState>()) {
-        state->pso = pipeline.handle; state->display = find_pipeline(pipeline.handle);
-    }
-}
-void on_bind_tables(api::command_list* list, api::shader_stage stages, api::pipeline_layout layout, uint32_t first, uint32_t count, const api::descriptor_table* tables) {
-    CpuScope scope(cpu_binds);
-    if (!enabled.load(std::memory_order_relaxed) || (stages & api::shader_stage::all_graphics) == api::shader_stage{}) return;
-    auto state = list->get_private_data<ListState>();
+    auto state = list_entry(list);
     if (!state) return;
-    if (state->layout != layout.handle) { state->layout = layout.handle; state->tables = {}; }
-    for (uint32_t i = 0; i < count && first + i < state->tables.size(); ++i) state->tables[first + i] = tables[i].handle;
+    restart(*state, device == main_device ? main_state : nullptr, initial);
+    list->SetPrivateData(__uuidof(ListState), sizeof(state), &state); // a new list object at an old list's address has none yet
 }
-void on_bind_targets(api::command_list* list, uint32_t count, const api::resource_view* targets, api::resource_view depth) {
+// A list reset to record again: nothing bound.
+void list_reset(ID3D12GraphicsCommandList* list, ID3D12PipelineState* initial) {
+    CpuScope scope(cpu_passes);
+    if (auto state = list_state(list)) restart(*state, state->device, initial);
+}
+void pipeline_bound(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline) {
+    CpuScope scope(cpu_binds);
+    if (!enabled.load(std::memory_order_relaxed)) return;
+    if (auto state = list_state(list)) bind_pipeline(*state, pipeline);
+}
+void root_signature_bound(ID3D12GraphicsCommandList* list, ID3D12RootSignature* root) {
+    CpuScope scope(cpu_binds);
+    if (!enabled.load(std::memory_order_relaxed)) return;
+    auto state = list_state(list);
+    if (!state) return;
+    const auto layout = reinterpret_cast<uint64_t>(root);
+    if (state->layout != layout) { state->layout = layout; state->tables = {}; } // a new root signature unbinds all tables
+}
+void table_bound(ID3D12GraphicsCommandList* list, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) {
+    CpuScope scope(cpu_binds);
+    if (!enabled.load(std::memory_order_relaxed)) return;
+    auto state = list_state(list);
+    if (state && index < state->tables.size()) state->tables[index] = table.ptr;
+}
+void targets_bound(ID3D12GraphicsCommandList* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range, const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
     CpuScope scope(cpu_targets);
     if (!enabled.load(std::memory_order_relaxed)) return;
-    auto state = list->get_private_data<ListState>();
+    auto state = list_state(list);
     if (!state) return;
-    state->target_count = count <= 8 ? count : 0;
-    for (uint32_t i = 0; i < state->target_count; ++i) state->targets[i].ptr = SIZE_T(targets[i].handle);
-    state->depth.ptr = SIZE_T(depth.handle);
+    state->target_count = count <= 8 && targets ? count : 0;
+    for (UINT i = 0; i < state->target_count; ++i)
+        state->targets[i].ptr = single_range ? targets[0].ptr + SIZE_T(i) * rtv_size : targets[i].ptr; // consecutive descriptors from the first
+    state->depth.ptr = depth ? depth->ptr : 0;
 }
-void on_bind_scissors(api::command_list* list, uint32_t first, uint32_t count, const api::rect* rects) {
-    if (!enabled.load(std::memory_order_relaxed) || first != 0 || !count || !rects) return;
-    if (auto state = list->get_private_data<ListState>()) { state->scissor = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom}; state->scissor_known = true; }
+void scissors_bound(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RECT* rects) {
+    if (!enabled.load(std::memory_order_relaxed) || !count || !rects) return;
+    if (auto state = list_state(list)) { state->scissor = rects[0]; state->scissor_known = true; }
 }
-void on_begin_pass(api::command_list* list, uint32_t count, const api::render_pass_render_target_desc* rts, const api::render_pass_depth_stencil_desc*) {
+void pass_begun(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* targets) {
     CpuScope scope(cpu_passes);
     if (!enabled.load(std::memory_order_relaxed)) return;
-    if (auto state = list->get_private_data<ListState>()) { state->in_pass = true; state->pass_targets = count; state->pass_rt0 = count && rts ? rts[0].view.handle : 0; }
+    if (auto state = list_state(list)) { state->in_pass = true; state->pass_targets = count; state->pass_rt0 = count && targets ? targets[0].cpuDescriptor.ptr : 0; }
 }
-void on_end_pass(api::command_list* list) {
+void pass_ended(ID3D12GraphicsCommandList* list) {
     CpuScope scope(cpu_passes);
     if (!enabled.load(std::memory_order_relaxed)) return;
-    if (auto state = list->get_private_data<ListState>()) { state->in_pass = false; state->target_count = 0; state->depth = {}; state->pass_targets = 0; state->pass_rt0 = 0; }
+    if (auto state = list_state(list)) { state->in_pass = false; state->target_count = 0; state->depth = {}; state->pass_targets = 0; state->pass_rt0 = 0; }
 }
 
 extern std::atomic<int> capture_requested; // screen capture (below)
 // Returns true when it issued the game's draw itself (the original call is then skipped).
-bool replay(api::command_list* list, ListState& state, const glass::Draw& draw) noexcept try {
+bool replay(ListState& state, const glass::Draw& draw) noexcept try {
+    Internal internal; // the draws below go through the hooked functions
     auto& device = *state.device;
     if (state.in_pass || !state.target_count || !state.depth.ptr || !draw.count || !draw.instances) { note(stats.unsupported_draw, "render_pass_or_targets"); return false; }
     std::pair<uint32_t, uint32_t> binding;
@@ -1119,12 +1322,10 @@ bool replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
     if (binding.first >= state.tables.size()) { note(stats.unsupported_draw, "root_layout"); return false; }
     const auto table = state.tables[binding.first];
     if (!table) { note(stats.unsupported_draw, "t1_table_unbound"); return false; }
-    api::descriptor_heap heap{}; uint32_t offset = 0;
-    list->get_device()->get_descriptor_heap_offset({table}, binding.second, 0, &heap, &offset);
-    if (!heap.handle) { note(stats.unsupported_draw, "descriptor_heap_unknown"); return false; }
-    auto native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
+    const auto address = descriptor_address(table, binding.second);
+    if (!address) { note(stats.unsupported_draw, "descriptor_heap_unknown"); return false; }
     Signature s{};
-    if (!read_bytes(reinterpret_cast<const void*>(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size), s.bytes.data(), descriptor_size)) {
+    if (!read_bytes(reinterpret_cast<const void*>(address), s.bytes.data(), descriptor_size)) {
         note(stats.unknown_texture, "descriptor_unreadable"); return false;
     }
     Texture texture;
@@ -1134,7 +1335,6 @@ bool replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
         if (const auto found = signatures.find(s); found != signatures.end()) { texture = found->second; recognised = true; }
     }
     if (!recognised && track_descriptors.load(std::memory_order_relaxed)) {
-        const auto address = uintptr_t(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size);
         recognised = tracked_texture(address, texture.resource, texture.format);
         if (recognised) LOG_ONCE("milestone screen texture found through descriptor tracking");
     }
@@ -1149,8 +1349,8 @@ bool replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
             ViewInfo info{};
             bool described = false;
             { std::lock_guard lock(diag_mutex); if (const auto d = diag_views.find(s); d != diag_views.end()) { info = d->second; described = true; } }
-            log("unrecognised_descriptor heap=%p offset=%u bytes=%s known=%llu tracked=%llu texture=%s w=%u h=%u format=%u usage=0x%x layers=%u samples=%u mips=%u",
-                native_heap, offset, hex(s).c_str(), uint64_t(signatures.size()), uint64_t(tracked_count), described ? "described" : "unknown",
+            log("unrecognised_descriptor address=%p bytes=%s known=%llu tracked=%llu texture=%s w=%u h=%u format=%u flags=0x%x layers=%u samples=%u mips=%u",
+                reinterpret_cast<void*>(address), hex(s).c_str(), uint64_t(signatures.size()), uint64_t(tracked_count), described ? "described" : "unknown",
                 info.width, info.height, info.format, info.usage, info.layers, info.samples, info.levels);
         }
         note(stats.unknown_texture, "texture_not_recognised"); return false;
@@ -1169,14 +1369,14 @@ bool replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
     }
     auto pso = variant(state.display, unsigned(slot));
     if (!pso) return false;
-    const auto target = list->get_device()->get_resource_from_view({state.targets[0].ptr});
-    if (!target.handle) { note(stats.unsupported_draw, "target_unknown"); return false; }
-    const auto desc = reinterpret_cast<ID3D12Resource*>(target.handle)->GetDesc();
+    const auto target = rtv_resource(state.targets[0]);
+    if (!target) { note(stats.unsupported_draw, "target_unknown"); return false; }
+    const auto desc = target->GetDesc();
     // VR draws all views at once into a layered target; the map gets the same layers.
     const UINT layers = state.display->vr ? std::clamp<UINT>(desc.DepthOrArraySize, 1, 8) : 1;
     auto map = map_for(device, UINT(desc.Width), desc.Height, layers);
     if (!map) { note(stats.unsupported_draw, "map_allocation"); return false; }
-    auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native());
+    auto native = state.native;
     const auto rtv = map->rtv->GetCPUDescriptorHandleForHeapStart();
     {
         std::lock_guard lock(device.maps_mutex);
@@ -1242,7 +1442,19 @@ bool replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
 
 // VR probe window (in presents), started when the upscaler runs at a size with no cockpit map (VR or another view).
 std::atomic<uint64_t> probe_until{0};
-void probe_screen_draw(api::command_list* list, const ListState& state, uint32_t count, uint32_t instances) noexcept try {
+// The first two render targets of a draw, for the probes' log lines.
+std::string describe_targets(const ListState& state) {
+    char targets[160]{};
+    for (uint32_t i = 0; i < state.target_count && i < 2; ++i) {
+        const auto rt = rtv_resource(state.targets[i]);
+        if (!rt) continue;
+        const auto r = rt->GetDesc();
+        snprintf(targets + strlen(targets), sizeof(targets) - strlen(targets), " rt%u=%llux%u layers=%u format=%u", i, uint64_t(r.Width), r.Height,
+            unsigned(r.DepthOrArraySize), unsigned(r.Format));
+    }
+    return targets;
+}
+void probe_screen_draw(const ListState& state, uint32_t count, uint32_t instances) noexcept try {
     if (!state.device || !state.layout) return;
     std::pair<uint32_t, uint32_t> binding;
     {
@@ -1253,12 +1465,10 @@ void probe_screen_draw(api::command_list* list, const ListState& state, uint32_t
     }
     const auto table = state.tables[binding.first];
     if (!table) return;
-    api::descriptor_heap heap{}; uint32_t offset = 0;
-    list->get_device()->get_descriptor_heap_offset({table}, binding.second, 0, &heap, &offset);
-    if (!heap.handle) return;
-    auto native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
+    const auto address = descriptor_address(table, binding.second);
+    if (!address) return;
     Signature s{};
-    if (!read_bytes(reinterpret_cast<const void*>(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size), s.bytes.data(), descriptor_size)) return;
+    if (!read_bytes(reinterpret_cast<const void*>(address), s.bytes.data(), descriptor_size)) return;
     ID3D12Resource* resource = nullptr;
     {
         std::shared_lock lock(textures_mutex);
@@ -1280,24 +1490,15 @@ void probe_screen_draw(api::command_list* list, const ListState& state, uint32_t
         std::shared_lock lock(hashes_mutex);
         if (const auto found = pipeline_hashes.find(state.pso); found != pipeline_hashes.end()) hashes = found->second;
     }
-    auto device = list->get_device();
-    char targets[160]{};
-    for (uint32_t i = 0; i < state.target_count && i < 2; ++i) {
-        const auto rt = device->get_resource_from_view({uint64_t(state.targets[i].ptr)});
-        if (!rt.handle) continue;
-        const auto r = device->get_resource_desc(rt);
-        snprintf(targets + strlen(targets), sizeof(targets) - strlen(targets), " rt%u=%ux%u layers=%u format=%u", i, r.texture.width, r.texture.height,
-            unsigned(r.texture.depth_or_layers), unsigned(r.texture.format));
-    }
     log("probe_screen_draw pso=%p vs=%016llx ps=%016llx screen=%p count=%u instances=%u in_pass=%d targets=%u%s", reinterpret_cast<void*>(state.pso),
-        hashes.first, hashes.second, resource, count, instances, state.in_pass, state.target_count, targets);
+        hashes.first, hashes.second, resource, count, instances, state.in_pass, state.target_count, describe_targets(state).c_str());
 } catch (...) {}
 
 // Screen probe (Ctrl+Shift+F12, 600 frames): draws with any other pipeline whose pixel shader reads a gauge-like texture
 // (GPU-written RGBA8 with mip maps, like every cockpit screen texture), to find screens drawn with another shader. Every
 // pass, not just the 3D scene's (the iFly 737 draws its MCP, CDU and radio digits over their screens in a later one).
 std::atomic<uint64_t> screen_probe_until{0};
-void screen_probe(api::command_list* list, const ListState& state, uint32_t count, uint32_t instances) noexcept try {
+void screen_probe(const ListState& state, uint32_t count, uint32_t instances) noexcept try {
     if (!state.device || !state.layout || !state.target_count) return;
     std::vector<DeviceState::SrvRange> ranges;
     {
@@ -1306,16 +1507,12 @@ void screen_probe(api::command_list* list, const ListState& state, uint32_t coun
         if (found == state.device->srv_ranges.end()) return;
         ranges = found->second;
     }
-    auto device = list->get_device();
     for (const auto& r : ranges) {
         const auto table = r.param < state.tables.size() ? state.tables[r.param] : 0;
         if (!table) continue;
         for (uint32_t k = 0; k < r.count; ++k) {
-            api::descriptor_heap heap{}; uint32_t offset = 0;
-            device->get_descriptor_heap_offset({table}, r.offset + k, 0, &heap, &offset);
-            if (!heap.handle) continue;
-            const auto native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
-            const auto address = uintptr_t(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size);
+            const auto address = descriptor_address(table, r.offset + k);
+            if (!address) continue;
             Signature sig{};
             if (!read_bytes(reinterpret_cast<const void*>(address), sig.bytes.data(), descriptor_size)) continue;
             ID3D12Resource* resource = nullptr;
@@ -1343,17 +1540,10 @@ void screen_probe(api::command_list* list, const ListState& state, uint32_t coun
                 std::shared_lock lock(hashes_mutex);
                 if (const auto found = pipeline_hashes.find(state.pso); found != pipeline_hashes.end()) hashes = found->second;
             }
-            char targets[160]{};
-            for (uint32_t i = 0; i < state.target_count && i < 2; ++i) {
-                const auto rt = device->get_resource_from_view({uint64_t(state.targets[i].ptr)});
-                if (!rt.handle) continue;
-                const auto t = device->get_resource_desc(rt);
-                snprintf(targets + strlen(targets), sizeof(targets) - strlen(targets), " rt%u=%ux%u layers=%u format=%u", i, t.texture.width, t.texture.height,
-                    unsigned(t.texture.depth_or_layers), unsigned(t.texture.format));
-            }
             log("screen_probe pso=%p vs=%016llx ps=%016llx t%u space%u texture=%p %llux%u mips=%u format=%u screen_slot=%d count=%u instances=%u layout=%p targets=%u%s",
                 reinterpret_cast<void*>(state.pso), hashes.first, hashes.second, r.reg + k, r.space, resource, uint64_t(desc.Width), desc.Height,
-                unsigned(desc.MipLevels), unsigned(desc.Format), slot, count, instances, reinterpret_cast<void*>(state.layout), state.target_count, targets);
+                unsigned(desc.MipLevels), unsigned(desc.Format), slot, count, instances, reinterpret_cast<void*>(state.layout), state.target_count,
+                describe_targets(state).c_str());
         }
     }
 } catch (...) {}
@@ -1376,23 +1566,24 @@ struct ProbedDraw { uint64_t pso = 0, vs = 0, ps = 0; uint32_t count = 0, instan
     UINT targets = 0; uint32_t rt_w = 0, rt_h = 0, rt_format = 0; std::string textures; };
 std::mutex pixel_probe_mutex;
 std::vector<ProbedDraw> pixel_probe_draws;
-void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& draw, int indirect = -1) noexcept try {
-    const uint64_t rt0 = state.in_pass ? state.pass_rt0 : uint64_t(state.targets[0].ptr);
+bool pixel_probing() { return present_count.load(std::memory_order_relaxed) - pixel_probe_frame.load(std::memory_order_relaxed) < pixel_probe_frames; }
+void pixel_probe(ListState& state, const glass::Draw& draw, int indirect = -1) noexcept try {
+    Internal internal; // the probe draw and the scissor changes below go through the hooked functions
+    const D3D12_CPU_DESCRIPTOR_HANDLE rt0{state.in_pass ? SIZE_T(state.pass_rt0) : state.targets[0].ptr};
     const UINT target_count = state.in_pass ? state.pass_targets : state.target_count;
-    if (!state.device || !state.device->probe_queries || !target_count || !rt0) return;
-    auto device = list->get_device();
-    const auto rt = device->get_resource_from_view({rt0});
-    if (!rt.handle) return;
-    const auto t = device->get_resource_desc(rt);
+    if (!state.device || !state.device->probe_queries || !target_count || !rt0.ptr) return;
+    const auto rt = rtv_resource(rt0);
+    if (!rt) return;
+    const auto t = rt->GetDesc();
     // The scene at the upscaler's render size only (not shadow maps, reflections, gauges or post-processing).
-    if (t.texture.width != last_render_w.load() || t.texture.height != last_render_h.load()) return;
+    if (t.Width != last_render_w.load() || t.Height != last_render_h.load()) return;
     const uint32_t index = pixel_probe_used.fetch_add(1);
     if (index >= pixel_probe_max) return;
-    auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native());
-    // Indirect draws are not re-issued (ExecuteIndirect may take its draw count from a buffer the event doesn't pass):
-    // they are only listed as found at this size.
+    auto native = state.native;
+    // Indirect draws are not re-issued (ExecuteIndirect may take its draw count from a buffer): they are only listed as
+    // found at this size.
     if (indirect < 0) {
-        const LONG cx = LONG(t.texture.width / 2), cy = LONG(t.texture.height / 2);
+        const LONG cx = LONG(t.Width / 2), cy = LONG(t.Height / 2);
         const D3D12_RECT pixel{cx, cy, cx + 1, cy + 1};
         native->RSSetScissorRects(1, &pixel);
         native->BeginQuery(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
@@ -1406,13 +1597,13 @@ void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& d
         } else {
             native->ResolveQueryData(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index, 1, state.device->probe_readback.Get(), uint64_t(index) * 8);
         }
-        const D3D12_RECT whole{0, 0, LONG(t.texture.width), LONG(t.texture.height)};
+        const D3D12_RECT whole{0, 0, LONG(t.Width), LONG(t.Height)};
         native->RSSetScissorRects(1, state.scissor_known ? &state.scissor : &whole);
     }
     ProbedDraw p;
     p.in_pass = state.in_pass; p.indirect = indirect;
     p.pso = state.pso; p.count = draw.count; p.instances = draw.instances; p.first = draw.first; p.base_vertex = draw.base_vertex; p.indexed = draw.indexed;
-    p.display = state.display != nullptr; p.targets = target_count; p.rt_w = t.texture.width; p.rt_h = t.texture.height; p.rt_format = uint32_t(t.texture.format);
+    p.display = state.display != nullptr; p.targets = target_count; p.rt_w = uint32_t(t.Width); p.rt_h = t.Height; p.rt_format = uint32_t(t.Format);
     {
         std::shared_lock lock(hashes_mutex);
         if (const auto found = pipeline_hashes.find(state.pso); found != pipeline_hashes.end()) { p.vs = found->second.first; p.ps = found->second.second; }
@@ -1427,12 +1618,10 @@ void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& d
         const auto table = r.param < state.tables.size() ? state.tables[r.param] : 0;
         if (!table) continue;
         for (uint32_t k = 0; k < r.count; ++k) {
-            api::descriptor_heap heap{}; uint32_t offset = 0;
-            device->get_descriptor_heap_offset({table}, r.offset + k, 0, &heap, &offset);
-            if (!heap.handle) continue;
-            const auto native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
+            const auto address = descriptor_address(table, r.offset + k);
+            if (!address) continue;
             Signature sig{};
-            if (!read_bytes(reinterpret_cast<const void*>(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size), sig.bytes.data(), descriptor_size)) continue;
+            if (!read_bytes(reinterpret_cast<const void*>(address), sig.bytes.data(), descriptor_size)) continue;
             ID3D12Resource* resource = nullptr;
             {
                 std::shared_lock lock(textures_mutex);
@@ -1440,18 +1629,18 @@ void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& d
             }
             char item[160];
             if (!resource) {
-                // Any other 2D texture: what its view was made of (no resource pointer; usage bits: 0x10 render target,
-                // 0x80 unordered access, 0x8 shader resource).
+                // Any other 2D texture: what its view was made of (no resource pointer; resource flags: 0x1 render target,
+                // 0x4 unordered access).
                 ViewInfo info{};
                 bool described = false;
                 { std::lock_guard lock(diag_mutex); if (const auto d = diag_views.find(sig); d != diag_views.end()) { info = d->second; described = true; } }
                 if (!described) {
-                    // Bound, but its view is unknown (made before the add-on loaded, or forgotten).
+                    // Bound, but its view is unknown (made before the fix loaded, or forgotten).
                     snprintf(item, sizeof(item), " t%u=?", r.reg + k);
                     p.textures += item;
                     continue;
                 }
-                snprintf(item, sizeof(item), " t%u=other(%ux%u mips=%u fmt=%u usage=0x%x)", r.reg + k, info.width, info.height, unsigned(info.levels), info.format, info.usage);
+                snprintf(item, sizeof(item), " t%u=other(%ux%u mips=%u fmt=%u flags=0x%x)", r.reg + k, info.width, info.height, unsigned(info.levels), info.format, info.usage);
                 p.textures += item;
                 continue;
             }
@@ -1467,19 +1656,26 @@ void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& d
     pixel_probe_draws[index] = std::move(p);
 } catch (...) {}
 
-// Called once per present: once the probed frames are submitted, resolves the queries ended inside render passes.
-void pixel_probe_resolve(api::command_queue* queue, uint64_t now) {
+// Called once per present: once the probed frames are submitted, resolves the queries ended inside render passes, with
+// a command list of its own on the queue the sim presents with.
+void pixel_probe_resolve(ID3D12CommandQueue* queue, uint64_t now) {
     const uint64_t frame = pixel_probe_frame.load();
     if (frame == UINT64_MAX || now != frame + pixel_probe_frames + 1 || !queue || !main_state || !main_state->probe_queries) return;
     std::vector<uint32_t> pending;
     { std::lock_guard lock(pixel_probe_pending_mutex); pending.swap(pixel_probe_pending); }
     if (pending.empty()) return;
-    auto list = queue->get_immediate_command_list();
-    if (!list) return;
-    auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native());
+    Internal internal;
+    // Kept until the next probe's resolve, by when the GPU has long finished this one.
+    static ComPtr<ID3D12CommandAllocator> allocator;
+    static ComPtr<ID3D12GraphicsCommandList> list;
+    allocator = nullptr; list = nullptr;
+    if (FAILED(main_state->native->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(main_state->native->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)))) return;
     for (const uint32_t index : pending)
-        native->ResolveQueryData(main_state->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index, 1, main_state->probe_readback.Get(), uint64_t(index) * 8);
-    queue->flush_immediate_command_list();
+        list->ResolveQueryData(main_state->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index, 1, main_state->probe_readback.Get(), uint64_t(index) * 8);
+    if (FAILED(list->Close())) return;
+    ID3D12CommandList* lists[]{list.Get()};
+    queue->ExecuteCommandLists(1, lists);
 }
 
 // Called once per present: logs a finished pixel probe.
@@ -1519,34 +1715,46 @@ void pixel_probe_flush(uint64_t now) {
     pixel_probe_draws.clear();
 }
 
+// Indirect commands (ExecuteIndirect): what each command signature runs, as ReShade's add-on events report it.
+enum class Indirect { unknown = 0, draw = 1, draw_indexed = 2, dispatch = 3 };
+struct __declspec(uuid("7D3B9A1E-2C64-4F0B-8E51-A9C02F6D4B37")) IndirectCommand { Indirect type = Indirect::unknown; UINT stride = 0; };
+void command_signature_created(const D3D12_COMMAND_SIGNATURE_DESC& desc, ID3D12CommandSignature* signature) {
+    IndirectCommand command{Indirect::unknown, desc.ByteStride};
+    if (desc.NumArgumentDescs && desc.pArgumentDescs) {
+        switch (desc.pArgumentDescs[desc.NumArgumentDescs - 1].Type) { // the last argument is the command itself
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: command.type = Indirect::draw; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: command.type = Indirect::draw_indexed; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: command.type = Indirect::dispatch; break;
+        default: break;
+        }
+    }
+    signature->SetPrivateData(__uuidof(IndirectCommand), sizeof(command), &command);
+}
 // Indirect draws at render size are only listed by the pixel probe (see pixel_probe).
-bool on_draw_indirect(api::command_list* list, api::indirect_command type, api::resource, uint64_t, uint32_t draw_count, uint32_t stride) {
-    if (!enabled.load(std::memory_order_relaxed) || type == api::indirect_command::dispatch) return false;
-    if (present_count.load(std::memory_order_relaxed) - pixel_probe_frame.load(std::memory_order_relaxed) >= pixel_probe_frames) return false;
-    if (auto state = list->get_private_data<ListState>())
-        pixel_probe(list, *state, {type == api::indirect_command::draw_indexed, draw_count, 1, stride, 0, 0}, int(type));
-    return false;
+void indirect_recorded(ID3D12GraphicsCommandList* list, ID3D12CommandSignature* signature, UINT max_count) {
+    if (!enabled.load(std::memory_order_relaxed) || duplicate_fix.load(std::memory_order_relaxed) || !signature || !pixel_probing()) return;
+    IndirectCommand command;
+    UINT size = sizeof(command);
+    if (FAILED(signature->GetPrivateData(__uuidof(IndirectCommand), &size, &command)) || size != sizeof(command)) command = {};
+    if (command.type == Indirect::dispatch) return;
+    // Logged like a draw: draw count in count, stride in first.
+    if (auto state = list_state(list)) pixel_probe(*state, {command.type == Indirect::draw_indexed, max_count, 1, command.stride, 0, 0}, int(command.type));
 }
 
-bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, uint32_t first_instance) {
+// Called before the sim's draw runs. Returns true when the fix issued the draw itself (the screen's map is drawn right
+// after it, against the depth it wrote): the hook then skips the original call.
+bool draw_recorded(ID3D12GraphicsCommandList* list, const glass::Draw& draw) {
     CpuScope scope(cpu_draws);
-    if (!enabled.load(std::memory_order_relaxed)) return false;
-    auto state = list->get_private_data<ListState>();
-    if (state && present_count.load(std::memory_order_relaxed) - pixel_probe_frame.load(std::memory_order_relaxed) < pixel_probe_frames) pixel_probe(list, *state, {false, count, instances, first, first_instance, 0});
-    if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
-    if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
-    if (state && state->display) ++stats.display_draws;
-    return state && state->display && state->generation == generation.load(std::memory_order_relaxed) && replay(list, *state, {false, count, instances, first, first_instance, 0});
-}
-bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, int32_t vertex, uint32_t first_instance) {
-    CpuScope scope(cpu_draws);
-    if (!enabled.load(std::memory_order_relaxed)) return false;
-    auto state = list->get_private_data<ListState>();
-    if (state && present_count.load(std::memory_order_relaxed) - pixel_probe_frame.load(std::memory_order_relaxed) < pixel_probe_frames) pixel_probe(list, *state, {true, count, instances, first, first_instance, vertex});
-    if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
-    if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
-    if (state && state->display) ++stats.display_draws;
-    return state && state->display && state->generation == generation.load(std::memory_order_relaxed) && replay(list, *state, {true, count, instances, first, first_instance, vertex});
+    if (!enabled.load(std::memory_order_relaxed) || duplicate_fix.load(std::memory_order_relaxed)) return false;
+    auto state = list_state(list);
+    if (!state) return false;
+    const auto now = present_count.load(std::memory_order_relaxed);
+    if (pixel_probing()) pixel_probe(*state, draw);
+    if (!state->display && now < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(*state, draw.count, draw.instances);
+    if (!state->display && now < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(*state, draw.count, draw.instances);
+    if (!state->display) return false;
+    ++stats.display_draws;
+    return state->generation == generation.load(std::memory_order_relaxed) && replay(*state, draw);
 }
 
 
@@ -1670,16 +1878,15 @@ UINT layer_for_call(UINT call, UINT views, ID3D12Resource* output) {
     return call;
 }
 
-bool on_copy_region(api::command_list*, api::resource source, uint32_t, const api::subresource_box*, api::resource dest, uint32_t dest_subresource,
-    const api::subresource_box*, api::filter_mode) {
+// A texture-to-texture copy (CopyTextureRegion between two subresources).
+void texture_copied(ID3D12Resource* src, ID3D12Resource* dest, UINT dest_subresource) {
     CpuScope scope(cpu_copies);
-    if (!view_order.views) return false;
-    const auto src = reinterpret_cast<ID3D12Resource*>(source.handle);
+    if (!view_order.views) return;
     std::lock_guard lock(view_order.mutex);
     // A copy of the latest call's output into a layered texture: that call's view is the destination layer.
-    if (!src || src != view_order.last_output) return false;
-    const auto desc = reinterpret_cast<ID3D12Resource*>(dest.handle)->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != view_order.views) return false;
+    if (!src || !dest || src != view_order.last_output) return;
+    const auto desc = dest->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != view_order.views) return;
     const UINT call = view_order.last_call;
     view_order.last_output = nullptr; // one copy per call; frames without a fixed view must not reuse it
     const int layer = int(dest_subresource / std::max<UINT16>(desc.MipLevels, 1));
@@ -1687,7 +1894,6 @@ bool on_copy_region(api::command_list*, api::resource source, uint32_t, const ap
         view_order.layer[call] = layer;
         log("vr view order: upscaler call %u of %u -> layer %d", call, view_order.views, layer);
     }
-    return false;
 }
 
 // What the upscaler (DLSS or FSR) was given and wrote, and the states it left its colour input and output in.
@@ -1714,7 +1920,6 @@ DXGI_FORMAT depth_srv_format(DXGI_FORMAT format) {
 }
 void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept;
 
-DXGI_FORMAT typed(DXGI_FORMAT format) { return DXGI_FORMAT(api::format_to_default_typed(api::format(format))); }
 
 void composite_dlss(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Parameter* params) noexcept try {
     if (!supplied || !params || !enabled.load(std::memory_order_relaxed)) return;
@@ -1813,6 +2018,8 @@ struct CaptureFrame {
     float jitter_x = 0, jitter_y = 0;
     int presented = -1; // >= 0: a frame sent to the monitor (index), not an upscaler call
     bool real = false;  // presented frame: the fix ran since the previous present (a real frame, not a generated one)
+    ComPtr<ID3D12CommandAllocator> allocator; // presented frame: the copy's own command list, kept until it is read back
+    ComPtr<ID3D12GraphicsCommandList> list;
 };
 constexpr int capture_frame_count = 4, capture_spacing = 5; // 4 frames, every 5th fixed frame (~0.3 s)
 std::atomic<int> capture_countdown{0};
@@ -2156,6 +2363,8 @@ void capture_flush(uint64_t now) {
         CapturedFrame copy{frame, {}, {}};
         copy.info.images.clear();
         copy.info.params.Reset();
+        copy.info.allocator.Reset();
+        copy.info.list.Reset();
         if (frame.params) {
             void* data = nullptr;
             const D3D12_RANGE range{0, slot_count * 3 * 16};
@@ -2183,14 +2392,16 @@ void capture_flush(uint64_t now) {
 
 void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept try {
     CpuScope scope(cpu_composite);
-    api::command_list* list = nullptr; UINT size = sizeof(list);
-    if (FAILED(supplied->GetPrivateData(__uuidof(ListState), &size, &list)) || size != sizeof(list) || !list) {
-        note(stats.composite_skipped, "upscaler_command_list_unknown (the upscaler ran on a command list ReShade did not report)"); return;
+    if (duplicate_fix.load(std::memory_order_relaxed)) return;
+    // The list's state, also when the upscaler was handed another mod's wrapper of it (the wrapper passes private data on).
+    ListState* state = nullptr; UINT size = sizeof(state);
+    if (FAILED(supplied->GetPrivateData(__uuidof(ListState), &size, &state)) || size != sizeof(state) || !state) state = list_state(supplied);
+    if (!state || !state->device) {
+        note(stats.composite_skipped, "upscaler_command_list_unknown (the upscaler ran on a command list the fix has not seen)"); return;
     }
-    auto state = list->get_private_data<ListState>();
-    if (!state) return;
     auto& d = *state->device;
-    if (reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native())->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+    Internal internal; // the passes below go through the hooked functions
+    if (state->native->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) {
         note(stats.composite_skipped, "upscaler_list_not_direct"); return;
     }
     const unsigned render_w = u.render_w, render_h = u.render_h;
@@ -2403,8 +2614,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         angle_soften_percent / 100.0f, history_info, frame_index, bounds_reset.exchange(0), d.diag_index, edge_trim_percent / 100.0f};
     d.diag_calls[d.diag_index & 63] = {present_count.load(std::memory_order_relaxed), map->recorded_present.load(), pending, map->views.load(), output, GetCurrentThreadId()};
 
-    api::command_list* api_list = list;
-    auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(api_list->get_native());
+    auto native = state->native;
     ID3D12DescriptorHeap* heaps[]{d.heap.Get()};
     native->SetDescriptorHeaps(1, heaps);
     native->SetComputeRootSignature(d.root.Get());
@@ -2805,7 +3015,7 @@ void install_ngx() {
     if (ngx_hooked) return;
     HMODULE module = GetModuleHandleW(L"_nvngx.dll");
     if (!module) return;
-    // Another mod may be patching the same function at the same moment: retry a few times (called every 10 s).
+    // Another mod may be patching the same function at the same moment: retry for about a minute (called every 2 s).
     static int attempts = 0;
     ++attempts;
     auto evaluate = GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature");
@@ -2821,7 +3031,7 @@ void install_ngx() {
     if (!a && !b) {
         log("DLSS hook attempt %d failed: evaluate %s (%s), evaluate_c %s (%s)", attempts, MH_StatusToString(status_a),
             describe_code(reinterpret_cast<void*>(evaluate)).c_str(), MH_StatusToString(status_b), describe_code(reinterpret_cast<void*>(evaluate_c)).c_str());
-        if (attempts < 6) return;
+        if (attempts < 30) return;
         ngx_hook_failed = true;
     }
     ngx_hooked = true;
@@ -2895,7 +3105,7 @@ void install_ngx_proxies() {
     }
 }
 
-// Settings live in an .ini next to the add-on (not in ReShade.ini).
+// Settings live in an .ini next to the DLL.
 std::wstring settings_path() { return (addon_directory / L"glass-cockpit-dlss-fix.ini").wstring(); }
 void load_settings() {
     enabled = GetPrivateProfileIntW(L"overlay", L"enabled", 1, settings_path().c_str()) != 0;
@@ -2942,6 +3152,15 @@ void save_settings() {
     WritePrivateProfileStringW(L"experimental", L"full_size_sampling", mip0_only.load() ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"calm_glass", std::to_wstring(calm_glass.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"occlusion_check", std::to_wstring(occlusion_check.load()).c_str(), settings_path().c_str());
+}
+// The settings in effect, for the log (at start and when the file is re-read).
+std::string settings_text() {
+    char text[768];
+    snprintf(text, sizeof(text), "enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d",
+        enabled.load(), jitter_positive.load(), smoothing_percent.load(), int(extra_smoothing.load()), glass_percent.load(), detail_clamp_percent.load(),
+        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), dark_screen_fix.load(), seam_fix.load(), int(mip0_only.load()),
+        stable_edges.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
+    return text;
 }
 
 // One measurement window every 10 s: 120 frames, reported ~30 frames later (the GPU has finished them by then).
@@ -3005,18 +3224,26 @@ void measure_cost(ID3D12CommandQueue* queue, DeviceState* d, uint64_t now) {
     }
 }
 
-// Copies the frame about to be shown into a readback buffer (only while a capture is running).
-void capture_present(api::effect_runtime* runtime) {
+// Copies the frame about to be shown into a readback buffer (only while a capture is running), on the queue the sim
+// presents with.
+void capture_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue) {
     static uint64_t composites_seen = 0;
     const uint64_t composites = stats.composites.load();
     const bool real = composites != composites_seen;
     composites_seen = composites;
     if (capture_presents_left.load() <= 0) return;
-    const auto queue = runtime->get_command_queue();
-    const auto back_buffer = runtime->get_current_back_buffer();
-    auto* resource = reinterpret_cast<ID3D12Resource*>(back_buffer.handle);
-    auto* list = queue ? queue->get_immediate_command_list() : nullptr;
-    if (!resource || !list) { capture_presents_left = 0; return; }
+    Internal internal;
+    ComPtr<IDXGISwapChain3> swapchain3;
+    ComPtr<ID3D12Resource> resource;
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (!queue || FAILED(swapchain->QueryInterface(IID_PPV_ARGS(&swapchain3))) ||
+        FAILED(swapchain3->GetBuffer(swapchain3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&resource))) || FAILED(queue->GetDevice(IID_PPV_ARGS(&device))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)))) {
+        capture_presents_left = 0; return;
+    }
     auto format = resource->GetDesc().Format;
     switch (format) {
     case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
@@ -3028,41 +3255,166 @@ void capture_present(api::effect_runtime* runtime) {
     const int index = capture_present_count - capture_presents_left.load();
     CaptureFrame frame;
     frame.presented = index; frame.real = real;
-    capture_copy(reinterpret_cast<ID3D12Device*>(runtime->get_device()->get_native()), reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native()),
-        resource, 0, D3D12_RESOURCE_STATE_PRESENT, format, "presented", frame);
-    queue->flush_immediate_command_list();
+    capture_copy(device.Get(), list.Get(), resource.Get(), 0, D3D12_RESOURCE_STATE_PRESENT, format, "presented", frame);
+    if (FAILED(list->Close())) { capture_presents_left = 0; return; }
+    ID3D12CommandList* lists[]{list.Get()};
+    queue->ExecuteCommandLists(1, lists);
+    frame.allocator = allocator; frame.list = list; // kept until the copy is read back, by when the GPU has long finished it
     std::lock_guard lock(capture_mutex);
     capture_frames.push_back(std::move(frame));
     --capture_presents_left;
 }
 
-void on_present(api::effect_runtime* runtime) {
-    ++present_count;
-    capture_present(runtime);
-    capture_flush(present_count.load(std::memory_order_relaxed));
-    const auto queue = runtime->get_command_queue();
-    measure_cost(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr, runtime->get_device()->get_private_data<DeviceState>(),
-        present_count.load(std::memory_order_relaxed));
-    const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
-    pixel_probe_resolve(queue, present_count.load(std::memory_order_relaxed));
-    pixel_probe_flush(present_count.load(std::memory_order_relaxed));
-    if (chord && runtime->is_key_pressed(VK_F8)) glass::request_capture();
-    if (chord && runtime->is_key_pressed(VK_F10)) glass::request_pixel_probe();
-    if (chord && runtime->is_key_pressed(VK_F7)) { mip0_only = !mip0_only; save_settings(); log("setting full_size_sampling=%d (Ctrl+Shift+F7)", int(mip0_only.load())); }
-    if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
-    if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
-    if (chord && runtime->is_key_pressed(VK_F12)) {
-        screen_probe_until = present_count.load() + 600;
-        log("screen_probe started: looking for draws that read cockpit-screen-like textures with other shaders");
+// The frame clock: one tick per frame the sim presents. Without presents (the swapchain hooks could not be installed,
+// or the offline test host, which has no swapchain) it is driven by the background thread instead.
+std::mutex frame_mutex;
+std::atomic<uint64_t> last_present_tick{0};
+void frame_tick(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue) {
+    std::lock_guard lock(frame_mutex);
+    const auto now = ++present_count;
+    if (swapchain) capture_present(swapchain, queue);
+    else capture_presents_left = 0; // no presents to capture: the capture finishes with the upscaler frames alone
+    capture_flush(now);
+    measure_cost(queue, main_state, now);
+    pixel_probe_resolve(queue, now);
+    pixel_probe_flush(now);
+}
+
+// The swapchain the sim presents with (its queue is on the sim's device). Presents of other swapchains are not frames.
+std::mutex swapchains_mutex;
+IDXGISwapChain* main_swapchain = nullptr;
+ComPtr<ID3D12CommandQueue> main_queue;
+void install_present_hooks(IDXGISwapChain* swapchain);
+void swapchain_created(IUnknown* device, IUnknown* created) noexcept try {
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<IDXGISwapChain> swapchain;
+    if (!device || !created || FAILED(device->QueryInterface(IID_PPV_ARGS(&queue))) || FAILED(created->QueryInterface(IID_PPV_ARGS(&swapchain)))) return;
+    install_present_hooks(swapchain.Get());
+    ComPtr<ID3D12Device> queue_device;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&queue_device)))) return;
+    if (!main_device) {
+        log("WARNING the sim's device was created in a way the fix did not see; found it through its swapchain. What the sim set up before is unknown, so screens will most likely stay unfixed: please report this with your log");
+        device_created(queue_device.Get());
     }
-    static uint64_t next = 0;
-    const auto now = GetTickCount64();
-    if (now < next) return;
-    next = now + 10000;
+    if (queue_device.Get() != main_device) return;
+    DXGI_SWAP_CHAIN_DESC desc{};
+    swapchain->GetDesc(&desc);
+    std::lock_guard lock(swapchains_mutex);
+    main_swapchain = swapchain.Get();
+    main_queue = queue;
+    log("swapchain %p %ux%u format=%u buffers=%u", swapchain.Get(), desc.BufferDesc.Width, desc.BufferDesc.Height, unsigned(desc.BufferDesc.Format), desc.BufferCount);
+} catch (...) {}
+void presented(IDXGISwapChain* swapchain) noexcept try {
+    ComPtr<ID3D12CommandQueue> queue;
+    {
+        std::lock_guard lock(swapchains_mutex);
+        if (main_swapchain && swapchain != main_swapchain) return;
+        queue = main_queue;
+    }
+    last_present_tick = GetTickCount64();
+    frame_tick(swapchain, queue.Get());
+} catch (...) {}
+
+// Settings: the .ini next to the DLL, re-read when it changes. Written at start with every setting and the value in
+// effect, so that settings an update adds show up in it too (what each one does is in the README).
+void write_settings_file() {
+    const std::filesystem::path path = settings_path();
+    std::error_code error;
+    if (!std::filesystem::exists(path, error)) {
+        std::ofstream file(path);
+        file << "; " GLASS_NAME " settings. Saved changes apply while the sim runs (within a second). The ReShade add-on\n"
+                "; also has them in its tab in the ReShade overlay. What each setting does: " GLASS_WEBSITE "#settings\n"
+                "; Hotkeys in the sim: Ctrl+Shift+F9 fix on/off, Ctrl+Shift+F11 green tint on every fixed screen,\n"
+                "; Ctrl+Shift+F8 capture the screens for a bug report. What the fix is doing: glass-cockpit-dlss-fix-status.txt.\n"
+                "\n";
+    }
+    save_settings();
+}
+// The file is re-read by the background thread when its time changes; settings changed in the add-on's overlay tab (or
+// by a hotkey) are saved under the same lock, and the new time remembered, so they aren't taken for an edit of the file.
+std::mutex settings_mutex;
+FILETIME settings_written{};
+bool settings_changed() { // under settings_mutex
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(settings_path().c_str(), GetFileExInfoStandard, &data) || CompareFileTime(&data.ftLastWriteTime, &settings_written) == 0) return false;
+    settings_written = data.ftLastWriteTime;
+    return true;
+}
+template <class Change> void change_settings(Change&& change) {
+    std::lock_guard lock(settings_mutex);
+    change();
+    save_settings();
+    settings_changed();
+}
+void reload_settings() {
+    std::lock_guard lock(settings_mutex);
+    if (!settings_changed()) return;
+    const bool was_enabled = enabled;
+    load_settings();
+    if (enabled && !was_enabled) ++generation; // lists recorded while it was off have stale binding state
+    log("settings reloaded: %s", settings_text().c_str());
+}
+
+// Hotkeys (Ctrl+Shift+...), polled about 30 times a second while one of the sim's windows has the focus.
+void poll_hotkeys() {
+    constexpr std::array<int, 6> keys{VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12};
+    static std::array<bool, keys.size()> was_down{};
+    DWORD process = 0;
+    if (const HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &process);
+    const bool chord = process == GetCurrentProcessId() && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool down = chord && (GetAsyncKeyState(keys[i]) & 0x8000);
+        if (down && !was_down[i]) {
+            if (keys[i] == VK_F7) {
+                change_settings([] { mip0_only = !mip0_only; });
+                log("setting full_size_sampling=%d (Ctrl+Shift+F7)", int(mip0_only.load()));
+            }
+            else if (keys[i] == VK_F8) glass::request_capture();
+            else if (keys[i] == VK_F9) glass::set_enabled(!enabled);
+            else if (keys[i] == VK_F10) glass::request_pixel_probe();
+            else if (keys[i] == VK_F11) glass::set_tint(!tint);
+            else {
+                screen_probe_until = present_count.load() + 600;
+                log("screen_probe started: looking for draws that read cockpit-screen-like textures with other shaders");
+            }
+        }
+        was_down[i] = down;
+    }
+}
+
+// Loaded after the sim created its device (e.g. by an ASI loader rather than as dxgi.dll): D3D12 hands back an
+// adapter's existing device instead of making a new one. Views, root signatures and pipelines made before are missed.
+bool loaded_late = false;
+void find_late_device() {
+    static bool tried = false;
+    if (!loaded_late || tried || main_device) return;
+    tried = true;
+    ComPtr<IDXGIFactory6> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    ComPtr<ID3D12Device> device;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter))))
+        D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)); // goes through the device hook
+    // What the sim set up before (its descriptor heaps, render target views) stays unknown, so screens most likely can't
+    // be fixed; the device is still followed so that the log shows what does work.
+    log(main_device ? "WARNING loaded after the sim created its graphics device: the fix can't see what the sim set up before, so screens will most likely stay unfixed. Install the fix as dxgi.dll next to FlightSimulator2024.exe"
+                    : "WARNING loaded after the sim created its graphics device, which could not be found: install the fix as dxgi.dll next to FlightSimulator2024.exe");
+}
+
+std::mutex install_mutex;
+void install_upscaler_hooks() {
+    std::lock_guard lock(install_mutex);
     install_ngx();
     install_ngx_proxies();
     install_ffx();
+}
+
+// Every 10 s: what is missing, in plain words (status file and log), and the counters when they changed.
+void periodic_checks(uint64_t now) {
     scan_modules();
+    if (!reshade_addon && !duplicate_fix && GetModuleHandleW(L"glass-cockpit-dlss-fix.addon64")) {
+        duplicate_fix = true;
+        log("WARNING the ReShade add-on version of this fix (glass-cockpit-dlss-fix.addon64) is installed too: this copy stays off. Remove one of them");
+    }
     {
         // DLSS calls that stop reaching the fix while the sim keeps drawing cockpit screens: DLSS turned off in the sim,
         // or another mod took over the DLSS call.
@@ -3071,8 +3423,8 @@ void on_present(api::effect_runtime* runtime) {
         const uint64_t evaluations = stats.evaluations.load(), draws = stats.display_draws.load(), fsr = stats.fsr_dispatches.load();
         const bool now_stopped = ngx_hooked && last_evaluations && evaluations == last_evaluations && fsr == last_fsr && draws > last_draws;
         if (now_stopped && !stopped)
-            log("WARNING DLSS calls stopped reaching the add-on while the sim still draws cockpit screens (DLSS turned off in the sim, or another mod took over the DLSS call)");
-        if (stopped && evaluations != last_evaluations) log("note DLSS calls reach the add-on again");
+            log("WARNING DLSS calls stopped reaching the fix while the sim still draws cockpit screens (DLSS turned off in the sim, or another mod took over the DLSS call)");
+        if (stopped && evaluations != last_evaluations) log("note DLSS calls reach the fix again");
         check_ngx_hooks(now_stopped, now_stopped && !stopped);
         stopped = now_stopped;
         last_evaluations = evaluations; last_draws = draws; last_fsr = fsr;
@@ -3083,7 +3435,17 @@ void on_present(api::effect_runtime* runtime) {
     }
     const auto minutes = (now - init_tick) / 60000.0;
     const char* found = nullptr;
-    if (!ngx_hooked && !ngx_proxy_hooked && !ffx_hooked && minutes > 2) {
+    if (duplicate_fix) found = "The ReShade add-on version of this fix (glass-cockpit-dlss-fix.addon64) is installed too, so this copy stays off. Remove one of them.";
+    if (!main_device && minutes > 2 && !found) {
+        if (reshade_addon) {
+            LOG_ONCE("WARNING no Direct3D 12 device reported by ReShade after 2 minutes: is ReShade installed for Direct3D 12?");
+            found = "ReShade has not reported the sim's graphics device. Install ReShade (with add-on support) for Direct3D 12.";
+        } else {
+            LOG_ONCE("WARNING no Direct3D 12 device seen after 2 minutes: is the fix installed as dxgi.dll in the folder of FlightSimulator2024.exe?");
+            found = "The sim's graphics device was not seen. Install the fix as dxgi.dll in the folder of FlightSimulator2024.exe.";
+        }
+    }
+    if (!ngx_hooked && !ngx_proxy_hooked && !ffx_hooked && minutes > 2 && !found) {
         LOG_ONCE("WARNING neither DLSS (_nvngx.dll) nor FSR (amd_fidelityfx_dx12.dll) loaded after 2 minutes: is DLSS or FSR selected in the sim's graphics settings?");
         found = "No upscaler loaded. Select DLSS or FSR in the sim's graphics settings.";
     }
@@ -3092,7 +3454,7 @@ void on_present(api::effect_runtime* runtime) {
         if (!found) found = "No cockpit display shader seen yet. Load a flight with a glass cockpit. If you are in one, a sim update may have changed the shader and the fix needs an update.";
     }
     if (ngx_hook_failed && !stats.fsr_dispatches && !found)
-        found = "DLSS is loaded, but the add-on could not attach to it. Another mod that hooks DLSS (e.g. a DLSS 5 add-on) may be blocking it: try without it, and send your log.";
+        found = "DLSS is loaded, but the fix could not attach to it. Another mod that hooks DLSS (e.g. a DLSS 5 add-on) may be blocking it: try without it, and send your log.";
     static uint64_t display_since = 0;
     if (stats.display_draws && !display_since) display_since = now;
     if (display_since && now - display_since > 20000 && !found) {
@@ -3110,7 +3472,7 @@ void on_present(api::effect_runtime* runtime) {
             found = "The upscaler is running and screens are recorded, but the fix could not be drawn yet. Please report this with your log files.";
         }
     }
-    if (stats.composites) found = nullptr;
+    if (stats.composites && !duplicate_fix) found = nullptr;
     problem = found;
     // Stats only when something changed, to keep the log small.
     static std::array<uint64_t, 6> last{};
@@ -3123,15 +3485,450 @@ void on_present(api::effect_runtime* runtime) {
             stats.composite_skipped.load(), stats.variant_pending.load(), stats.unknown_texture.load(), stats.unsupported_draw.load());
     }
 }
+
+// The status as a text file next to the log, rewritten when it changes (the add-on also shows it in its overlay tab).
+void write_status_file() {
+    static std::string last;
+    const auto text = glass::status_text(glass::status());
+    if (text == last) return;
+    last = text;
+    std::ofstream(addon_directory / L"glass-cockpit-dlss-fix-status.txt") << text;
+}
+
+bool fixture_host = false; // the offline test host (no swapchain: it ticks the frame clock itself)
+void housekeeping() {
+    uint64_t next_settings = 0, next_install = 0, next_check = 0;
+    for (;;) {
+        Sleep(33);
+        const uint64_t now = GetTickCount64();
+        poll_hotkeys();
+        // No presents for a second: keep the frame clock going (about 60 ticks a second).
+        if (!fixture_host && now - last_present_tick.load() > 1000) { frame_tick(nullptr, nullptr); frame_tick(nullptr, nullptr); }
+        if (now >= next_settings) { next_settings = now + 1000; reload_settings(); }
+        // (The offline test host loads its stand-in upscalers and patches them itself before creating its device.)
+        if (now >= next_install && !fixture_host) { next_install = now + 2000; find_late_device(); install_upscaler_hooks(); }
+        if (now >= next_check) { next_check = now + 10000; periodic_checks(now); write_status_file(); }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The hook functions and their installation.
+template <class T> bool hook_slot(void* object, size_t slot, void* detour, T& original) {
+    return hook((*reinterpret_cast<void***>(object))[slot], detour, original);
+}
+
+// Device creation (d3d12.dll export).
+using CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+CreateDevice original_create_device = nullptr;
+HRESULT WINAPI create_device_hook(IUnknown* adapter, D3D_FEATURE_LEVEL level, REFIID iid, void** device) {
+    const HRESULT hr = original_create_device(adapter, level, iid, device);
+    if (SUCCEEDED(hr) && device && *device) {
+        ComPtr<ID3D12Device> created;
+        if (SUCCEEDED(static_cast<IUnknown*>(*device)->QueryInterface(IID_PPV_ARGS(&created)))) device_created(created.Get());
+    }
+    return hr;
+}
+
+// Device methods.
+using CreateRootSignature = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
+using CreateSrv = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using CreateUav = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*, const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using CreateRtv = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using CreateCommandList = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID, void**);
+using CreateCommandList1 = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device4*, UINT, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_FLAGS, REFIID, void**);
+using CreateCommandSignature = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, ID3D12RootSignature*, REFIID, void**);
+CreateRootSignature original_create_root_signature = nullptr;
+CreateSrv original_create_srv = nullptr;
+CreateUav original_create_uav = nullptr;
+CreateRtv original_create_rtv = nullptr;
+CreateCommandList original_create_command_list = nullptr;
+CreateCommandList1 original_create_command_list1 = nullptr;
+CreateCommandSignature original_create_command_signature = nullptr;
+HRESULT STDMETHODCALLTYPE create_root_signature_hook(ID3D12Device* device, UINT mask, const void* blob, SIZE_T size, REFIID iid, void** out) {
+    const HRESULT hr = original_create_root_signature(device, mask, blob, size, iid, out);
+    if (SUCCEEDED(hr) && !passthrough() && device == main_device && blob && out && *out) {
+        ComPtr<ID3D12RootSignature> root;
+        if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&root)))) root_signature_created(blob, size, root.Get());
+    }
+    return hr;
+}
+void STDMETHODCALLTYPE create_srv_hook(ID3D12Device* device, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    original_create_srv(device, resource, desc, handle);
+    if (!passthrough() && device == main_device) view_created(resource, desc, handle);
+}
+void STDMETHODCALLTYPE create_uav_hook(ID3D12Device* device, ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    original_create_uav(device, resource, counter, desc, handle);
+    if (!passthrough() && device == main_device && handle.ptr && track_descriptors.load(std::memory_order_relaxed)) set_tracked(uintptr_t(handle.ptr), 0); // a new view replaces what was there
+}
+void STDMETHODCALLTYPE create_rtv_hook(ID3D12Device* device, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    original_create_rtv(device, resource, desc, handle);
+    if (passthrough() || device != main_device) return;
+    std::unique_lock lock(rtv_mutex);
+    rtv_resources[handle.ptr] = resource;
+}
+void command_list_created(ID3D12Device* device, void** out, ID3D12PipelineState* initial) {
+    if (passthrough() || !out || !*out) return;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list)))) list_created(list.Get(), device, initial);
+}
+HRESULT STDMETHODCALLTYPE create_command_list_hook(ID3D12Device* device, UINT mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator,
+    ID3D12PipelineState* initial, REFIID iid, void** out) {
+    const HRESULT hr = original_create_command_list(device, mask, type, allocator, initial, iid, out);
+    if (SUCCEEDED(hr)) command_list_created(device, out, initial);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE create_command_list1_hook(ID3D12Device4* device, UINT mask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID iid, void** out) {
+    const HRESULT hr = original_create_command_list1(device, mask, type, flags, iid, out);
+    if (SUCCEEDED(hr)) command_list_created(device, out, nullptr); // created closed: Reset comes before recording
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE create_command_signature_hook(ID3D12Device* device, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root, REFIID iid,
+    void** out) {
+    const HRESULT hr = original_create_command_signature(device, desc, root, iid, out);
+    if (SUCCEEDED(hr) && !passthrough() && desc && out && *out) {
+        ComPtr<ID3D12CommandSignature> signature;
+        if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&signature)))) command_signature_created(*desc, signature.Get());
+    }
+    return hr;
+}
+
+// Command list methods. Draws and copies are seen before they run; bindings after.
+using ListReset = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+using ListClearState = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+using ListDraw = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+using ListDrawIndexed = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+using ListCopyTextureRegion = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT,
+    const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
+using ListSetPipelineState = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+using ListSetRootSignature = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
+using ListSetRootTable = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
+using ListSetRenderTargets = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+using ListBeginRenderPass = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList4*, UINT, const D3D12_RENDER_PASS_RENDER_TARGET_DESC*,
+    const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC*, D3D12_RENDER_PASS_FLAGS);
+using ListEndRenderPass = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList4*);
+using ListSetScissorRects = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RECT*);
+using ListExecuteIndirect = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64);
+ListReset original_reset = nullptr;
+ListClearState original_clear_state = nullptr;
+ListDraw original_draw = nullptr;
+ListDrawIndexed original_draw_indexed = nullptr;
+ListCopyTextureRegion original_copy_texture_region = nullptr;
+ListSetPipelineState original_set_pipeline_state = nullptr;
+ListSetRootSignature original_set_root_signature = nullptr;
+ListSetRootTable original_set_root_table = nullptr;
+ListSetRenderTargets original_set_render_targets = nullptr;
+ListBeginRenderPass original_begin_render_pass = nullptr;
+ListEndRenderPass original_end_render_pass = nullptr;
+ListSetScissorRects original_set_scissor_rects = nullptr;
+ListExecuteIndirect original_execute_indirect = nullptr;
+HRESULT STDMETHODCALLTYPE reset_hook(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial) {
+    const HRESULT hr = original_reset(list, allocator, initial);
+    if (SUCCEEDED(hr) && !passthrough()) list_reset(list, initial);
+    return hr;
+}
+void STDMETHODCALLTYPE clear_state_hook(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline) {
+    original_clear_state(list, pipeline);
+    if (!passthrough()) pipeline_bound(list, pipeline);
+}
+// A cockpit screen's draw is issued by the fix itself, followed by its map draw (draw_recorded returns true then).
+void STDMETHODCALLTYPE draw_hook(ID3D12GraphicsCommandList* list, UINT count, UINT instances, UINT first, UINT first_instance) {
+    if (!passthrough() && draw_recorded(list, {false, count, instances, first, first_instance, 0})) return;
+    original_draw(list, count, instances, first, first_instance);
+}
+void STDMETHODCALLTYPE draw_indexed_hook(ID3D12GraphicsCommandList* list, UINT count, UINT instances, UINT first, INT vertex, UINT first_instance) {
+    if (!passthrough() && draw_recorded(list, {true, count, instances, first, first_instance, vertex})) return;
+    original_draw_indexed(list, count, instances, first, vertex, first_instance);
+}
+void STDMETHODCALLTYPE execute_indirect_hook(ID3D12GraphicsCommandList* list, ID3D12CommandSignature* signature, UINT max_count, ID3D12Resource* arguments,
+    UINT64 arguments_offset, ID3D12Resource* count, UINT64 count_offset) {
+    if (!passthrough()) indirect_recorded(list, signature, max_count);
+    original_execute_indirect(list, signature, max_count, arguments, arguments_offset, count, count_offset);
+}
+void STDMETHODCALLTYPE copy_texture_region_hook(ID3D12GraphicsCommandList* list, const D3D12_TEXTURE_COPY_LOCATION* dest, UINT x, UINT y, UINT z,
+    const D3D12_TEXTURE_COPY_LOCATION* source, const D3D12_BOX* box) {
+    if (!passthrough() && dest && source && dest->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && source->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
+        texture_copied(source->pResource, dest->pResource, dest->SubresourceIndex);
+    original_copy_texture_region(list, dest, x, y, z, source, box);
+}
+void STDMETHODCALLTYPE set_pipeline_state_hook(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline) {
+    original_set_pipeline_state(list, pipeline);
+    if (!passthrough()) pipeline_bound(list, pipeline);
+}
+void STDMETHODCALLTYPE set_root_signature_hook(ID3D12GraphicsCommandList* list, ID3D12RootSignature* root) {
+    original_set_root_signature(list, root);
+    if (!passthrough()) root_signature_bound(list, root);
+}
+void STDMETHODCALLTYPE set_root_table_hook(ID3D12GraphicsCommandList* list, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) {
+    original_set_root_table(list, index, table);
+    if (!passthrough()) table_bound(list, index, table);
+}
+void STDMETHODCALLTYPE set_render_targets_hook(ID3D12GraphicsCommandList* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
+    original_set_render_targets(list, count, targets, single_range, depth);
+    if (!passthrough()) targets_bound(list, count, targets, single_range, depth);
+}
+void STDMETHODCALLTYPE set_scissor_rects_hook(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RECT* rects) {
+    original_set_scissor_rects(list, count, rects);
+    if (!passthrough()) scissors_bound(list, count, rects);
+}
+void STDMETHODCALLTYPE begin_render_pass_hook(ID3D12GraphicsCommandList4* list, UINT count, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* targets,
+    const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth, D3D12_RENDER_PASS_FLAGS flags) {
+    if (!passthrough()) pass_begun(list, count, targets);
+    original_begin_render_pass(list, count, targets, depth, flags);
+}
+void STDMETHODCALLTYPE end_render_pass_hook(ID3D12GraphicsCommandList4* list) {
+    if (!passthrough()) pass_ended(list);
+    original_end_render_pass(list);
+}
+
+// The runtime's functions are shared by all its devices and command lists, so they are hooked once, at the first device.
+void install_d3d12_hooks(ID3D12Device* device) {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    bool pipelines = hook_slot(device, graphics_pipeline_slot(), reinterpret_cast<void*>(&graphics_hook), original_graphics);
+    ComPtr<ID3D12Device2> device2;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device2))))
+        pipelines &= hook_slot(device2.Get(), pipeline_stream_slot(), reinterpret_cast<void*>(&stream_hook), original_stream);
+    bool devices = hook_slot(device, create_descriptor_heap_slot(), reinterpret_cast<void*>(&create_heap_hook), original_create_heap) &&
+        hook_slot(device, copy_descriptors_slot(), reinterpret_cast<void*>(&copy_hook), original_copy) &&
+        hook_slot(device, copy_descriptors_simple_slot(), reinterpret_cast<void*>(&copy_simple_hook), original_copy_simple) &&
+        hook_slot(device, create_root_signature_slot(), reinterpret_cast<void*>(&create_root_signature_hook), original_create_root_signature) &&
+        hook_slot(device, create_srv_slot(), reinterpret_cast<void*>(&create_srv_hook), original_create_srv) &&
+        hook_slot(device, create_uav_slot(), reinterpret_cast<void*>(&create_uav_hook), original_create_uav) &&
+        hook_slot(device, create_rtv_slot(), reinterpret_cast<void*>(&create_rtv_hook), original_create_rtv) &&
+        hook_slot(device, create_command_list_slot(), reinterpret_cast<void*>(&create_command_list_hook), original_create_command_list);
+    ComPtr<ID3D12Device4> device4;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4))))
+        devices &= hook_slot(device4.Get(), create_command_list1_slot(), reinterpret_cast<void*>(&create_command_list1_hook), original_create_command_list1);
+    // Only the pixel probe needs these (indirect draws listed, the game's scissor rectangle restored).
+    bool probes = hook_slot(device, create_command_signature_slot(), reinterpret_cast<void*>(&create_command_signature_hook), original_create_command_signature);
+    // The command list functions, found through a list of our own.
+    bool lists = false, passes = false;
+    {
+        Internal internal;
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) &&
+            SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)))) {
+            list->Close();
+            lists = hook_slot(list.Get(), list_reset_slot(), reinterpret_cast<void*>(&reset_hook), original_reset) &&
+                hook_slot(list.Get(), list_clear_state_slot(), reinterpret_cast<void*>(&clear_state_hook), original_clear_state) &&
+                hook_slot(list.Get(), list_draw_slot(), reinterpret_cast<void*>(&draw_hook), original_draw) &&
+                hook_slot(list.Get(), list_draw_indexed_slot(), reinterpret_cast<void*>(&draw_indexed_hook), original_draw_indexed) &&
+                hook_slot(list.Get(), list_copy_texture_region_slot(), reinterpret_cast<void*>(&copy_texture_region_hook), original_copy_texture_region) &&
+                hook_slot(list.Get(), list_set_pipeline_state_slot(), reinterpret_cast<void*>(&set_pipeline_state_hook), original_set_pipeline_state) &&
+                hook_slot(list.Get(), list_set_graphics_root_signature_slot(), reinterpret_cast<void*>(&set_root_signature_hook), original_set_root_signature) &&
+                hook_slot(list.Get(), list_set_graphics_root_table_slot(), reinterpret_cast<void*>(&set_root_table_hook), original_set_root_table) &&
+                hook_slot(list.Get(), list_set_render_targets_slot(), reinterpret_cast<void*>(&set_render_targets_hook), original_set_render_targets);
+            probes = probes && hook_slot(list.Get(), list_set_scissor_rects_slot(), reinterpret_cast<void*>(&set_scissor_rects_hook), original_set_scissor_rects) &&
+                hook_slot(list.Get(), list_execute_indirect_slot(), reinterpret_cast<void*>(&execute_indirect_hook), original_execute_indirect);
+            ComPtr<ID3D12GraphicsCommandList4> list4;
+            if (SUCCEEDED(list.As(&list4)))
+                passes = hook_slot(list4.Get(), list_begin_render_pass_slot(), reinterpret_cast<void*>(&begin_render_pass_hook), original_begin_render_pass) &&
+                    hook_slot(list4.Get(), list_end_render_pass_slot(), reinterpret_cast<void*>(&end_render_pass_hook), original_end_render_pass);
+        }
+    }
+    log("d3d12 hooks pipelines=%d device=%d command_lists=%d render_passes=%d pixel_probe=%d%s", pipelines, devices, lists, passes, probes,
+        pipelines && devices && lists ? "" : " - ERROR the fix cannot follow the sim's drawing without these; send the log");
+}
+
+// DXGI: swapchain creation (to know the sim's swapchain and queue) and presents (the frame clock).
+using FactoryCreateSwapChain = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+using FactoryCreateSwapChainForHwnd = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+using FactoryCreateSwapChainForCoreWindow = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*,
+    IDXGISwapChain1**);
+using FactoryCreateSwapChainForComposition = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+using SwapChainPresent = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+using SwapChainPresent1 = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+FactoryCreateSwapChain original_create_swapchain = nullptr;
+FactoryCreateSwapChainForHwnd original_create_swapchain_hwnd = nullptr;
+FactoryCreateSwapChainForCoreWindow original_create_swapchain_core_window = nullptr;
+FactoryCreateSwapChainForComposition original_create_swapchain_composition = nullptr;
+SwapChainPresent original_present = nullptr;
+SwapChainPresent1 original_present1 = nullptr;
+HRESULT STDMETHODCALLTYPE create_swapchain_hook(IDXGIFactory* factory, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
+    const HRESULT hr = original_create_swapchain(factory, device, desc, out);
+    if (SUCCEEDED(hr) && out && *out) swapchain_created(device, *out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE create_swapchain_hwnd_hook(IDXGIFactory2* factory, IUnknown* device, HWND window, const DXGI_SWAP_CHAIN_DESC1* desc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output, IDXGISwapChain1** out) {
+    const HRESULT hr = original_create_swapchain_hwnd(factory, device, window, desc, fullscreen, output, out);
+    if (SUCCEEDED(hr) && out && *out) swapchain_created(device, *out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE create_swapchain_core_window_hook(IDXGIFactory2* factory, IUnknown* device, IUnknown* window, const DXGI_SWAP_CHAIN_DESC1* desc,
+    IDXGIOutput* output, IDXGISwapChain1** out) {
+    const HRESULT hr = original_create_swapchain_core_window(factory, device, window, desc, output, out);
+    if (SUCCEEDED(hr) && out && *out) swapchain_created(device, *out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE create_swapchain_composition_hook(IDXGIFactory2* factory, IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* output,
+    IDXGISwapChain1** out) {
+    const HRESULT hr = original_create_swapchain_composition(factory, device, desc, output, out);
+    if (SUCCEEDED(hr) && out && *out) swapchain_created(device, *out);
+    return hr;
+}
+// One tick per present, also when Present calls Present1 inside (or the other way round).
+thread_local bool in_present = false;
+HRESULT STDMETHODCALLTYPE present_hook(IDXGISwapChain* swapchain, UINT interval, UINT flags) {
+    const bool outer = !in_present;
+    if (outer && !(flags & DXGI_PRESENT_TEST) && !passthrough()) presented(swapchain);
+    in_present = true;
+    const HRESULT hr = original_present(swapchain, interval, flags);
+    if (outer) in_present = false;
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE present1_hook(IDXGISwapChain1* swapchain, UINT interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
+    const bool outer = !in_present;
+    if (outer && !(flags & DXGI_PRESENT_TEST) && !passthrough()) presented(swapchain);
+    in_present = true;
+    const HRESULT hr = original_present1(swapchain, interval, flags, parameters);
+    if (outer) in_present = false;
+    return hr;
+}
+std::mutex dxgi_hooks_mutex;
+void install_dxgi_hooks(IUnknown* factory) {
+    std::lock_guard lock(dxgi_hooks_mutex);
+    static bool installed = false;
+    ComPtr<IDXGIFactory2> factory2;
+    if (installed || !factory || FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory2)))) return;
+    installed = true;
+    const bool hooked = hook_slot(factory2.Get(), factory_create_swapchain_slot(), reinterpret_cast<void*>(&create_swapchain_hook), original_create_swapchain) &&
+        hook_slot(factory2.Get(), factory_create_swapchain_hwnd_slot(), reinterpret_cast<void*>(&create_swapchain_hwnd_hook), original_create_swapchain_hwnd) &&
+        hook_slot(factory2.Get(), factory_create_swapchain_core_window_slot(), reinterpret_cast<void*>(&create_swapchain_core_window_hook), original_create_swapchain_core_window) &&
+        hook_slot(factory2.Get(), factory_create_swapchain_composition_slot(), reinterpret_cast<void*>(&create_swapchain_composition_hook), original_create_swapchain_composition);
+    log("dxgi swapchain hooks=%d", hooked);
+}
+void install_present_hooks(IDXGISwapChain* swapchain) {
+    std::lock_guard lock(dxgi_hooks_mutex);
+    static bool installed = false;
+    ComPtr<IDXGISwapChain1> swapchain1;
+    if (installed || FAILED(swapchain->QueryInterface(IID_PPV_ARGS(&swapchain1)))) return;
+    installed = true;
+    const bool hooked = hook_slot(swapchain1.Get(), swapchain_present_slot(), reinterpret_cast<void*>(&present_hook), original_present) &&
+        hook_slot(swapchain1.Get(), swapchain_present1_slot(), reinterpret_cast<void*>(&present1_hook), original_present1);
+    log("dxgi present hooks=%d%s", hooked, hooked ? "" : " (the frame clock runs on a timer instead; captures leave out the presented frames)");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Start (host.hpp), when the sim loads this DLL: as its dxgi.dll (or through another loader), or as ReShade's add-on.
+// In any other process (the launcher, crash reporter...) the fix doesn't start, and the standalone DLL only passes
+// dxgi.dll's exports through.
+bool active = false;
 }
 
 namespace glass {
+bool start(void* self_module, void* reshade_module) noexcept try {
+    const auto self = static_cast<HMODULE>(self_module);
+    wchar_t executable[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, executable, MAX_PATH);
+    if (_wcsicmp(std::filesystem::path(executable).filename().c_str(), L"FlightSimulator2024.exe") != 0) return false;
+    if (const auto minhook = MH_Initialize(); minhook != MH_OK && minhook != MH_ERROR_ALREADY_INITIALIZED) return false;
+    active = true;
+    reshade_addon = reshade_module != nullptr;
+    HMODULE pinned = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&start), &pinned);
+    wchar_t module[MAX_PATH]{};
+    GetModuleFileNameW(self, module, MAX_PATH);
+    addon_directory = std::filesystem::path(module).parent_path();
+    // Offline test host: the stand-in display shader sits next to the fake FlightSimulator2024.exe.
+    const auto fixture_directory = std::filesystem::path(executable).parent_path();
+    std::error_code error;
+    fixture_host = std::filesystem::exists(fixture_directory / L"fixture_ps.cso", error);
+    force_tracking = fixture_host && wcsstr(GetCommandLineW(), L"--track");
+    if (fixture_host) {
+        auto hash_file = [](const std::filesystem::path& path) {
+            std::ifstream file(path, std::ios::binary);
+            const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), {});
+            return shader_hash(bytes.data(), bytes.size());
+        };
+        display_ps = hash_file(fixture_directory / L"fixture_ps.cso");
+        display_vs = hash_file(fixture_directory / L"fixture_vs.cso");
+        vr_display_ps = hash_file(fixture_directory / L"fixture_vr_ps.cso");
+        display_ps_t0 = hash_file(fixture_directory / L"fixture_t0_ps.cso");
+        vr_display_ps_t0 = hash_file(fixture_directory / L"fixture_vr_t0_ps.cso");
+        vr_display_vs = hash_file(fixture_directory / L"fixture_vr_vs.cso");
+    }
+    // Keep the previous session's log: after a crash people usually relaunch before sending it.
+    const auto log_path = addon_directory / L"glass-cockpit-dlss-fix.log";
+    std::filesystem::rename(log_path, addon_directory / L"glass-cockpit-dlss-fix.old.log", error);
+    // Not inherited (N): the sim starts helper processes (e.g. FenixBootstrapper) that would keep the log open after it
+    // quits, and the next session could not open it.
+    logfile = _wfsopen(log_path.c_str(), L"wN", _SH_DENYWR);
+    log_file_path = log_path;
+    if (!logfile) {
+        // Something still holds the log (e.g. the previous session's process hasn't quite exited): log under another
+        // name rather than not at all.
+        log_file_path = addon_directory / (L"glass-cockpit-dlss-fix-" + std::to_wstring(GetCurrentProcessId()) + L".log");
+        logfile = _wfsopen(log_file_path.c_str(), L"wN", _SH_DENYWR);
+        if (logfile) log("the usual log file could not be opened (another process holds it): logging here instead");
+    }
+    // The offline test runs with default settings unless asked to read the .ini (GLASS_FIXTURE_SETTINGS=1).
+    wchar_t fixture_settings[8]{};
+    if (!fixture_host || (GetEnvironmentVariableW(L"GLASS_FIXTURE_SETTINGS", fixture_settings, 8) && fixture_settings[0] == L'1')) {
+        std::lock_guard lock(settings_mutex);
+        load_settings();
+        write_settings_file();
+        settings_changed(); // remember the file's time: only later changes are reloads
+    }
+    init_tick = GetTickCount64();
+    OSVERSIONINFOEXW os{sizeof(os)};
+    using RtlGetVersion = LONG(WINAPI*)(OSVERSIONINFOEXW*);
+    if (auto get = reinterpret_cast<RtlGetVersion>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"))) get(&os);
+    log("%s (%s) %s (built " __DATE__ " " __TIME__ ")", GLASS_NAME, edition(), overlay_version);
+    log("windows %lu.%lu.%lu  game=%ls", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, executable);
+    if (reshade_addon) {
+        wchar_t reshade_path[MAX_PATH]{};
+        GetModuleFileNameW(static_cast<HMODULE>(reshade_module), reshade_path, MAX_PATH);
+        log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
+    }
+    log("module path=%ls fixture=%d %s", module, fixture_host, settings_text().c_str());
+    log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint, Ctrl+Shift+F8 capture, Ctrl+Shift+F10 pixel probe, Ctrl+Shift+F7 full-size sampling; settings in %ls",
+        settings_path().c_str());
+    if (!reshade_addon && _wcsicmp(std::filesystem::path(module).filename().c_str(), L"dxgi.dll") != 0)
+        log("note loaded as %ls rather than as dxgi.dll", std::filesystem::path(module).filename().c_str());
+    std::thread(worker).detach();
+    std::thread(housekeeping).detach();
+    return true;
+} catch (...) { return false; }
+
+void stop() { shutting_down = true; }
+
+// Standalone: the sim creates its device after loading this DLL. d3d12.dll is loaded already (this DLL imports it); if
+// its device exists already, this DLL came too late to see it made.
+void hook_device_creation() noexcept try {
+    if (!active) return;
+    loaded_late = GetModuleHandleW(L"d3d12core.dll") != nullptr;
+    const auto d3d12 = GetModuleHandleW(L"d3d12.dll");
+    const auto create = d3d12 ? GetProcAddress(d3d12, "D3D12CreateDevice") : nullptr;
+    const bool hooked = create && hook(reinterpret_cast<void*>(create), reinterpret_cast<void*>(&create_device_hook), original_create_device);
+    log("device creation hook=%d%s", hooked, loaded_late ? " (a device existed already: loaded late)" : "");
+} catch (...) {}
+
+void dxgi_factory_created(IUnknown* factory) {
+    if (active) install_dxgi_hooks(factory);
+}
+void device_created(ID3D12Device* device) {
+    if (active && device) ::device_created(device);
+}
+void swapchain_created(IUnknown* queue, IUnknown* swapchain) {
+    if (active) ::swapchain_created(queue, swapchain);
+}
+void write_log(const char* format, ...) {
+    va_list args; va_start(args, format); log_args(format, args); va_end(args);
+}
+
 Status status() {
     Status s;
     {
         std::lock_guard lock(info_mutex);
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
+    s.addon = reshade_addon;
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
     s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing, stable_edges, int(mip0_only.load()), calm_glass, edge_trim_percent, occlusion_check}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
@@ -3148,7 +3945,8 @@ Status status() {
 void set_enabled(bool on) {
     if (on == enabled) return;
     if (on) ++generation;
-    enabled = on; save_settings(); log("setting overlay=%d", int(on));
+    change_settings([&] { enabled = on; });
+    log("setting overlay=%d", int(on));
 }
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
 void request_pixel_probe() {
@@ -3186,131 +3984,44 @@ void request_capture() {
     capture_requested = capture_frame_count;
     log("capture requested: %ls", capture_folder.c_str());
 }
-void set_line_smoothing(int percent) { smoothing_percent = std::clamp(percent, 0, smoothing_limit()); save_settings(); log("setting line_smoothing=%d", smoothing_percent.load()); }
+// The add-on's overlay tab (status_panel.cpp).
+void set_line_smoothing(int percent) {
+    change_settings([&] { smoothing_percent = std::clamp(percent, 0, smoothing_limit()); });
+    log("setting line_smoothing=%d", smoothing_percent.load());
+}
 void set_extra_smoothing(bool on) {
-    extra_smoothing = on;
-    smoothing_percent = std::min(smoothing_percent.load(), smoothing_limit());
-    save_settings();
+    change_settings([&] { extra_smoothing = on; smoothing_percent = std::min(smoothing_percent.load(), smoothing_limit()); });
     log("setting extra_smoothing=%d line_smoothing=%d", int(on), smoothing_percent.load());
 }
-void set_jitter_positive(bool on) { jitter_positive = on; save_settings(); log("setting jitter_positive=%d", int(on)); }
+void set_jitter_positive(bool on) {
+    change_settings([&] { jitter_positive = on; });
+    log("setting jitter_positive=%d", int(on));
+}
 void set_experimental(const Experimental& e) {
-    detail_clamp_percent = std::clamp(e.detail_clamp, 0, 100); edge_fade_percent = std::clamp(e.edge_fade, 0, max_edge_fade);
-    angle_soften_percent = std::clamp(e.angle_softening, 0, 100); edge_stretch_percent = std::clamp(e.edge_stretch, 0, max_edge_stretch);
-    edge_trim_percent = std::clamp(e.edge_trim, 0, max_edge_trim);
-    dark_screen_fix = e.dark_screens ? 1 : 0;
-    seam_fix = e.seam_fix ? 1 : 0;
-    temporal_aa = e.temporal_aa ? 1 : 0;
-    soft_smoothing = e.soft_smoothing ? 1 : 0;
-    if (soft_smoothing) temporal_aa = 0; // one or the other
-    stable_edges = e.stable_edges ? 1 : 0;
-    mip0_only = e.full_size != 0;
-    calm_glass = e.calm_glass ? 1 : 0;
-    occlusion_check = e.occlusion_check ? 1 : 0;
-    save_settings();
+    change_settings([&] {
+        detail_clamp_percent = std::clamp(e.detail_clamp, 0, 100); edge_fade_percent = std::clamp(e.edge_fade, 0, max_edge_fade);
+        angle_soften_percent = std::clamp(e.angle_softening, 0, 100); edge_stretch_percent = std::clamp(e.edge_stretch, 0, max_edge_stretch);
+        edge_trim_percent = std::clamp(e.edge_trim, 0, max_edge_trim);
+        dark_screen_fix = e.dark_screens ? 1 : 0;
+        seam_fix = e.seam_fix ? 1 : 0;
+        temporal_aa = e.temporal_aa ? 1 : 0;
+        soft_smoothing = e.soft_smoothing ? 1 : 0;
+        if (soft_smoothing) temporal_aa = 0; // one or the other
+        stable_edges = e.stable_edges ? 1 : 0;
+        mip0_only = e.full_size != 0;
+        calm_glass = e.calm_glass ? 1 : 0;
+        occlusion_check = e.occlusion_check ? 1 : 0;
+    });
     log("setting seam_fix=%d full_size_sampling=%d stable_edges=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d", seam_fix.load(), int(mip0_only.load()), stable_edges.load(),
         dark_screen_fix.load(), detail_clamp_percent.load(), edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
 }
-void set_glass_strength(int percent) { glass_percent = std::clamp(percent, 0, 100); save_settings(); log("setting glass_strength=%d", glass_percent.load()); }
+void set_glass_strength(int percent) {
+    change_settings([&] { glass_percent = std::clamp(percent, 0, 100); });
+    log("setting glass_strength=%d", glass_percent.load());
+}
 }
 
-extern "C" __declspec(dllexport) const char* NAME = GLASS_NAME;
-extern "C" __declspec(dllexport) const char* AUTHOR = GLASS_AUTHOR;
-extern "C" __declspec(dllexport) const char* WEBSITE = GLASS_WEBSITE;
-extern "C" __declspec(dllexport) const char* ISSUES = GLASS_ISSUES;
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghosting from MSFS 2024 glass cockpit displays. Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint.";
-
-#define OVERLAY_EVENTS(X) \
-    X(init_device, on_init_device) X(destroy_device, on_destroy_device) X(init_pipeline_layout, on_init_layout) \
-    X(init_resource_view, on_init_view) X(destroy_resource, on_destroy_resource) \
-    X(init_command_list, on_init_list) X(destroy_command_list, on_destroy_list) X(reset_command_list, on_reset_list) \
-    X(bind_pipeline, on_bind_pipeline) X(bind_descriptor_tables, on_bind_tables) \
-    X(bind_render_targets_and_depth_stencil, on_bind_targets) X(begin_render_pass, on_begin_pass) X(end_render_pass, on_end_pass) \
-    X(draw, on_draw) X(draw_indexed, on_draw_indexed) X(reshade_present, on_present) X(init_pipeline, on_init_pipeline) \
-    X(copy_texture_region, on_copy_region) X(bind_scissor_rects, on_bind_scissors) X(draw_or_dispatch_indirect, on_draw_indirect)
-
-// ReShade unloads its add-ons when the last device goes away and loads them again for the next one (e.g. when another
-// mod such as OptiScaler creates and releases a device at startup). The module stays pinned (its hooks must stay
-// valid), so a reload calls AddonInit again on the same, already initialised module.
-bool initialised = false;
-bool enabled_before_unload = true;
-extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_module) {
-    wchar_t executable[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, executable, MAX_PATH);
-    if (_wcsicmp(std::filesystem::path(executable).filename().c_str(), L"FlightSimulator2024.exe") != 0) return false;
-    const auto minhook = MH_Initialize();
-    if ((minhook != MH_OK && minhook != MH_ERROR_ALREADY_INITIALIZED) || !reshade::register_addon(addon, reshade_module)) return false;
-    if (initialised) { // reload: keep the log, settings, worker and hooks; only re-register with ReShade
-        enabled = enabled_before_unload;
-        log("add-on reloaded by ReShade (another device was created and released before; normal with some other mods)");
-#define REGISTER(event, callback) reshade::register_event<reshade::addon_event::event>(callback);
-        OVERLAY_EVENTS(REGISTER)
-#undef REGISTER
-        glass::init_status_panel(reshade_module);
-        return true;
-    }
-    initialised = true;
-    HMODULE pinned = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&AddonInit), &pinned);
-    wchar_t module[MAX_PATH]{};
-    GetModuleFileNameW(addon, module, MAX_PATH);
-    addon_directory = std::filesystem::path(module).parent_path();
-    // Offline test host: the stand-in display shader sits next to the fake FlightSimulator2024.exe.
-    const auto fixture_directory = std::filesystem::path(executable).parent_path();
-    std::error_code error;
-    const bool fixture = std::filesystem::exists(fixture_directory / L"fixture_ps.cso", error);
-    force_tracking = fixture && wcsstr(GetCommandLineW(), L"--track");
-    if (fixture) {
-        auto hash_file = [](const std::filesystem::path& path) {
-            std::ifstream file(path, std::ios::binary);
-            const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), {});
-            return shader_hash(bytes.data(), bytes.size());
-        };
-        display_ps = hash_file(fixture_directory / L"fixture_ps.cso");
-        display_vs = hash_file(fixture_directory / L"fixture_vs.cso");
-        vr_display_ps = hash_file(fixture_directory / L"fixture_vr_ps.cso");
-        display_ps_t0 = hash_file(fixture_directory / L"fixture_t0_ps.cso");
-        vr_display_ps_t0 = hash_file(fixture_directory / L"fixture_vr_t0_ps.cso");
-        vr_display_vs = hash_file(fixture_directory / L"fixture_vr_vs.cso");
-    }
-    // Keep the previous session's log: after a crash people usually relaunch before sending it.
-    const auto log_path = addon_directory / L"glass-cockpit-dlss-fix.log";
-    std::filesystem::rename(log_path, addon_directory / L"glass-cockpit-dlss-fix.old.log", error);
-    // Not inherited (N): the sim starts helper processes (e.g. FenixBootstrapper) that would keep the log open after it
-    // quits, and the next session could not open it.
-    logfile = _wfsopen(log_path.c_str(), L"wN", _SH_DENYWR);
-    log_file_path = log_path;
-    if (!logfile) {
-        // Something still holds the log (e.g. the previous session's process hasn't quite exited): log under another
-        // name rather than not at all.
-        log_file_path = addon_directory / (L"glass-cockpit-dlss-fix-" + std::to_wstring(GetCurrentProcessId()) + L".log");
-        logfile = _wfsopen(log_file_path.c_str(), L"wN", _SH_DENYWR);
-        if (logfile) log("the usual log file could not be opened (another process holds it): logging here instead");
-    }
-    // The offline test runs with default settings unless asked to read the .ini (GLASS_FIXTURE_SETTINGS=1).
-    wchar_t fixture_settings[8]{};
-    if (!fixture || (GetEnvironmentVariableW(L"GLASS_FIXTURE_SETTINGS", fixture_settings, 8) && fixture_settings[0] == L'1')) load_settings();
-    init_tick = GetTickCount64();
-    OSVERSIONINFOEXW os{sizeof(os)};
-    using RtlGetVersion = LONG(WINAPI*)(OSVERSIONINFOEXW*);
-    if (auto get = reinterpret_cast<RtlGetVersion>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"))) get(&os);
-    wchar_t reshade_path[MAX_PATH]{};
-    GetModuleFileNameW(reshade_module, reshade_path, MAX_PATH);
-    log("Glass Cockpit DLSS Fix %s (built " __DATE__ " " __TIME__ ")", overlay_version);
-    log("windows %lu.%lu.%lu  game=%ls", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, executable);
-    log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
-    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d",
-        module, fixture, enabled.load(), jitter_positive.load(), smoothing_percent.load(), int(extra_smoothing.load()), glass_percent.load(), detail_clamp_percent.load(),
-        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), dark_screen_fix.load(), seam_fix.load(), int(mip0_only.load()), stable_edges.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
-    log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint");
-    scan_modules();
-    std::thread(worker).detach();
-#define REGISTER(event, callback) reshade::register_event<reshade::addon_event::event>(callback);
-    OVERLAY_EVENTS(REGISTER)
-#undef REGISTER
-    log("status panel %s", glass::init_status_panel(reshade_module) ? "added to the ReShade overlay" : "unavailable (this ReShade build has a different ImGui version); the fix itself still works");
-    return true;
-}
+// Offline test host.
 extern "C" __declspec(dllexport) void GlassFixJitterPositive(bool positive) { jitter_positive = positive; }
 extern "C" __declspec(dllexport) void GlassFixLineSmoothing(int percent) { smoothing_percent = percent; }
 extern "C" __declspec(dllexport) void GlassFixTemporal(int on) { temporal_aa = on ? 1 : 0; }
@@ -3322,35 +4033,22 @@ extern "C" __declspec(dllexport) void GlassFixEdgeTrim(int hundredths) { edge_tr
 extern "C" __declspec(dllexport) void GlassFixOcclusionCheck(int on) { occlusion_check = on ? 1 : 0; }
 extern "C" __declspec(dllexport) void GlassFixFullSize(int on) { mip0_only = on != 0; }
 extern "C" __declspec(dllexport) void GlassFixDebugFlags(uint32_t bits) { debug_flags = bits; }
-// Offline test host: one call per frame stands in for the present event (cost window of 4 frames, reported 2 later).
+// One call per frame stands in for the present (cost window of 4 frames, reported 2 later).
 extern "C" __declspec(dllexport) void GlassFixCostTick(ID3D12CommandQueue* queue) {
     static uint64_t frame = 0;
     cost_window = 4; cost_delay = 2; cost_spacing_ms = 0;
     measure_cost(queue, main_state, ++frame);
 }
-// Offline test host (no swapchain): 1 requests a screen capture (without presented frames), 0 stands in for a present.
+// No swapchain: 1 requests a screen capture (without presented frames), 0 stands in for a present.
 extern "C" __declspec(dllexport) void GlassFixCaptureTest(int request) {
     if (request) { glass::request_capture(); capture_presents_left = 0; return; }
     capture_flush(++present_count);
     pixel_probe_flush(present_count.load());
 }
-// Offline test host: 1 requests a pixel probe; 0 returns the draws that reached the pixel in the last one (high 16 bits:
-// screen draws), -1 while none has finished.
+// 1 requests a pixel probe; 0 returns the draws that reached the pixel in the last one (high 16 bits: screen draws), -1
+// while none has finished.
 extern "C" __declspec(dllexport) int GlassFixPixelProbe(int request) {
     if (request) { glass::request_pixel_probe(); pixel_probe_hits = -1; return 0; }
     const int hits = pixel_probe_hits.load();
     return hits < 0 ? -1 : (hits & 0xffff) | (pixel_probe_display_hits.load() << 16);
-}
-extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE) {
-    enabled_before_unload = enabled.exchange(false);
-    log("add-on unloaded by ReShade");
-    glass::uninit_status_panel();
-#define UNREGISTER(event, callback) reshade::unregister_event<reshade::addon_event::event>(callback);
-    OVERLAY_EVENTS(UNREGISTER)
-#undef UNREGISTER
-    reshade::unregister_addon(addon);
-}
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(instance);
-    return TRUE;
 }

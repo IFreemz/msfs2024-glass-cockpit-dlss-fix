@@ -1,5 +1,5 @@
-// "Glass Cockpit DLSS Fix" tab in the ReShade overlay: status, settings and a copyable report for bug reports.
-// Kept in its own file: only this file uses ReShade's Dear ImGui, so a ReShade build with another ImGui version
+// "Glass Cockpit DLSS Fix" tab in the ReShade overlay (the add-on build): status, settings and a copyable report for bug
+// reports. Kept in its own file: only this file uses ReShade's Dear ImGui, so a ReShade build with another ImGui version
 // just loses the panel (init_status_panel returns false) instead of refusing to load the whole add-on.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -34,24 +34,6 @@ std::string format(const char* text, ...) {
     return buffer;
 }
 
-std::string summary(const glass::Status& s) {
-    if (s.active) return format("Working: fixing %u screen%s (%s %ux%u -> %ux%u)", s.screens, s.screens == 1 ? "" : "s", s.upscaler, s.render_w, s.render_h, s.out_w, s.out_h);
-    if (!s.enabled) return "Off (Ctrl+Shift+F9 to turn on)";
-    if (s.problem) return std::string("Not working: ") + s.problem;
-    return "Waiting for a glass cockpit with DLSS or FSR selected";
-}
-
-std::string report(const glass::Status& s) {
-    return format("Glass Cockpit DLSS Fix %s\nstatus: %s\ngpu: %s (driver %s)\ndlss: %s, calls=%llu upscales=%llu\nfsr: %s, calls=%llu\nshader_found=%d screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu\n"
-        "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d\n"
-        "detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d\n",
-        GLASS_VERSION_STRING, summary(s).c_str(), s.gpu.empty() ? "unknown" : s.gpu.c_str(), s.driver.c_str(),
-        s.dlss_loaded ? (s.dlss_version.empty() ? "loaded" : s.dlss_version.c_str()) : "not loaded", s.dlss_calls, s.dlss_upscales,
-        s.fsr_loaded ? (s.fsr_version.empty() ? "loaded" : s.fsr_version.c_str()) : "not loaded", s.fsr_calls, s.shader_found, s.screen_draws,
-        s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing, s.extra_smoothing, s.glass_strength,
-        s.experimental.detail_clamp, s.experimental.edge_fade, s.experimental.angle_softening, s.experimental.edge_stretch, s.experimental.edge_trim, s.experimental.dark_screens, s.experimental.seam_fix, s.experimental.full_size, s.experimental.stable_edges, s.experimental.temporal_aa, s.experimental.soft_smoothing, s.experimental.calm_glass, s.experimental.occlusion_check);
-}
-
 void draw(reshade::api::effect_runtime*) {
     const auto s = glass::status();
     ImGui::Text("%s %s", GLASS_NAME, GLASS_VERSION_STRING);
@@ -59,7 +41,7 @@ void draw(reshade::api::effect_runtime*) {
     ImGui::TextLinkOpenURL("GitHub page", GLASS_WEBSITE);
     ImGui::SameLine(); ImGui::TextLinkOpenURL("Report a problem", GLASS_ISSUES);
     ImGui::Spacing();
-    ImGui::TextColored(s.active ? green : (!s.enabled || !s.problem) ? yellow : red, "%s", summary(s).c_str());
+    ImGui::TextColored(s.active ? green : (!s.enabled || !s.problem) ? yellow : red, "%s", glass::status_summary(s).c_str());
 
     ImGui::SeparatorText("Settings");
     bool enabled = s.enabled, tint = s.tint;
@@ -103,7 +85,7 @@ void draw(reshade::api::effect_runtime*) {
         ShellExecuteW(nullptr, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Copy report")) ImGui::SetClipboardText(report(s).c_str());
+    if (ImGui::Button("Copy report")) ImGui::SetClipboardText(glass::status_report(s).c_str());
     ImGui::SameLine();
     if (ImGui::Button("Capture screens  (Ctrl+Shift+F8)")) glass::request_capture();
     ImGui::SetItemTooltip("Saves 8 frames as sent to the monitor and 4 frames over about a third of a second as pictures next to the log: the sim's own frame, the upscaled frame before and\n"
