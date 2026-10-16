@@ -33,6 +33,7 @@ cbuffer Constants : register(b0)
     uint frame_index;        // temporal anti-aliasing: picks this frame's sample position inside the pixel
     uint bounds_reset;       // stable screen edges: slots whose learnt edges are forgotten (another texture took the slot)
     uint diag_index;         // diagnostics: this upscaler call's number (screen pixels in the map are counted per call)
+    float edge_trim;         // experimental: leave the outer edge_trim render pixels of each screen to the upscaler
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -419,6 +420,9 @@ void solve(uint3 id : SV_DispatchThreadID)
     }
     float4 previous_a = params[slot * 3], previous_b = params[slot * 3 + 1], previous_q = params[slot * 3 + 2];
     if (flags & 1) previous_a.w = 0;
+    // The slot took another screen texture (the sim recycles them): its brightness match belongs to the old one. Start
+    // over, and leave the screen to the upscaler until the new one has enough samples (a wrong match would flash).
+    if (bounds_reset & (1u << slot)) previous_a.w = 0;
     double n = v[0];
     if (n < 64) { params[slot * 3] = previous_a; return; }
     // Per channel: scene = gain * screen + offset (least squares).
@@ -832,6 +836,34 @@ void composite(uint3 id : SV_DispatchThreadID)
     // there the redrawn screen takes over, fully on a whole pixel. Steady, as the learnt edge doesn't move with jitter.
     coverage = (flags & 4) ? saturate(2 * coverage - 1) : (coverage >= 0.75 ? 1 : 0);
     if (blend <= 0 || coverage <= 0) return;
+    // Edge trim (experimental, the reverse of the edge stretcher): leave the outer edge_trim render pixels of each screen
+    // to the upscaler, for screens whose redrawn edge shows a sliver of something that isn't there (another screen's
+    // picture next to it in a shared texture, a frame drawn over the screen's edge). Measured from where the screen meets
+    // something that isn't a screen (two screens meeting within one display is no edge): from the learnt edge where it is
+    // that same edge (it doesn't move with the camera jitter), else from the render pixels around.
+    float trim_keep = 1;
+    if (edge_trim > 0 && !filled)
+    {
+        int radius = min(int(ceil(edge_trim + 1)), 5);
+        float nearest = 1e9;
+        [loop] for (int ty = -radius; ty <= radius + 1; ++ty)
+            [loop] for (int tx = -radius; tx <= radius + 1; ++tx)
+            {
+                int2 q = cell + int2(tx, ty);
+                if (any(q < 0) || any(q >= int2(map_size)) || map_slot(load_map(q)) < slot_count) continue;
+                nearest = min(nearest, length(float2(q) - location));
+            }
+        float dist = nearest - 0.5; // render pixels from the screen's end (half way to the first pixel off it)
+        float learnt;
+        float2 toward;
+        if (dist < edge_trim + 1.5 && (flags & 256) && edge_distance(slot, uv, dx, dy, learnt, toward))
+        {
+            learnt *= map_per_output.x;
+            if (abs(learnt - dist) < 1.5) dist = learnt;
+        }
+        trim_keep = saturate(dist - edge_trim + 0.5);
+        if (trim_keep <= 0) return;
+    }
     float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
     if (gain.w <= 0) return;
     // Angle softening: on a screen seen at a steep angle the texture footprint of a pixel is long and thin. Anisotropic
@@ -944,7 +976,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     }
     if (glass_strength < 1) colour -= (1 - glass_strength) * (glass - offset.rgb);
     if (flags & 2) colour = colour * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0);
-    float keep = (blend < 1 ? blend * blend * (3 - 2 * blend) : 1) * coverage;
+    float keep = (blend < 1 ? blend * blend * (3 - 2 * blend) : 1) * coverage * trim_keep;
     if (band_share > 0 && (flags & 4)) keep *= 1 - band_share;
     if (keep < 1) colour = lerp(output[id.xy].rgb, colour, keep);
     if (all(isfinite(colour))) output[id.xy] = float4(max(colour, 0), 1);

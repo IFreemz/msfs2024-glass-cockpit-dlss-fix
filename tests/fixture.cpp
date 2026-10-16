@@ -751,6 +751,7 @@ int main(int argc, char** argv) {
                 return result;
             };
             float dlss_shift[2]{};
+            bool dlss_magenta = false; // trim test: the fake DLSS output is magenta (shows which pixels the fix left alone)
             auto run = [&](const Image& ideal, float jx, float jy) {
                 list->ClearRenderTargetView(rtv(0), black.Color, 0, nullptr);
                 list->ClearDepthStencilView(dsv(0), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
@@ -762,7 +763,7 @@ int main(int argc, char** argv) {
                 transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 submit();
                 // The fake DLSS output: the ideal picture (no ghost); the fix redraws the screen over it.
-                for (size_t i = 0; i < prefill.size(); ++i) prefill[i] = encode_r11g11b10({ideal[i][0], ideal[i][1], ideal[i][2]});
+                for (size_t i = 0; i < prefill.size(); ++i) prefill[i] = encode_r11g11b10(dlss_magenta ? std::array<float, 3>{1, 0, 1} : std::array<float, 3>{ideal[i][0], ideal[i][1], ideal[i][2]});
                 if (dlss_shift[0] != 0 || dlss_shift[1] != 0)
                     for (UINT y = 1; y + 1 < output_h; ++y) for (UINT x = 1; x + 1 < output_w; ++x) {
                         const float sx = x + dlss_shift[0], sy = y + dlss_shift[1];
@@ -807,7 +808,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; };
             const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 2048}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
                 {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
@@ -835,7 +836,21 @@ int main(int argc, char** argv) {
                 {"inset-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, false, false, 0, false, 1, true},
                 // Screens sharing one texture (A220, A340, A380).
                 {"still-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true}, {"atlas", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true},
-                {"still-atlas-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, true}, {"atlas-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, true}};
+                {"still-atlas-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, true}, {"atlas-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, true},
+                // The sim recycling screen textures (A220): every 12 frames the screen texture is destroyed and a new one
+                // made (it takes the same slot), shown at another brightness. "swap" = error on the 2 frames after each swap.
+                {"still-swap", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, true},
+                // Edge trim: the fake DLSS output is magenta, so the trimmed band shows. "trim" = flicker of the pixels near the
+                // screen's edge (the band must not crawl with the jitter) and the share of them left to the upscaler.
+                {"still-trim-0", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0},
+                {"still-trim", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 200},
+                {"trim", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 200},
+                {"still-trim-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, false, false, 200},
+                {"trim-0", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0},
+                {"still-trim-0-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0},
+                {"still-trim-0-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0},
+                {"still-trim-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 200},
+                {"still-trim-join", 35, 0, 0, 0, 1, 0, 0, 1, true, false, 0, false, 1, false, false, false, 200}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
@@ -849,7 +864,8 @@ int main(int argc, char** argv) {
             const auto set_full_size = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixFullSize"));
             const auto set_debug = reinterpret_cast<void (*)(uint32_t)>(GetProcAddress(addon, "GlassFixDebugFlags"));
             const auto set_calm = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixCalmGlass"));
-            require(set_glass && set_full_size && set_debug && set_calm, "exports missing");
+            const auto set_trim = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixEdgeTrim"));
+            require(set_glass && set_full_size && set_debug && set_calm && set_trim, "exports missing");
             Sleep(1500); // let the background PSO compile finish
             const char* only = nullptr; // --only <text>: just the modes whose name contains it
             for (int i = 1; i + 1 < argc; ++i) if (!std::strcmp(argv[i], "--only")) only = argv[i + 1];
@@ -863,6 +879,8 @@ int main(int argc, char** argv) {
                 set_glass(m.glass);
                 set_debug(m.debug);
                 set_calm(m.calm);
+                set_trim(m.trim);
+                dlss_magenta = std::strstr(m.name, "trim") != nullptr;
                 set_full_size(m.full_size);
                 set_temporal(0);
                 join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas;
@@ -870,11 +888,29 @@ int main(int argc, char** argv) {
                 upload_display(0, join, true);
                 Image previous_out, previous_ideal;
                 std::vector<float> flicker_map(size_t(output_w) * output_h, 0.0f); // per pixel: summed frame-to-frame change beyond the ideal's
+                int swapped_at = -100;
+                double swap_error = 0; uint64_t swap_n = 0;
+                double trim_flicker = 0, trimmed = 0; uint64_t trim_n = 0, trim_flicker_n = 0;
+                std::vector<uint8_t> trim_zone; // pixels on the screen within 8 output pixels of its edge
                 double error = 0, flicker = 0, after_change = 0, edge_error = 0, edge_flicker = 0, join_error = 0, join_flicker = 0;
                 uint64_t error_n = 0, flicker_n = 0, change_n = 0, edge_n = 0, edge_flicker_n = 0, join_n = 0, join_flicker_n = 0;
                 for (int t = 0; t < frame_count; ++t) {
                     if (t == 1) set_temporal(m.temporal); // the first frame without history (like switching it on)
                     if (t == change_at) { upload_display(8, join); upload_display(8, join, true); }
+                    if (m.swap && t > 0 && t % 12 == 0) {
+                        // A new screen texture (the old one destroyed first, so the new one gets its slot), at another brightness.
+                        display = nullptr;
+                        display = texture(device.Get(), 768, 768, 5, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+                        display_initialised = false;
+                        upload_display(0, join);
+                        device->CreateShaderResourceView(screen_t0 ? display.Get() : alpha.Get(), nullptr, cpu0);
+                        device->CreateShaderResourceView(screen_t0 ? alpha.Get() : display.Get(), nullptr, cpu1);
+                        device->CopyDescriptorsSimple(2, gpu_slot, cpu0, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                        const float k = (t / 12) % 2 ? 0.35f : 1.0f;
+                        material[2] = {gain[0] * k, gain[1] * k, gain[2] * k, 0};
+                        upload(materials[0].Get(), material.data(), sizeof(material));
+                        swapped_at = t;
+                    }
                     const auto c = constants(m.speed * t, m.scale);
                     upload(globals[0].Get(), c.global.data(), sizeof(c.global));
                     // Sun modes: the ideal picture with the steady sun (what DLSS shows), the sim's frame with this frame's.
@@ -908,6 +944,29 @@ int main(int argc, char** argv) {
                             ends[e][1] = (1 - clip[1] / clip[3]) * 0.5f * output_h;
                         }
                     const float jx_ = ends[1][0] - ends[0][0], jy_ = ends[1][1] - ends[0][1], jlen = std::sqrt(jx_ * jx_ + jy_ * jy_);
+                    if (dlss_magenta && t == measure_from) {
+                        trim_zone.assign(out.size(), 0);
+                        for (UINT y = 8; y + 8 < output_h; ++y) for (UINT x = 8; x + 8 < output_w; ++x) {
+                            const size_t i = size_t(y) * output_w + x;
+                            if (ideal[i][3] < 0.999f) continue;
+                            bool near_edge = false;
+                            for (int dy = -8; dy <= 8 && !near_edge; ++dy) for (int dx = -8; dx <= 8 && !near_edge; ++dx)
+                                near_edge = ideal[i + dy * int(output_w) + dx][3] < 0.001f;
+                            trim_zone[i] = near_edge;
+                        }
+                    }
+                    if (dlss_magenta && t >= measure_from && t < change_at)
+                        for (size_t i = 0; i < out.size(); ++i) {
+                            if (!trim_zone[i]) continue;
+                            // Share of the pixel left to the upscaler: how far towards magenta (green 0, the screen's green up).
+                            const float g = ideal[i][1] > 0.05f ? std::clamp(1 - out[i][1] / ideal[i][1], 0.0f, 1.0f) : 0.0f;
+                            trimmed += g; ++trim_n;
+                            if (!previous_out.empty()) {
+                                double f = 0;
+                                for (int k = 0; k < 3; ++k) f += std::abs((double(out[i][k]) - previous_out[i][k]) - (double(ideal[i][k]) - previous_ideal[i][k]));
+                                trim_flicker += f / 3; ++trim_flicker_n;
+                            }
+                        }
                     for (UINT y = 3; y + 3 < output_h; ++y) for (UINT x = 3; x + 3 < output_w; ++x) {
                         const size_t i = size_t(y) * output_w + x;
                         if ((join || band) && t >= measure_from && t < change_at && (band || ideal[i][3] >= 0.999f)) {
@@ -943,6 +1002,7 @@ int main(int argc, char** argv) {
                         if (t >= measure_from && t < change_at) flicker_map[i] += float(f / 3);
                         if (t >= measure_from && t < change_at) { error += e / 3; ++error_n; if (!previous_out.empty()) { flicker += f / 3; ++flicker_n; } }
                         if (t >= change_at && t < change_at + 3) { after_change += e / 3; ++change_n; }
+                        if (m.swap && t >= swapped_at && t < swapped_at + 2) { swap_error += e / 3; ++swap_n; }
                     }
                     if (t == change_at - 1) {
                         save(out, std::string(m.name));
@@ -956,6 +1016,12 @@ int main(int argc, char** argv) {
                 std::printf("%-16s error=%.4f flicker=%.4f after_change=%.4f edge_error=%.4f edge_flicker=%.4f", m.name, error / std::max<uint64_t>(error_n, 1),
                     flicker / std::max<uint64_t>(flicker_n, 1), after_change / std::max<uint64_t>(change_n, 1), edge_error / std::max<uint64_t>(edge_n, 1),
                     edge_flicker / std::max<uint64_t>(edge_flicker_n, 1));
+                if (m.swap) {
+                    std::printf(" swap_error=%.4f", swap_error / std::max<uint64_t>(swap_n, 1));
+                    material[2] = {gain[0], gain[1], gain[2], 0};
+                    upload(materials[0].Get(), material.data(), sizeof(material));
+                }
+                if (dlss_magenta) std::printf(" trim_flicker=%.4f trimmed=%.3f", trim_flicker / std::max<uint64_t>(trim_flicker_n, 1), trimmed / std::max<uint64_t>(trim_n, 1));
                 if (m.join || m.band) std::printf(" %s_error=%.4f %s_flicker=%.4f", m.band ? "band" : "join", join_error / std::max<uint64_t>(join_n, 1), m.band ? "band" : "join", join_flicker / std::max<uint64_t>(join_flicker_n, 1));
                 std::printf("\n");
             }

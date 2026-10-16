@@ -44,12 +44,12 @@ std::string summary(const glass::Status& s) {
 std::string report(const glass::Status& s) {
     return format("Glass Cockpit DLSS Fix %s\nstatus: %s\ngpu: %s (driver %s)\ndlss: %s, calls=%llu upscales=%llu\nfsr: %s, calls=%llu\nshader_found=%d screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu\n"
         "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d\n"
-        "detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d\n",
+        "detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d\n",
         GLASS_VERSION_STRING, summary(s).c_str(), s.gpu.empty() ? "unknown" : s.gpu.c_str(), s.driver.c_str(),
         s.dlss_loaded ? (s.dlss_version.empty() ? "loaded" : s.dlss_version.c_str()) : "not loaded", s.dlss_calls, s.dlss_upscales,
         s.fsr_loaded ? (s.fsr_version.empty() ? "loaded" : s.fsr_version.c_str()) : "not loaded", s.fsr_calls, s.shader_found, s.screen_draws,
         s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing, s.extra_smoothing, s.glass_strength,
-        s.experimental.detail_clamp, s.experimental.edge_fade, s.experimental.angle_softening, s.experimental.edge_stretch, s.experimental.dark_screens, s.experimental.seam_fix, s.experimental.full_size, s.experimental.stable_edges, s.experimental.temporal_aa, s.experimental.soft_smoothing, s.experimental.calm_glass);
+        s.experimental.detail_clamp, s.experimental.edge_fade, s.experimental.angle_softening, s.experimental.edge_stretch, s.experimental.edge_trim, s.experimental.dark_screens, s.experimental.seam_fix, s.experimental.full_size, s.experimental.stable_edges, s.experimental.temporal_aa, s.experimental.soft_smoothing, s.experimental.calm_glass);
 }
 
 void draw(reshade::api::effect_runtime*) {
@@ -163,6 +163,10 @@ void draw(reshade::api::effect_runtime*) {
         changed |= ImGui::SliderInt("Edge stretcher", &e.edge_stretch, 0, 400, e.edge_stretch ? "%d" : "off", ImGuiSliderFlags_AlwaysClamp);
         ImGui::SetItemTooltip("Extends screens outwards over their frame, in hundredths of a render pixel (100 = 1 pixel),\n"
             "continuing their picture. For screens that don't quite reach their frame.");
+        changed |= ImGui::SliderInt("Edge trim", &e.edge_trim, 0, 400, e.edge_trim ? "%d" : "off", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::SetItemTooltip("Leaves the outer edge of every screen to the sim's own picture, in hundredths of a render pixel\n"
+            "(100 = 1 pixel). The reverse of the edge stretcher: for screens whose fixed edge shows a sliver of something\n"
+            "that isn't there, or jagged edges. Within that band the upscaler's trails come back.");
         if (ImGui::Button("Reset experimental fixes")) { e = {}; changed = true; }
         if (changed) glass::set_experimental(e);
         ImGui::TreePop();
