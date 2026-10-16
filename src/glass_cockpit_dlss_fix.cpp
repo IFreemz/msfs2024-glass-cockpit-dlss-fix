@@ -105,10 +105,10 @@ std::atomic<int> soft_smoothing{0};
 // Stable screen edges (on by default): where each screen ends is learnt in its texture, so the camera jitter doesn't
 // make the pixels along its edge flip between the fix and the upscaler every frame.
 std::atomic<int> stable_edges{1};
-// Calm glass at symbols (on by default): next to symbol outlines the glass layer is only the soft average of the sim's
+// Calm glass at symbols (off by default): next to symbol outlines the glass layer is only the soft average of the sim's
 // remainder around the pixel, without the sharp detail taken from the upscaler's picture: DLSS's lines sit slightly
 // elsewhere than the redrawn ones, and that difference changes every frame.
-std::atomic<int> calm_glass{1};
+std::atomic<int> calm_glass{0};
 std::atomic<uint32_t> bounds_reset{0}; // slots whose learnt edges must be forgotten (the slot took another texture)
 std::atomic<uint32_t> debug_flags{0}; // offline test only: extra shader flag bits
 // Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like.
@@ -686,6 +686,14 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     ComPtr<ID3D12DescriptorHeap> heap, scratch;
     ComPtr<ID3D12Resource> sums, params, edge_bounds;
     ComPtr<ID3D12Resource> params_readback; // brightness match per screen, copied out now and then for the log
+    // Diagnostics: per upscaler call, screen pixels in the map on the GPU (64-call ring after the edge bounds), copied out
+    // now and then with what the CPU knew at each call.
+    ComPtr<ID3D12Resource> diag_readback;
+    struct DiagCall { uint64_t present = 0, recorded = 0; uint32_t pending = 0, views = 0; const void* output = nullptr; uint32_t thread = 0; };
+    std::array<DiagCall, 64> diag_calls{}, diag_snapshot{};
+    uint32_t diag_index = 0, diag_copied_at = 0;
+    uint64_t diag_ready = UINT64_MAX, diag_next = 300;
+    int diag_dumps = 0;
     std::atomic<uint64_t> readback_next{600}, readback_ready{UINT64_MAX};
     uint64_t frame = 0;
     ComPtr<ID3D12QueryHeap> timestamps; // cost diagnostics: start and end of the passes of each upscaler call
@@ -1245,7 +1253,7 @@ bool create_composite(DeviceState& d) {
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 6, 5, 0, uav_base + 4}}; // u4 is the root UAV (fit sums)
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 20};
+    params[0].Constants = {0, 0, 21};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {3, ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -1272,12 +1280,15 @@ bool create_composite(DeviceState& d) {
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.sums)))) return false;
     buffer.Width = slot_count * 3 * 16;
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.params)))) return false;
-    buffer.Width = slot_count * bounds_cells * bounds_cells * 16;
+    buffer.Width = slot_count * bounds_cells * bounds_cells * 16 + 256;
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.edge_bounds)))) return false;
     D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
     if (FAILED(d.native->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&d.params_readback))))
         d.params_readback = nullptr; // diagnostics only
+    buffer.Width = 256;
+    if (FAILED(d.native->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&d.diag_readback))))
+        d.diag_readback = nullptr;
     D3D12_QUERY_HEAP_DESC queries{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, max_timed_calls * 2, 0};
     buffer.Width = max_timed_calls * 2 * sizeof(uint64_t);
     if (FAILED(d.native->CreateQueryHeap(&queries, IID_PPV_ARGS(&d.timestamps))) ||
@@ -1976,7 +1987,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     history_view.Format = DXGI_FORMAT_R16G16_UNORM;
     d.native->CreateUnorderedAccessView(temporal ? map->history_uv.Get() : nullptr, nullptr, &history_view, at(uav_base + 6));
     D3D12_UNORDERED_ACCESS_VIEW_DESC raw{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
-    raw.Buffer = {0, slot_count * bounds_cells * bounds_cells * 4, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+    raw.Buffer = {0, slot_count * bounds_cells * bounds_cells * 4 + 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
     d.native->CreateUnorderedAccessView(d.edge_bounds.Get(), nullptr, &raw, at(uav_base + 7));
     D3D12_UNORDERED_ACCESS_VIEW_DESC glass_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
     glass_view.Texture2DArray = {0, 0, map->layers, 0};
@@ -1985,19 +1996,20 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     d.native->CreateUnorderedAccessView(map->glass_history_uv.Get(), nullptr, &glass_view, at(uav_base + 9));
 
     struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp, angle_soften;
-        UINT history_info, frame_index, bounds_reset; } constants{
+        UINT history_info, frame_index, bounds_reset, diag_index; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
         jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u) | (temporal ? 64u : 0u) | (soft_smoothing ? 128u : 0u) | (stable_edges ? 256u : 0u) | (mip0_only ? 512u : 0u) | (calm_glass ? 4096u : 0u) | debug_flags.load(),
         smoothing_percent / 50.0f, layer, glass_percent / 100.0f, edge_fade_percent / 100.0f,
         edge_stretch_percent / 100.0f, detail_clamp_percent / 100.0f,
-        angle_soften_percent / 100.0f, history_info, frame_index, bounds_reset.exchange(0)};
+        angle_soften_percent / 100.0f, history_info, frame_index, bounds_reset.exchange(0), d.diag_index};
+    d.diag_calls[d.diag_index & 63] = {present_count.load(std::memory_order_relaxed), map->recorded_present.load(), pending, map->views.load(), output, GetCurrentThreadId()};
 
     api::command_list* api_list = list;
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(api_list->get_native());
     ID3D12DescriptorHeap* heaps[]{d.heap.Get()};
     native->SetDescriptorHeaps(1, heaps);
     native->SetComputeRootSignature(d.root.Get());
-    native->SetComputeRoot32BitConstants(0, 20, &constants, 0);
+    native->SetComputeRoot32BitConstants(0, 21, &constants, 0);
     native->SetComputeRootDescriptorTable(1, gpu);
     native->SetComputeRootUnorderedAccessView(2, d.sums->GetGPUVirtualAddress());
     // DLSS leaves its colour input compute-readable and the output as UAV; FSR reports the states it restores.
@@ -2025,7 +2037,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         uav_barrier(native);
         d.accumulators_zeroed = true;
         constants.flags |= 1;
-        native->SetComputeRoot32BitConstants(0, 20, &constants, 0);
+        native->SetComputeRoot32BitConstants(0, 21, &constants, 0);
     }
     native->SetPipelineState(d.passes[1].Get());
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
@@ -2054,6 +2066,44 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
     transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, map_resting);
     uav_barrier(native);
+    if (d.diag_readback) {
+        const uint64_t now = present_count.load(std::memory_order_relaxed);
+        if (d.diag_ready != UINT64_MAX && now >= d.diag_ready) {
+            const uint32_t* counts = nullptr;
+            const D3D12_RANGE range{0, 256};
+            if (SUCCEEDED(d.diag_readback->Map(0, &range, reinterpret_cast<void**>(const_cast<uint32_t**>(&counts))))) {
+                // One line per copy: the 32 calls before it, oldest first: screen pixels in the map on the GPU (0 = the fix
+                // had nothing to draw), presents since the screens were recorded, views pending, output (a/b...).
+                std::string line;
+                std::vector<const void*> outputs;
+                for (uint32_t k = 31; k >= 1; --k) {
+                    const uint32_t i = (d.diag_copied_at - k) & 63;
+                    const auto& c = d.diag_snapshot[i];
+                    size_t o = std::find(outputs.begin(), outputs.end(), c.output) - outputs.begin();
+                    if (o == outputs.size()) outputs.push_back(c.output);
+                    char item[64];
+                    std::snprintf(item, sizeof(item), " %u/%lld/%u%c", counts[i], (long long)(c.present - c.recorded), c.pending, char('a' + std::min<size_t>(o, 25)));
+                    line += item;
+                }
+                const D3D12_RANGE none{};
+                d.diag_readback->Unmap(0, &none);
+                log("diag calls (pixels/presents since recorded/pending/output):%s", line.c_str());
+            }
+            d.diag_ready = UINT64_MAX;
+        }
+        if (d.diag_ready == UINT64_MAX && now >= d.diag_next && d.diag_dumps < 400) {
+            // The copy runs after this call's passes: counters of the last 63 calls (the next one was just zeroed).
+            transition(native, d.edge_bounds.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            native->CopyBufferRegion(d.diag_readback.Get(), 0, d.edge_bounds.Get(), UINT64(slot_count) * bounds_cells * bounds_cells * 16, 256);
+            transition(native, d.edge_bounds.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            d.diag_snapshot = d.diag_calls;
+            d.diag_copied_at = d.diag_index + 1; // the copy holds calls up to diag_index
+            d.diag_ready = now + 30;
+            d.diag_next = now + (d.diag_dumps < 60 ? 120 : 1200);
+            ++d.diag_dumps;
+        }
+    }
+    ++d.diag_index;
     if (timed) {
         native->EndQuery(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2 + 1);
         native->ResolveQueryData(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2, 2, d.timestamps_readback.Get(), uint64_t(timed - 1) * 2 * sizeof(uint64_t));
@@ -2403,7 +2453,7 @@ void load_settings() {
     if (soft_smoothing) temporal_aa = 0; // one or the other
     stable_edges = GetPrivateProfileIntW(L"experimental", L"stable_edges", 1, settings_path().c_str()) != 0;
     mip0_only = GetPrivateProfileIntW(L"experimental", L"full_size_sampling", 1, settings_path().c_str()) != 0;
-    calm_glass = GetPrivateProfileIntW(L"experimental", L"calm_glass", 1, settings_path().c_str()) != 0;
+    calm_glass = GetPrivateProfileIntW(L"experimental", L"calm_glass", 0, settings_path().c_str()) != 0;
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;

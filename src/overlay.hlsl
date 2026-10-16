@@ -32,6 +32,7 @@ cbuffer Constants : register(b0)
                              // bit 1 = last frame's history belongs to this view and can be used
     uint frame_index;        // temporal anti-aliasing: picks this frame's sample position inside the pixel
     uint bounds_reset;       // stable screen edges: slots whose learnt edges are forgotten (another texture took the slot)
+    uint diag_index;         // diagnostics: this upscaler call's number (screen pixels in the map are counted per call)
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -61,6 +62,7 @@ static const uint slot_count = 32;
 static const uint terms = 20;
 static const float fixed_scale = 16777216.0;
 static const uint bounds_cells = 64;
+static const uint diag_base = slot_count * bounds_cells * bounds_cells * 16; // after the edge bounds: 64 call counters
 static const float3 luma = float3(0.2126, 0.7152, 0.0722);
 static const float bounds_scale = 16777215.0;
 
@@ -281,6 +283,9 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     float4 gain = active ? params[slot * 3] : 0;
     if (all(p < int2(map_size))) residual[p] = active && gain.w > 0 ? float4(y - gain.rgb * x, slot + 1 + (outline ? 64 : 0)) : 0;
     if (index == 0 && all(group.xy < (map_size + 7) / 8)) tiles[group.xy] = tile_slot < slot_count ? tile_slot + 1 : 0;
+    // Diagnostics: screen pixels in the map at this call (the GPU's view: were this frame's screens drawn before it?).
+    uint screen_pixels = WaveActiveCountBits(slot < slot_count && all(p < int2(map_size)));
+    if (WaveIsFirstLane() && screen_pixels) { uint unused; edge_bounds.InterlockedAdd(diag_base + (diag_index & 63) * 4, screen_pixels, unused); }
 
     // Stable screen edges: widen the bounds of the texture cell this render pixel sampled (one set of atomics per cell
     // and wave). With the camera jitter the samples move every frame, so the bounds close in on the screen's real edge.
@@ -923,4 +928,5 @@ void clear(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID)
     if (bounds_reset && id.x < map_size.x && index < slot_count * cells && (bounds_reset & (1u << (index / cells))))
         edge_bounds.Store4(index * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
     if (all(id.xy < map_size) && all(group.xy < (map_size + 7) / 8) && tiles[group.xy]) map_rw[uint3(id.xy, layer)] = 0;
+    if (all(id.xy == 0)) edge_bounds.Store(diag_base + ((diag_index + 1) & 63) * 4, 0);
 }

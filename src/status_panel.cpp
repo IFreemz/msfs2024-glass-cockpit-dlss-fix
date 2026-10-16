@@ -130,7 +130,7 @@ void draw(reshade::api::effect_runtime*) {
             "instead of judged anew every frame. Turn off if a screen's edge looks cut off or too wide.");
         e.stable_edges = stable ? 1 : 0;
         bool calm_glass = e.calm_glass != 0;
-        changed |= ImGui::Checkbox("Calm glass at symbols (on by default)", &calm_glass);
+        changed |= ImGui::Checkbox("Calm glass at symbols", &calm_glass);
         ImGui::SetItemTooltip("Right next to symbols and lines, the glass effects (dirt, glare, reflections) are drawn without their finest\n"
             "detail, which flickers there (e.g. along the E-Jet's altitude and vertical speed tapes). Away from symbols nothing changes.\n"
             "Turn off if something drawn over a screen (a highlight, a cursor) looks blurred.");
