@@ -44,12 +44,12 @@ std::string summary(const glass::Status& s) {
 std::string report(const glass::Status& s) {
     return format("Glass Cockpit DLSS Fix %s\nstatus: %s\ngpu: %s (driver %s)\ndlss: %s, calls=%llu upscales=%llu\nfsr: %s, calls=%llu\nshader_found=%d screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu\n"
         "enabled=%d jitter_positive=%d tint=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d\n"
-        "detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d\n",
+        "detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d soft_glass=%d\n",
         GLASS_VERSION_STRING, summary(s).c_str(), s.gpu.empty() ? "unknown" : s.gpu.c_str(), s.driver.c_str(),
         s.dlss_loaded ? (s.dlss_version.empty() ? "loaded" : s.dlss_version.c_str()) : "not loaded", s.dlss_calls, s.dlss_upscales,
         s.fsr_loaded ? (s.fsr_version.empty() ? "loaded" : s.fsr_version.c_str()) : "not loaded", s.fsr_calls, s.shader_found, s.screen_draws,
         s.recorded, s.overlay_frames, s.skipped, s.enabled, s.jitter_positive, s.tint, s.line_smoothing, s.extra_smoothing, s.glass_strength,
-        s.experimental.detail_clamp, s.experimental.edge_fade, s.experimental.angle_softening, s.experimental.edge_stretch, s.experimental.dark_screens, s.experimental.seam_fix, s.experimental.full_size, s.experimental.stable_edges, s.experimental.temporal_aa, s.experimental.soft_smoothing);
+        s.experimental.detail_clamp, s.experimental.edge_fade, s.experimental.angle_softening, s.experimental.edge_stretch, s.experimental.dark_screens, s.experimental.seam_fix, s.experimental.full_size, s.experimental.stable_edges, s.experimental.temporal_aa, s.experimental.soft_smoothing, s.experimental.soft_glass);
 }
 
 void draw(reshade::api::effect_runtime*) {
@@ -129,6 +129,12 @@ void draw(reshade::api::effect_runtime*) {
         ImGui::SetItemTooltip("Keeps the pixels along each screen's edge from shimmering: where a screen ends is learnt over a few frames\n"
             "instead of judged anew every frame. Turn off if a screen's edge looks cut off or too wide.");
         e.stable_edges = stable ? 1 : 0;
+        bool soft_glass = e.soft_glass != 0;
+        changed |= ImGui::Checkbox("Soft glass layer", &soft_glass);
+        ImGui::SetItemTooltip("Keeps the sim's glass effects (dirt, glare, reflections, shadows) but without their finest per-pixel detail,\n"
+            "which can flicker along thin lines and tapes (e.g. the E-Jet's vertical speed and altitude tapes).\n"
+            "Turn off if something drawn over a screen (a highlight, a cursor) looks blurred.");
+        e.soft_glass = soft_glass ? 1 : 0;
         bool dark = e.dark_screens != 0;
         changed |= ImGui::Checkbox("Dark screen fix", &dark);
         ImGui::SetItemTooltip("Keeps mostly black screens with thin symbols (e.g. the F/A-18E's) fixed in strong sun glare.\n"

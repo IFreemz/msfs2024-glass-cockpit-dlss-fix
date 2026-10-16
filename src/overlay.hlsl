@@ -772,7 +772,7 @@ void composite(uint3 id : SV_DispatchThreadID)
             // DLSS output minus the clean content = sharp glass detail + ghost of old content. Keep it only within the
             // local spread of this frame's glass layer (variance clipping, as in TAA); ghost trails fall outside.
             float3 spread = sqrt(max(m2 / smooth_weight - glass * glass, 0)) + 0.002;
-            if (!(flags & 1024)) glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread); // debug bit 10: smooth part only
+            if (!(flags & 1024)) glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread); // bit 10: soft glass layer
         }
     }
     float3 colour = content + glass;

@@ -13,6 +13,7 @@ struct Experimental {
     int soft_smoothing = 0; // soft-edged (Gaussian) line smoothing on/off
     int stable_edges = 1; // stable screen edges on/off (on by default)
     int full_size = 1; // full-size sampling on/off (on by default; off = the game's mip levels)
+    int soft_glass = 0; // soft glass layer on/off (glass effects without their sharp per-pixel detail)
     bool operator==(const Experimental&) const = default;
 };
 
