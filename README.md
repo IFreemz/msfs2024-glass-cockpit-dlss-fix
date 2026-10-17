@@ -8,7 +8,8 @@ It comes in two versions with the same fix inside; pick one:
 
 - **ReShade add-on** (`glass-cockpit-dlss-fix.addon64`): for ReShade users. Status and settings in a tab of the ReShade
   menu.
-- **Standalone** (`dxgi.dll`): no ReShade needed, one file next to the sim. Settings in a text file.
+- **Standalone** (`dxgi.dll`): no ReShade needed, one file next to the sim. Status and settings in a small window of
+  its own (**Ctrl+Shift+F6**).
 
 ![Fenix A320 PFD in DLSS Performance: 8 s of stock DLSS smearing the altitude readout, then 8 s with the fix](docs/comparison.webp)
 
@@ -38,6 +39,7 @@ the official add-on). Other packages, rebuilds or pages are unofficial; for thos
 - [How the fix works](#how-the-fix-works)
 - [Known limitations](#known-limitations)
 - [Building from source](#building-from-source)
+- [Credits](#credits)
 - [License](#license)
 - [Official downloads and redistribution](#official-downloads-and-redistribution)
 
@@ -55,8 +57,8 @@ Install **one** of the two versions. If both are installed, the standalone versi
 
 The game folder is the one that contains `FlightSimulator2024.exe`:
 
-- Steam: `...\steamapps\common\MSFS2024\`. To find it, right-click the game in Steam, then **Manage → Browse local
-  files**.
+- Steam: `...\steamapps\common\Microsoft Flight Simulator 2024\` (on some installs `...\steamapps\common\MSFS2024\`).
+  To find it, right-click the game in Steam, then **Manage → Browse local files**.
 - Microsoft Store / Xbox app: usually `C:\XboxGames\Microsoft Flight Simulator 2024\Content\`. To find it, open the
   Xbox app, right-click the game, then **Manage → Files → Browse**.
 
@@ -88,9 +90,9 @@ fixes turns green-tinted. Press it again to turn the tint off.
 If Windows asks whether to replace an existing `dxgi.dll` there, **don't**: another mod (usually ReShade or
 OptiScaler) is already using that name. See [Other mods](#other-mods).
 
-To check that it's working, press **Ctrl+Shift+F11** in the cockpit: every screen it fixes turns green-tinted. Press it
-again to turn the tint off. The file `glass-cockpit-dlss-fix-status.txt` next to the DLL also says
-"Working: fixing N screens" and shows a checklist.
+To check that it's working, press **Ctrl+Shift+F6** in the sim: the settings window opens and says "Working: fixing N
+screens". Or press **Ctrl+Shift+F11** in the cockpit: every screen it fixes turns green-tinted. Press it again to turn
+the tint off. The file `glass-cockpit-dlss-fix-status.txt` next to the DLL also shows a checklist.
 
 **Switching from the add-on?** Delete `glass-cockpit-dlss-fix.addon64`. If you used ReShade only for the fix,
 uninstall ReShade too (its `dxgi.dll` is in the same folder). Your settings carry over: both versions use the same
@@ -101,9 +103,12 @@ files next to it.
 
 ## Settings
 
-The add-on has all settings in its tab in the ReShade menu (**Home**). Both versions keep them in
-`glass-cockpit-dlss-fix.ini` next to the add-on or DLL, which lists every setting (the tables below say what each one
-does); with the standalone version, edit it with Notepad while the sim runs: saved changes apply within a second.
+The add-on has all settings in its tab in the ReShade menu (**Home**). The standalone version has the same settings in a
+small window of its own: press **Ctrl+Shift+F6** in the sim to open or close it (Esc closes it too; hover over an
+option to see what it does). It's a separate window rather than a menu drawn into the game, so it doesn't get in the
+way of ReShade, OptiScaler or OptiShade menus. Both versions keep the settings in `glass-cockpit-dlss-fix.ini` next to
+the add-on or DLL, which lists every setting (the tables below say what each one does); you can also edit it with
+Notepad while the sim runs: saved changes apply within a second.
 
 | Setting (ReShade tab / `.ini`) | What it does |
 |---|---|
@@ -445,6 +450,11 @@ no measurable FPS difference with the fix on or off in testing.
 
 The full source is in this repository. See [BUILDING.md](BUILDING.md) to build both versions yourself.
 
+## Credits
+
+Glass Cockpit DLSS Fix by IFreemz. The standalone version (`dxgi.dll`) was built by
+[Jason Tsorlinis](https://github.com/jtsorlinis). Thanks, Jason!
+
 ## License
 
 From 1.0.0: GPL-3.0-only with additional attribution terms, see [NOTICE.md](NOTICE.md) and [LICENSE](LICENSE).
@@ -453,7 +463,7 @@ Versions up to 0.8.3 remain MIT. Third-party components are listed in [THIRD_PAR
 ## Official downloads and redistribution
 
 The only official downloads are the [GitHub releases](https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix/releases)
-(each release lists the SHA-256 checksum of the add-on file). OptiShade bundles the official add-on with explicit permission (see [NOTICE.md](NOTICE.md)).
+(each release lists the SHA-256 checksums of its files). OptiShade bundles the official add-on with explicit permission (see [NOTICE.md](NOTICE.md)).
 
 You may redistribute and modify the add-on under the GPL-3 terms. In short, for builds that contain 1.0.0 or later code:
 

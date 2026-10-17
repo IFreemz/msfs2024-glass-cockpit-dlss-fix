@@ -12,7 +12,10 @@
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
-        if (glass::start(instance, nullptr)) glass::hook_device_creation();
+        if (glass::start(instance, nullptr)) {
+            glass::init_settings_window(instance);
+            glass::hook_device_creation();
+        }
     } else if (reason == DLL_PROCESS_DETACH) glass::stop();
     return TRUE;
 }

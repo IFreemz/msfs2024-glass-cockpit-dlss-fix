@@ -1,6 +1,6 @@
 // Glass Cockpit DLSS Fix for Microsoft Flight Simulator 2024. Removes DLSS ghosting/smearing from glass cockpit displays
 // by redrawing their content after DLSS.
-// https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix  (MIT license)
+// https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix  (GPL-3.0-only from 1.0.0, see NOTICE.md; 0.8.3 and earlier MIT)
 //
 // This file is the fix itself. It is built two ways, which differ only in how the fix gets loaded (host.hpp):
 // - standalone: dxgi.dll next to the sim, no ReShade needed (dxgi_proxy.cpp);
@@ -130,6 +130,10 @@ const char* edition() { return reshade_addon ? "ReShade add-on" : "standalone"; 
 std::atomic<bool> enabled{true}, jitter_positive{true}, tint{false};
 // Standalone: the ReShade add-on build of this fix is loaded as well. It does the work, this copy stays off.
 std::atomic<bool> duplicate_fix{false};
+}
+// Standalone: opens and closes the settings window (settings_window.cpp); null in the add-on, which has its ReShade tab.
+void (*glass::settings_window_hotkey)() = nullptr;
+namespace {
 // The process is exiting (DLL_PROCESS_DETACH): the hooks pass everything straight through from then on, since the
 // fix's own state is being torn down while other modules may still release Direct3D objects.
 std::atomic<bool> shutting_down{false};
@@ -977,9 +981,18 @@ struct Internal {
 };
 
 std::mutex device_mutex;
+bool same_adapter(ID3D12Device* a, ID3D12Device* b) {
+    const LUID x = a->GetAdapterLuid(), y = b->GetAdapterLuid();
+    return x.LowPart == y.LowPart && x.HighPart == y.HighPart;
+}
 void device_created(ID3D12Device* native) noexcept try {
     std::lock_guard lock(device_mutex);
     if (native == main_device) return; // the same device again: D3D12 keeps one device per adapter
+    // A device on another GPU after the sim's (e.g. a helper on a laptop's integrated GPU) is not the sim's.
+    if (main_device && !same_adapter(native, main_device)) {
+        LOG_ONCE("note a Direct3D 12 device on another GPU was created after the sim's; the fix stays with the sim's");
+        return;
+    }
     // Only the game's hardware device: MSFS also creates a WARP (software) device for a helper window,
     // whose descriptors have a different size and must not be mixed with the GPU's.
     const auto size = native->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -3296,12 +3309,20 @@ void swapchain_created(IUnknown* device, IUnknown* created) noexcept try {
         log("WARNING the sim's device was created in a way the fix did not see; found it through its swapchain. What the sim set up before is unknown, so screens will most likely stay unfixed: please report this with your log");
         device_created(queue_device.Get());
     }
-    if (queue_device.Get() != main_device) return;
+    // Under another mod's wrapper (e.g. ReShade loaded for its effects) the queue may be that mod's, on its own device
+    // object: the swapchain is still the sim's if it is on the sim's GPU. Only a queue of the sim's own device is used
+    // for the fix's own work (GPU cost, presented frames in captures).
+    const bool own_queue = queue_device.Get() == main_device;
+    if (!own_queue && (!main_device || !same_adapter(queue_device.Get(), main_device))) {
+        log("note swapchain %p is on another device than the sim's: not followed", created);
+        return;
+    }
+    if (!own_queue) log("note the sim's swapchain was created through another mod's wrapper: GPU cost and presented frames in captures are unavailable");
     DXGI_SWAP_CHAIN_DESC desc{};
     swapchain->GetDesc(&desc);
     std::lock_guard lock(swapchains_mutex);
     main_swapchain = swapchain.Get();
-    main_queue = queue;
+    main_queue = own_queue ? queue : nullptr;
     log("swapchain %p %ux%u format=%u buffers=%u", swapchain.Get(), desc.BufferDesc.Width, desc.BufferDesc.Height, unsigned(desc.BufferDesc.Format), desc.BufferCount);
 } catch (...) {}
 void presented(IDXGISwapChain* swapchain) noexcept try {
@@ -3325,7 +3346,8 @@ void write_settings_file() {
         file << "; " GLASS_NAME " settings. Saved changes apply while the sim runs (within a second). The ReShade add-on\n"
                 "; also has them in its tab in the ReShade overlay. What each setting does: " GLASS_WEBSITE "#settings\n"
                 "; Hotkeys in the sim: Ctrl+Shift+F9 fix on/off, Ctrl+Shift+F11 green tint on every fixed screen,\n"
-                "; Ctrl+Shift+F8 capture the screens for a bug report. What the fix is doing: glass-cockpit-dlss-fix-status.txt.\n"
+                "; Ctrl+Shift+F8 capture the screens for a bug report, Ctrl+Shift+F6 settings window (standalone).\n"
+                "; What the fix is doing: glass-cockpit-dlss-fix-status.txt.\n"
                 "\n";
     }
     save_settings();
@@ -3357,7 +3379,7 @@ void reload_settings() {
 
 // Hotkeys (Ctrl+Shift+...), polled about 30 times a second while one of the sim's windows has the focus.
 void poll_hotkeys() {
-    constexpr std::array<int, 6> keys{VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12};
+    constexpr std::array<int, 7> keys{VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12};
     static std::array<bool, keys.size()> was_down{};
     DWORD process = 0;
     if (const HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &process);
@@ -3365,7 +3387,8 @@ void poll_hotkeys() {
     for (size_t i = 0; i < keys.size(); ++i) {
         const bool down = chord && (GetAsyncKeyState(keys[i]) & 0x8000);
         if (down && !was_down[i]) {
-            if (keys[i] == VK_F7) {
+            if (keys[i] == VK_F6) { if (glass::settings_window_hotkey) glass::settings_window_hotkey(); }
+            else if (keys[i] == VK_F7) {
                 change_settings([] { mip0_only = !mip0_only; });
                 log("setting full_size_sampling=%d (Ctrl+Shift+F7)", int(mip0_only.load()));
             }
@@ -3887,8 +3910,8 @@ bool start(void* self_module, void* reshade_module) noexcept try {
         log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
     }
     log("module path=%ls fixture=%d %s", module, fixture_host, settings_text().c_str());
-    log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint, Ctrl+Shift+F8 capture, Ctrl+Shift+F10 pixel probe, Ctrl+Shift+F7 full-size sampling; settings in %ls",
-        settings_path().c_str());
+    log("hotkeys: %sCtrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint, Ctrl+Shift+F8 capture, Ctrl+Shift+F10 pixel probe, Ctrl+Shift+F7 full-size sampling; settings in %ls",
+        reshade_addon ? "" : "Ctrl+Shift+F6 settings window, ", settings_path().c_str());
     if (!reshade_addon && _wcsicmp(std::filesystem::path(module).filename().c_str(), L"dxgi.dll") != 0)
         log("note loaded as %ls rather than as dxgi.dll", std::filesystem::path(module).filename().c_str());
     std::thread(worker).detach();

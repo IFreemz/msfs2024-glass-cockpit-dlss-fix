@@ -75,7 +75,7 @@ try {
     & $rc /nologo /D GLASS_RESHADE_ADDON /I (Join-Path $root 'src') /I (Join-Path $sdk.FullName 'um') /I (Join-Path $sdk.FullName 'shared') /fo version_addon.res (Join-Path $root 'src\version.rc')
     if ($LASTEXITCODE) { throw 'Add-on version resource failed' }
     # The fix is compiled once and linked into both versions; only how it gets loaded differs (src\host.hpp).
-    $sources = 'glass_cockpit_dlss_fix.cpp', 'status_report.cpp', 'vtable_slots.cpp', 'dxgi_proxy.cpp', 'reshade_addon.cpp', 'status_panel.cpp' | ForEach-Object { Join-Path $root "src\$_" }
+    $sources = 'glass_cockpit_dlss_fix.cpp', 'status_report.cpp', 'vtable_slots.cpp', 'dxgi_proxy.cpp', 'settings_window.cpp', 'reshade_addon.cpp', 'status_panel.cpp' | ForEach-Object { Join-Path $root "src\$_" }
     & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /c /I $build /I (Join-Path $minhook 'include') /I $reshadeInclude /I $imgui $sources
     if ($LASTEXITCODE) { throw 'Compilation failed' }
     $fix = 'glass_cockpit_dlss_fix.obj', 'status_report.obj', 'vtable_slots.obj', 'buffer.obj', 'hook.obj', 'trampoline.obj', 'hde64.obj'
@@ -83,7 +83,7 @@ try {
     # src\dxgi.def). /NOIMPLIB: an import library named dxgi.lib here would be linked into the test host and the add-on
     # instead of the SDK's.
     Remove-Item -LiteralPath 'dxgi.lib' -ErrorAction SilentlyContinue
-    & $compiler /nologo /LD $fix dxgi_proxy.obj version.res /link /DEF:"$root\src\dxgi.def" /NOIMPLIB d3d12.lib version.lib user32.lib ole32.lib windowscodecs.lib /OUT:dxgi.dll
+    & $compiler /nologo /LD $fix dxgi_proxy.obj settings_window.obj version.res /link /DEF:"$root\src\dxgi.def" /NOIMPLIB d3d12.lib version.lib user32.lib gdi32.lib shell32.lib ole32.lib windowscodecs.lib /OUT:dxgi.dll
     if ($LASTEXITCODE) { throw 'dxgi.dll link failed' }
     # ReShade add-on.
     & $compiler /nologo /LD $fix reshade_addon.obj status_panel.obj version_addon.res /link /NOIMPLIB d3d12.lib dxgi.lib version.lib user32.lib shell32.lib ole32.lib windowscodecs.lib /OUT:glass-cockpit-dlss-fix.addon64
@@ -92,6 +92,8 @@ try {
     if ($Test) {
         # Fake FlightSimulator2024.exe + fake _nvngx.dll + the fix as its dxgi.dll, with stand-in display shaders.
         $testHost = Join-Path $build 'test'
+        # Recreated: an older build put the add-on and ReShade here, and the test host would load those instead.
+        if (Test-Path -LiteralPath $testHost) { Remove-Item -LiteralPath $testHost -Recurse -Force }
         New-Item -ItemType Directory -Path $testHost -Force | Out-Null
         & $dxc -T vs_6_6 -HV 2021 -E main -WX -O3 -Fo (Join-Path $testHost 'fixture_vs.cso') (Join-Path $root 'tests\fixture_vs.hlsl')
         if ($LASTEXITCODE) { throw 'Test vertex shader failed' }
