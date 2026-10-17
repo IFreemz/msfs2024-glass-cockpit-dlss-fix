@@ -18,7 +18,7 @@ cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headse
 
 **About this project:** Glass Cockpit DLSS Fix is developed by IFreemz. It was first released here on 11 October 2026
 (v0.6.0), and every version since has been published from this repository. Official downloads: the
-[GitHub releases](https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix/releases) (and OptiShade, which bundles
+[GitHub releases](https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix/releases) (and [OptiShade](https://github.com/GamingWithGravy/OptiShade), which bundles
 the official add-on). Other packages, rebuilds or pages are unofficial; for those, please contact their authors.
 
 ## Contents
@@ -258,8 +258,10 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
 - **Standalone DLSS Glass Cockpit Refresh** ([wesimglide.org](https://wesimglide.org/otherdata/tools/Standalone-DLSS-Glass-Cockpit-Refresh.html)):
   a third-party package of this add-on with ReShade built in, by WeSimGlide. For problems with it, follow the support
   steps on its page. Don't use it together with this add-on (the fix would run twice).
-- **OptiShade** (<OPTISHADE LINK>): bundles this add-on (an OptiShade update with 1.0.0 is coming soon). Use one or
-  the other, not both: with OptiShade, don't also install the `.addon64` from here.
+- **[OptiShade](https://github.com/GamingWithGravy/OptiShade)** by Gravy: bundles the official, unmodified add-on (an OptiShade update with 1.0.0 is coming
+  soon). Use one or the other, not both: with OptiShade, don't also install the `.addon64` from here. Problems with
+  OptiShade itself (installing, its presets and effects, updates) go to
+  [OptiShade's issues](https://github.com/GamingWithGravy/OptiShade/issues); problems with the fixed screens come here.
 - **Multi Frame Generation unlocks for RTX 40:**
   - **RenoDX MFG unlock add-on:** tested, works together with this fix.
   - **[RTX40MFG-Unlock](https://github.com/dashdogy/RTX40MFG-Unlock) by dashdogy:** tested with v1.4.2 (installed as
@@ -293,7 +295,11 @@ the settings in [Before you report a problem: what to try](#before-you-report-a-
 | Something you can see on fixed screens: wrong or changing colours, flicker, lines, jagged or blurry edges, trails | A **capture**: with the problem visible, press **Capture screens** (or **Ctrl+Shift+F8**), keep the screens in view for a few seconds, then attach the `glass-capture-....zip` from the log folder. It already contains both logs |
 
 Always mention the aircraft, your DLSS/FSR mode, Frame Generation on/off and other mods (OptiScaler, RenoDX, MFG
-unlocks...).
+unlocks, OptiShade...).
+
+**Using OptiShade?** Report problems with the fixed screens here, and problems with OptiShade itself (installing, its
+presets and effects, updates) on [OptiShade's issues page](https://github.com/GamingWithGravy/OptiShade/issues). Not sure which? If the problem goes
+away when you toggle the fix off with **Ctrl+Shift+F9**, it belongs here.
 
 The **logs** are written every session: the add-on writes `glass-cockpit-dlss-fix.log` next to itself and keeps the
 previous session as `glass-cockpit-dlss-fix.old.log` (if the sim crashed or you restarted it, the problem is in the
