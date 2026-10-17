@@ -382,7 +382,7 @@ int main(int argc, char** argv) {
 
         // Mesh, constants.
         // Vertices 1-6: the display quad; 7-12 and 13-18: its top and bottom halves, each showing a whole texture (join test).
-        std::array<Vertex, 61> vertices{};
+        std::array<Vertex, 85> vertices{};
         const float positions[6][2]{{-0.7f, 0.7f}, {0.7f, 0.7f}, {-0.7f, -0.7f}, {-0.7f, -0.7f}, {0.7f, 0.7f}, {0.7f, -0.7f}};
         for (size_t half = 0; half < 3; ++half)
             for (size_t i = 0; i < 6; ++i) {
@@ -426,6 +426,19 @@ int main(int argc, char** argv) {
                 v.tangent[0] = v.tangent[3] = v.normal[2] = 1;
                 if (part == 0) { v.uv[0] = 0.004f; v.uv[1] = 0.06f; }
                 else { v.uv[0] = (positions[i][0] + 0.7f) / 1.4f; v.uv[1] = (top - y) / (top - bottom); }
+                std::fill(std::begin(v.color), std::end(v.color), 1.0f);
+            }
+        // Windows test: four windows over most of the screen, drawn with the screen's texture but all their texture
+        // coordinates on one spot, and a brighter material (like the iFly 737's radio windows: their digits come from
+        // elsewhere). Vertices 61-84.
+        for (size_t q = 0; q < 4; ++q)
+            for (size_t i = 0; i < 6; ++i) {
+                auto& v = vertices[61 + q * 6 + i];
+                const bool right = q & 1, lower = q >> 1;
+                const float x0 = right ? 0.08f : -0.62f, x1 = right ? 0.62f : -0.08f, y0 = lower ? -0.62f : 0.08f, y1 = lower ? -0.08f : 0.62f;
+                v.position[0] = positions[i][0] > 0 ? x1 : x0; v.position[1] = positions[i][1] > 0 ? y1 : y0; v.position[2] = 0.399f; v.position[3] = 1;
+                v.tangent[0] = v.tangent[3] = v.normal[2] = 1;
+                v.uv[0] = 0.004f; v.uv[1] = 0.06f;
                 std::fill(std::begin(v.color), std::end(v.color), 1.0f);
             }
         auto vb = buffer(device.Get(), sizeof(vertices), D3D12_HEAP_TYPE_UPLOAD); upload(vb.Get(), vertices.data(), sizeof(vertices));
@@ -721,8 +734,16 @@ int main(int argc, char** argv) {
             using Image = std::vector<std::array<float, 4>>;
             bool join = false;
             // The display as drawn: one quad, or (join) its two halves with their own textures.
-            bool band = false, inset = false, atlas = false;
+            bool band = false, inset = false, atlas = false, windows = false;
+            auto window_material = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD);
             auto draw_display = [&] {
+                if (windows) {
+                    list->DrawIndexedInstanced(6, 1, 0, 1, 0);
+                    list->SetGraphicsRootConstantBufferView(4, window_material->GetGPUVirtualAddress());
+                    for (int q = 0; q < 4; ++q) list->DrawIndexedInstanced(6, 1, 0, 61 + q * 6, 0);
+                    list->SetGraphicsRootConstantBufferView(4, materials[0]->GetGPUVirtualAddress());
+                    return;
+                }
                 if (band) { list->DrawIndexedInstanced(6, 1, 0, 19, 0); list->DrawIndexedInstanced(6, 1, 0, 25, 0); return; }
                 if (inset) { list->DrawIndexedInstanced(6, 1, 0, 31, 0); return; }
                 if (atlas) { for (int q = 0; q < 4; ++q) list->DrawIndexedInstanced(6, 1, 0, 37 + q * 6, 0); return; }
@@ -825,7 +846,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; bool occluder = false; int occlusion = 0; bool blank = false; };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; bool occluder = false; int occlusion = 0; bool blank = false; bool windows = false; };
             const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 2048}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
                 {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
@@ -879,7 +900,10 @@ int main(int argc, char** argv) {
                 {"still-occluder-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0, true, 1},
                 // The screen's picture goes blank (all black) after it was matched (A380 EFB: only its blank side in view).
                 // The fake DLSS output is magenta: "blank_dropped" = share of the screen left to the upscaler afterwards.
-                {"still-blank", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, false, 0, true}};
+                {"still-blank", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, false, 0, true},
+                // Windows over most of the screen pointing at one texture spot, brighter (iFly 737 radio windows): the fake
+                // DLSS output is magenta, "screen_dropped" = share of the rest of the screen left to the upscaler.
+                {"still-windows", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, false, 0, false, true}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
@@ -915,10 +939,15 @@ int main(int argc, char** argv) {
                 set_occlusion(m.occlusion || occlusion_everywhere);
                 occluder = {};
                 double occluder_error = 0, ring_trimmed = 0, blank_dropped = 0; uint64_t occluder_n = 0, ring_n = 0, blank_n = 0;
-                dlss_magenta = std::strstr(m.name, "trim") != nullptr || m.blank;
+                dlss_magenta = std::strstr(m.name, "trim") != nullptr || m.blank || m.windows;
                 set_full_size(m.full_size);
                 set_temporal(0);
-                join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas;
+                join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas; windows = m.windows;
+                if (m.windows) {
+                    auto bright = material; bright[2] = {}; bright[3] = {1.5f, 1.3f, 1.0f, 0}; // the windows' own light (lit digits)
+                    upload(window_material.Get(), bright.data(), sizeof(bright));
+                }
+                double screen_dropped = 0; uint64_t screen_n = 0;
                 upload_display(0, join);
                 upload_display(0, join, true);
                 Image previous_out, previous_ideal;
@@ -992,6 +1021,10 @@ int main(int argc, char** argv) {
                             ends[e][0] = (clip[0] / clip[3] + 1) * 0.5f * output_w;
                             ends[e][1] = (1 - clip[1] / clip[3]) * 0.5f * output_h;
                         }
+                    if (m.windows && t >= measure_from)
+                        // The screen itself (not the windows: those are the one bright flat colour).
+                        for (size_t i = 0; i < out.size(); ++i)
+                            if (ideal[i][3] >= 0.999f && ideal[i][0] < 0.3f) { screen_dropped += std::clamp(out[i][0], 0.0f, 1.0f) > 0.9f ? 1 : 0; ++screen_n; }
                     if (m.blank && t >= measure_from + 10)
                         for (size_t i = 0; i < out.size(); ++i)
                             if (ideal[i][3] >= 0.999f) { blank_dropped += std::clamp(out[i][0], 0.0f, 1.0f); ++blank_n; }
@@ -1092,6 +1125,7 @@ int main(int argc, char** argv) {
                 }
                 if (m.occluder) std::printf(" occluder_error=%.4f", occluder_error / std::max<uint64_t>(occluder_n, 1));
                 if (m.occluder && dlss_magenta) std::printf(" ring_trimmed=%.3f", ring_trimmed / std::max<uint64_t>(ring_n, 1));
+                if (m.windows) std::printf(" screen_dropped=%.3f (%llu px)", screen_dropped / std::max<uint64_t>(screen_n, 1), (unsigned long long)(screen_n / std::max(1, change_at - measure_from + 6)));
                 if (m.blank) {
                     std::printf(" blank_dropped=%.3f", blank_dropped / std::max<uint64_t>(blank_n, 1));
                     upload_display(0, join);

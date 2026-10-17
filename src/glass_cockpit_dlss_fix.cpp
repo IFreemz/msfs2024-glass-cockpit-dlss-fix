@@ -1095,6 +1095,16 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
     }
     const int slot = slot_of(texture.resource, texture.format);
     if (slot < 0) { note(stats.unsupported_draw, "slots_full"); return; }
+    {
+        // Diagnostics: each distinct draw of a screen texture once (several panels can share one texture, e.g. the iFly
+        // 737's CDU and radios: are they separate draws?).
+        static std::mutex draws_mutex;
+        static std::set<std::tuple<ID3D12Resource*, uint32_t, uint32_t, int32_t, uint32_t>> draws;
+        std::lock_guard lock(draws_mutex);
+        if (draws.size() < 400 && draws.emplace(texture.resource, draw.count, draw.first, draw.base_vertex, draw.instances).second)
+            log("screen_draw slot=%d texture=%p %s count=%u first=%u base_vertex=%d instances=%u", slot, texture.resource, draw.indexed ? "indexed" : "plain",
+                draw.count, draw.first, draw.base_vertex, draw.instances);
+    }
     auto pso = variant(state.display, unsigned(slot));
     if (!pso) return;
     const auto target = list->get_device()->get_resource_from_view({state.targets[0].ptr});

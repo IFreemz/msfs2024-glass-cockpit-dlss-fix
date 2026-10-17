@@ -290,7 +290,10 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
         float2 dy = map_slot(d) == slot ? d.xy - m.xy : map_slot(u) == slot ? m.xy - u.xy : 0;
         x = sample_display(slot, m.xy, dx, dy);
         y = scene.Load(int3(p, 0)).rgb;
-        active = all(isfinite(y));
+        // Parts of the mesh whose texture coordinates all point at one spot (a bezel band, or the iFly 737's radio windows,
+        // whose digits come from elsewhere) carry no picture of the texture: the composite leaves them to the upscaler,
+        // and what the sim shows there would only drag the brightness match down.
+        active = all(isfinite(y)) && length(dx) + length(dy) >= 1e-7;
         y = clamp(y, 0, 1024);
         // Fine detail: differences to the right and lower neighbour on the same display. Sun glare and other smooth
         // light on the glass hardly changes these, so dark screens with thin symbols still score well in the sun.
