@@ -1140,9 +1140,11 @@ int main(int argc, char** argv) {
             for (int i = 1; i < argc; ++i) if (!std::strcmp(argv[i], "--capture")) capture_test = true;
             if (capture_test) {
                 const auto capture = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixCaptureTest"));
-                require(capture != nullptr, "exports missing");
+                const auto pixel_probe = reinterpret_cast<int (*)(int)>(GetProcAddress(addon, "GlassFixPixelProbe"));
+                require(capture != nullptr && pixel_probe != nullptr, "exports missing");
                 const auto started = std::filesystem::file_time_type::clock::now();
                 capture(1);
+                pixel_probe(1); // the screen covers the middle of the view: its draw must reach that pixel
                 for (int t = 0; t < 40; ++t) {
                     const auto c = constants(0, 1);
                     upload(globals[0].Get(), c.global.data(), sizeof(c.global));
@@ -1163,8 +1165,12 @@ int main(int argc, char** argv) {
                 const bool fit_saved = summary.find("fit-input: ") != std::string::npos && summary.find("fit-input: 1280x720") != std::string::npos &&
                     std::filesystem::exists(folder / L"frame0-fit-input.png");
                 const bool map_saved = summary.find("screen slot") != std::string::npos;
-                std::printf("capture %s: fit_input=%s map_screens=%s\n", folder.filename().string().c_str(), fit_saved ? "saved" : "MISSING", map_saved ? "yes" : "NO");
-                require(fit_saved && map_saved, "capture incomplete");
+                const bool draw_saved = summary.find("draw-input: 1280x720") != std::string::npos && std::filesystem::exists(folder / L"frame0-draw-input.png") && std::filesystem::exists(folder / L"frame3-draw-input.png");
+                const int probe = pixel_probe(0);
+                std::printf("capture %s: fit_input=%s draw_input=%s map_screens=%s pixel_probe hits=%d screen_hits=%d\n", folder.filename().string().c_str(),
+                    fit_saved ? "saved" : "MISSING", draw_saved ? "saved" : "MISSING", map_saved ? "yes" : "NO", probe < 0 ? -1 : probe & 0xffff, probe < 0 ? -1 : probe >> 16);
+                require(fit_saved && draw_saved && map_saved, "capture incomplete");
+                require(probe > 0 && (probe >> 16) >= 1, "pixel probe found no screen draw at the middle pixel");
             }
             set_temporal(0); set_smooth(0);
             return 0;

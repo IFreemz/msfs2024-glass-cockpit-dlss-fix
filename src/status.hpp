@@ -36,6 +36,7 @@ Status status();
 void set_enabled(bool on);
 void set_tint(bool on);
 void request_capture();
+void request_pixel_probe();
 void set_jitter_positive(bool on);
 void set_line_smoothing(int percent);
 void set_extra_smoothing(bool on);

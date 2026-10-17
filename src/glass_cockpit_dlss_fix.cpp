@@ -283,6 +283,8 @@ struct DisplayPipeline {
     bool screen_t0 = false; // screen texture in t0 (display_ps_t0)
     std::array<std::atomic<ID3D12PipelineState*>, slot_count> variants{};
     std::array<std::atomic<bool>, slot_count> requested{};
+    std::atomic<ID3D12PipelineState*> colour_variant{}; // screen capture: writes the screen's colour at draw time
+    std::atomic<bool> colour_requested{};
 };
 constexpr size_t max_pipelines = 64;
 std::array<std::atomic<uint64_t>, max_pipelines> pipeline_keys{};
@@ -347,15 +349,27 @@ void worker() {
         { std::unique_lock lock(work_mutex); work_ready.wait(lock, [] { return !work.empty(); }); item = work.front(); work.pop_front(); }
         auto [pipeline, slot] = item;
         D3D12_GRAPHICS_PIPELINE_STATE_DESC clone{};
-        const auto& shader = map_shader(*pipeline, slot);
+        const bool colour = slot == slot_count; // the screen capture's colour variant
+        const std::pair<const unsigned char*, size_t> shader = colour
+            ? (pipeline->screen_t0 ? std::pair<const unsigned char*, size_t>{map_colour_ps_t0, sizeof(map_colour_ps_t0)} : std::pair<const unsigned char*, size_t>{map_colour_ps, sizeof(map_colour_ps)})
+            : map_shader(*pipeline, slot);
         if (!glass::clone_pipeline(pipeline->desc, {shader.first, shader.second}, clone)) {
             log("variant_rejected slot=%u", slot); continue;
         }
         ID3D12PipelineState* created = nullptr;
         const auto hr = pipeline->device->CreateGraphicsPipelineState(&clone, IID_PPV_ARGS(&created));
         if (FAILED(hr)) { log("variant_failed slot=%u hr=0x%lx", slot, hr); continue; }
-        pipeline->variants[slot] = created;
+        if (colour) pipeline->colour_variant = created;
+        else pipeline->variants[slot] = created;
     }
+}
+ID3D12PipelineState* colour_variant(DisplayPipeline* pipeline) {
+    if (auto ready = pipeline->colour_variant.load(std::memory_order_acquire)) return ready;
+    if (!pipeline->vr && !pipeline->colour_requested.exchange(true)) {
+        { std::lock_guard lock(work_mutex); work.emplace_back(pipeline, slot_count); }
+        work_ready.notify_one();
+    }
+    return nullptr;
 }
 ID3D12PipelineState* variant(DisplayPipeline* pipeline, unsigned slot) {
     if (auto ready = pipeline->variants[slot].load(std::memory_order_acquire)) return ready;
@@ -696,6 +710,13 @@ struct Map {
 
 struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     ID3D12Device* native = nullptr;
+    // Screen capture: each screen texture's colour at the moment the sim drew it (render size, kept as a render target).
+    std::mutex draw_colour_mutex;
+    ComPtr<ID3D12Resource> draw_colour;
+    ComPtr<ID3D12DescriptorHeap> draw_colour_rtv;
+    // Pixel probe: one occlusion query per probed draw, resolved into a readback buffer.
+    ComPtr<ID3D12QueryHeap> probe_queries;
+    ComPtr<ID3D12Resource> probe_readback;
     std::mutex maps_mutex;
     std::vector<std::unique_ptr<Map>> maps;
     std::shared_mutex layouts_mutex;
@@ -735,6 +756,8 @@ struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
     UINT target_count = 0;
     bool in_pass = false;
     uint32_t generation = 0;
+    D3D12_RECT scissor{}; // the game's first scissor rectangle (pixel probe restores it)
+    bool scissor_known = false;
 };
 
 Map* map_for(DeviceState& device, UINT width, UINT height, UINT layers) {
@@ -1033,6 +1056,10 @@ void on_bind_targets(api::command_list* list, uint32_t count, const api::resourc
     for (uint32_t i = 0; i < state->target_count; ++i) state->targets[i].ptr = SIZE_T(targets[i].handle);
     state->depth.ptr = SIZE_T(depth.handle);
 }
+void on_bind_scissors(api::command_list* list, uint32_t first, uint32_t count, const api::rect* rects) {
+    if (!enabled.load(std::memory_order_relaxed) || first != 0 || !count || !rects) return;
+    if (auto state = list->get_private_data<ListState>()) { state->scissor = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom}; state->scissor_known = true; }
+}
 void on_begin_pass(api::command_list* list, uint32_t, const api::render_pass_render_target_desc*, const api::render_pass_depth_stencil_desc*) {
     CpuScope scope(cpu_passes);
     if (!enabled.load(std::memory_order_relaxed)) return;
@@ -1044,6 +1071,7 @@ void on_end_pass(api::command_list* list) {
     if (auto state = list->get_private_data<ListState>()) { state->in_pass = false; state->target_count = 0; state->depth = {}; }
 }
 
+extern std::atomic<int> capture_requested; // screen capture (below)
 void replay(api::command_list* list, ListState& state, const glass::Draw& draw) noexcept try {
     auto& device = *state.device;
     if (state.in_pass || !state.target_count || !state.depth.ptr || !draw.count || !draw.instances) { note(stats.unsupported_draw, "render_pass_or_targets"); return; }
@@ -1129,6 +1157,37 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
     native->OMSetRenderTargets(1, &rtv, FALSE, &state.depth);
     if (draw.indexed) native->DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
     else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
+    // Screen capture: the screen texture's colour as the sim draws it (it can differ from what the fix reads later).
+    if (capture_requested.load(std::memory_order_relaxed) > 0 && layers == 1) {
+        if (auto colour = colour_variant(state.display)) {
+            D3D12_CPU_DESCRIPTOR_HANDLE colour_rtv{};
+            {
+                std::lock_guard lock(device.draw_colour_mutex);
+                if (device.draw_colour && (device.draw_colour->GetDesc().Width != desc.Width || device.draw_colour->GetDesc().Height != desc.Height)) device.draw_colour = nullptr;
+                if (!device.draw_colour) {
+                    D3D12_HEAP_PROPERTIES colour_heap{D3D12_HEAP_TYPE_DEFAULT};
+                    D3D12_RESOURCE_DESC colour_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, desc.Width, desc.Height, 1, 1, glass::map_format, {1, 0},
+                        D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+                    D3D12_CLEAR_VALUE clear{glass::map_format, {}};
+                    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+                    if (FAILED(device.native->CreateCommittedResource(&colour_heap, D3D12_HEAP_FLAG_NONE, &colour_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&device.draw_colour))) ||
+                        (!device.draw_colour_rtv && FAILED(device.native->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&device.draw_colour_rtv))))) device.draw_colour = nullptr;
+                    else {
+                        device.native->CreateRenderTargetView(device.draw_colour.Get(), nullptr, device.draw_colour_rtv->GetCPUDescriptorHandleForHeapStart());
+                        constexpr float zero[4]{};
+                        native->ClearRenderTargetView(device.draw_colour_rtv->GetCPUDescriptorHandleForHeapStart(), zero, 0, nullptr);
+                    }
+                }
+                if (device.draw_colour) colour_rtv = device.draw_colour_rtv->GetCPUDescriptorHandleForHeapStart();
+            }
+            if (colour_rtv.ptr) {
+                native->SetPipelineState(colour);
+                native->OMSetRenderTargets(1, &colour_rtv, FALSE, &state.depth);
+                if (draw.indexed) native->DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
+                else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
+            }
+        }
+    }
     native->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pso));
     native->OMSetRenderTargets(state.target_count, state.targets.data(), FALSE, &state.depth);
     transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, map_resting);
@@ -1256,10 +1315,112 @@ void screen_probe(api::command_list* list, const ListState& state, uint32_t coun
     }
 } catch (...) {}
 
+// Pixel probe (Ctrl+Shift+F10 or the panel's button): for one frame, every draw is first drawn once more clipped to the
+// pixel in the middle of its render target, inside an occlusion query (before the game's own draw, so the depth test is
+// the same as for it). The draws that reach that pixel are logged with their shaders, render target and the cockpit-
+// screen textures their pixel shader can read: shows how whatever is in the middle of the view is drawn.
+constexpr uint32_t pixel_probe_max = 8192;
+std::atomic<uint64_t> pixel_probe_frame{UINT64_MAX}; // present count whose draws are probed
+std::atomic<uint32_t> pixel_probe_used{0};
+std::atomic<int> pixel_probe_hits{-1}; // offline test: draws that reached the pixel in the last probe (-1: none done)
+std::atomic<int> pixel_probe_display_hits{-1};
+struct ProbedDraw { uint64_t pso = 0, vs = 0, ps = 0; uint32_t count = 0, instances = 0, first = 0; int32_t base_vertex = 0; bool indexed = false, display = false;
+    UINT targets = 0; uint32_t rt_w = 0, rt_h = 0, rt_format = 0; std::string textures; };
+std::mutex pixel_probe_mutex;
+std::vector<ProbedDraw> pixel_probe_draws;
+void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& draw) noexcept try {
+    if (!state.device || !state.device->probe_queries || state.in_pass || !state.target_count) return;
+    auto device = list->get_device();
+    const auto rt = device->get_resource_from_view({uint64_t(state.targets[0].ptr)});
+    if (!rt.handle) return;
+    const auto t = device->get_resource_desc(rt);
+    const uint32_t index = pixel_probe_used.fetch_add(1);
+    if (index >= pixel_probe_max) return;
+    auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native());
+    const LONG cx = LONG(t.texture.width / 2), cy = LONG(t.texture.height / 2);
+    const D3D12_RECT pixel{cx, cy, cx + 1, cy + 1};
+    native->RSSetScissorRects(1, &pixel);
+    native->BeginQuery(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
+    if (draw.indexed) native->DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
+    else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
+    native->EndQuery(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
+    native->ResolveQueryData(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index, 1, state.device->probe_readback.Get(), uint64_t(index) * 8);
+    const D3D12_RECT whole{0, 0, LONG(t.texture.width), LONG(t.texture.height)};
+    native->RSSetScissorRects(1, state.scissor_known ? &state.scissor : &whole);
+    ProbedDraw p;
+    p.pso = state.pso; p.count = draw.count; p.instances = draw.instances; p.first = draw.first; p.base_vertex = draw.base_vertex; p.indexed = draw.indexed;
+    p.display = state.display != nullptr; p.targets = state.target_count; p.rt_w = t.texture.width; p.rt_h = t.texture.height; p.rt_format = uint32_t(t.texture.format);
+    {
+        std::shared_lock lock(hashes_mutex);
+        if (const auto found = pipeline_hashes.find(state.pso); found != pipeline_hashes.end()) { p.vs = found->second.first; p.ps = found->second.second; }
+    }
+    // Cockpit-screen-like textures the pixel shader's tables hold (like the screen probe).
+    std::vector<DeviceState::SrvRange> ranges;
+    {
+        std::shared_lock lock(state.device->layouts_mutex);
+        if (const auto found = state.device->srv_ranges.find(state.layout); found != state.device->srv_ranges.end()) ranges = found->second;
+    }
+    for (const auto& r : ranges) {
+        const auto table = r.param < state.tables.size() ? state.tables[r.param] : 0;
+        if (!table) continue;
+        for (uint32_t k = 0; k < r.count; ++k) {
+            api::descriptor_heap heap{}; uint32_t offset = 0;
+            device->get_descriptor_heap_offset({table}, r.offset + k, 0, &heap, &offset);
+            if (!heap.handle) continue;
+            const auto native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
+            Signature sig{};
+            if (!read_bytes(reinterpret_cast<const void*>(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size), sig.bytes.data(), descriptor_size)) continue;
+            ID3D12Resource* resource = nullptr;
+            {
+                std::shared_lock lock(textures_mutex);
+                if (const auto found = signatures.find(sig); found != signatures.end()) resource = found->second.resource;
+            }
+            if (!resource) continue;
+            const auto d = resource->GetDesc();
+            int slot = -1;
+            for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() == resource) slot = int(i);
+            char item[128];
+            snprintf(item, sizeof(item), " t%u=%p(%llux%u mips=%u fmt=%u slot=%d)", r.reg + k, resource, uint64_t(d.Width), d.Height, unsigned(d.MipLevels), unsigned(d.Format), slot);
+            p.textures += item;
+        }
+    }
+    std::lock_guard lock(pixel_probe_mutex);
+    if (pixel_probe_draws.size() <= index) pixel_probe_draws.resize(index + 1);
+    pixel_probe_draws[index] = std::move(p);
+} catch (...) {}
+
+// Called once per present: logs a finished pixel probe.
+void pixel_probe_flush(uint64_t now) {
+    const uint64_t frame = pixel_probe_frame.load();
+    if (frame == UINT64_MAX || now < frame + 4 || !main_state || !main_state->probe_readback) return;
+    pixel_probe_frame = UINT64_MAX;
+    const uint32_t used = std::min(pixel_probe_used.load(), pixel_probe_max);
+    void* data = nullptr;
+    const D3D12_RANGE range{0, SIZE_T(used) * 8};
+    if (FAILED(main_state->probe_readback->Map(0, &range, &data))) return;
+    std::vector<uint64_t> samples(static_cast<const uint64_t*>(data), static_cast<const uint64_t*>(data) + used);
+    const D3D12_RANGE none{0, 0};
+    main_state->probe_readback->Unmap(0, &none);
+    std::lock_guard lock(pixel_probe_mutex);
+    int hits = 0, display_hits = 0;
+    for (uint32_t i = 0; i < used && i < pixel_probe_draws.size(); ++i) {
+        if (!samples[i]) continue;
+        const auto& p = pixel_probe_draws[i];
+        ++hits; display_hits += p.display;
+        log("pixel_probe hit samples=%llu pso=%p vs=%016llx ps=%016llx display=%d %s count=%u first=%u base_vertex=%d instances=%u targets=%u rt0=%ux%u format=%u%s",
+            samples[i], reinterpret_cast<void*>(p.pso), p.vs, p.ps, int(p.display), p.indexed ? "indexed" : "plain", p.count, p.first, p.base_vertex, p.instances,
+            p.targets, p.rt_w, p.rt_h, p.rt_format, p.textures.c_str());
+    }
+    log("pixel_probe done: %u draws probed, %d reach the middle pixel (%d of them screen draws)", used, hits, display_hits);
+    pixel_probe_hits = hits; pixel_probe_display_hits = display_hits;
+    pixel_probe_draws.clear();
+}
+
 bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, uint32_t first_instance) {
     CpuScope scope(cpu_draws);
     if (!enabled.load(std::memory_order_relaxed)) return false;
     auto state = list->get_private_data<ListState>();
+    if (state && present_count.load(std::memory_order_relaxed) == pixel_probe_frame.load(std::memory_order_relaxed)) pixel_probe(list, *state, {false, count, instances, first, first_instance, 0});
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
     if (state && state->display) ++stats.display_draws;
@@ -1270,6 +1431,7 @@ bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances
     CpuScope scope(cpu_draws);
     if (!enabled.load(std::memory_order_relaxed)) return false;
     auto state = list->get_private_data<ListState>();
+    if (state && present_count.load(std::memory_order_relaxed) == pixel_probe_frame.load(std::memory_order_relaxed)) pixel_probe(list, *state, {true, count, instances, first, first_instance, vertex});
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
     if (state && state->display) ++stats.display_draws;
@@ -1617,7 +1779,7 @@ HRESULT save_png(const std::filesystem::path& path, UINT width, UINT height, con
         ComPtr<IWICBitmapFrameEncode> frame;
         ComPtr<IWICBitmap> bitmap;
         ComPtr<IWICFormatConverter> converter;
-        WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+        WICPixelFormatGUID format = GUID_WICPixelFormat32bppRGBA;
         result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
         if (SUCCEEDED(result)) result = factory->CreateStream(&stream);
         if (SUCCEEDED(result)) result = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
@@ -1805,7 +1967,7 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
                         box[0] = std::min(box[0], x); box[1] = std::min(box[1], y); box[2] = std::max(box[2], x); box[3] = std::max(box[3], y); ++box[4];
                     }
                 } else for (int i = 0; i < 3; ++i) {
-                    const float v = std::clamp(std::isfinite(c[i]) ? c[i] * (image.name == "fit-input" ? 1.0f : scale) : 0.0f, 0.0f, 1.0f);
+                    const float v = std::clamp(std::isfinite(c[i]) ? c[i] * (image.name == "fit-input" || image.name == "draw-input" ? 1.0f : scale) : 0.0f, 0.0f, 1.0f);
                     out[i] = uint8_t(std::lround((v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1 / 2.4f) - 0.055f) * 255));
                 }
                 // fit-input: alpha = slot + 1 where the brightness match counted the pixel, 0 where it didn't.
@@ -2246,6 +2408,11 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         capture_copy(d.native, native, output, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out_format, "3-after-fix", capture);
         if (map->fit_input && render_w <= map->fit_input->GetDesc().Width && render_h <= map->fit_input->GetDesc().Height)
             capture_copy(d.native, native, map->fit_input.Get(), 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, DXGI_FORMAT_R16G16B16A16_FLOAT, "fit-input", capture);
+        {
+            std::lock_guard colour_lock(d.draw_colour_mutex);
+            if (d.draw_colour && d.draw_colour->GetDesc().Width == render_w && d.draw_colour->GetDesc().Height == render_h)
+                capture_copy(d.native, native, d.draw_colour.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, glass::map_format, "draw-input", capture);
+        }
         // The colour match this frame used (the solve pass wrote it before the composite).
         D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
         D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slot_count * 3 * 16, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -2720,7 +2887,9 @@ void on_present(api::effect_runtime* runtime) {
     measure_cost(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr, runtime->get_device()->get_private_data<DeviceState>(),
         present_count.load(std::memory_order_relaxed));
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
+    pixel_probe_flush(present_count.load(std::memory_order_relaxed));
     if (chord && runtime->is_key_pressed(VK_F8)) glass::request_capture();
+    if (chord && runtime->is_key_pressed(VK_F10)) glass::request_pixel_probe();
     if (chord && runtime->is_key_pressed(VK_F7)) { mip0_only = !mip0_only; save_settings(); log("setting full_size_sampling=%d (Ctrl+Shift+F7)", int(mip0_only.load())); }
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
     if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
@@ -2824,6 +2993,25 @@ void set_enabled(bool on) {
     enabled = on; save_settings(); log("setting overlay=%d", int(on));
 }
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
+void request_pixel_probe() {
+    if (!main_state || pixel_probe_frame.load() != UINT64_MAX) return;
+    if (!main_state->probe_queries) {
+        D3D12_QUERY_HEAP_DESC heap{D3D12_QUERY_HEAP_TYPE_OCCLUSION, pixel_probe_max, 0};
+        D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, uint64_t(pixel_probe_max) * 8, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        ComPtr<ID3D12QueryHeap> queries; ComPtr<ID3D12Resource> results;
+        if (FAILED(main_state->native->CreateQueryHeap(&heap, IID_PPV_ARGS(&queries))) ||
+            FAILED(main_state->native->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&results)))) {
+            log("pixel_probe: could not create its queries"); return;
+        }
+        main_state->probe_readback = results; main_state->probe_queries = queries;
+    }
+    { std::lock_guard lock(pixel_probe_mutex); pixel_probe_draws.clear(); }
+    pixel_probe_used = 0;
+    pixel_probe_frame = present_count.load() + 1;
+    log("pixel_probe requested: the draws of the next frame that reach the middle of the view");
+}
 void request_capture() {
     std::lock_guard lock(capture_mutex);
     if (capture_requested.load() || capture_ready_at || capture_presents_left.load()) return;
@@ -2833,7 +3021,7 @@ void request_capture() {
     capture_folder = addon_directory / name;
     capture_frames.clear();
     capture_message = "Capturing... (fly with the screens in view)";
-    capture_countdown = 0;
+    capture_countdown = 3; // a few frames first: the draw-time colour shaders compile in the background
     capture_presents_left = capture_present_count;
     capture_requested = capture_frame_count;
     log("capture requested: %ls", capture_folder.c_str());
@@ -2879,7 +3067,7 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghostin
     X(bind_pipeline, on_bind_pipeline) X(bind_descriptor_tables, on_bind_tables) \
     X(bind_render_targets_and_depth_stencil, on_bind_targets) X(begin_render_pass, on_begin_pass) X(end_render_pass, on_end_pass) \
     X(draw, on_draw) X(draw_indexed, on_draw_indexed) X(reshade_present, on_present) X(init_pipeline, on_init_pipeline) \
-    X(copy_texture_region, on_copy_region)
+    X(copy_texture_region, on_copy_region) X(bind_scissor_rects, on_bind_scissors)
 
 // ReShade unloads its add-ons when the last device goes away and loads them again for the next one (e.g. when another
 // mod such as OptiScaler creates and releases a device at startup). The module stays pinned (its hooks must stay
@@ -2974,6 +3162,14 @@ extern "C" __declspec(dllexport) void GlassFixCostTick(ID3D12CommandQueue* queue
 extern "C" __declspec(dllexport) void GlassFixCaptureTest(int request) {
     if (request) { glass::request_capture(); capture_presents_left = 0; return; }
     capture_flush(++present_count);
+    pixel_probe_flush(present_count.load());
+}
+// Offline test host: 1 requests a pixel probe; 0 returns the draws that reached the pixel in the last one (high 16 bits:
+// screen draws), -1 while none has finished.
+extern "C" __declspec(dllexport) int GlassFixPixelProbe(int request) {
+    if (request) { glass::request_pixel_probe(); pixel_probe_hits = -1; return 0; }
+    const int hits = pixel_probe_hits.load();
+    return hits < 0 ? -1 : (hits & 0xffff) | (pixel_probe_display_hits.load() << 16);
 }
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE) {
     enabled_before_unload = enabled.exchange(false);

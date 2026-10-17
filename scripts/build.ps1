@@ -43,6 +43,12 @@ try {
         if ($LASTEXITCODE) { throw "VR screen-t0 map shader $slot failed" }
         $headers += "map_ps_vr_t0_$slot.h"
     }
+    # Screen capture: the screen texture's colour at the moment the sim draws it (flat; standard and screen-t0 variants).
+    & $dxc -T ps_6_6 -HV 2021 -E main -D DISPLAY_SLOT=0 -D COLOUR=1 -WX -O3 -Fh 'map_colour_ps.h' -Vn 'map_colour_ps' (Join-Path $root 'src\display_map.hlsl')
+    if ($LASTEXITCODE) { throw 'Colour capture shader failed' }
+    & $dxc -T ps_6_6 -HV 2021 -E main -D DISPLAY_SLOT=0 -D COLOUR=1 -D SCREEN_T0=1 -WX -O3 -Fh 'map_colour_ps_t0.h' -Vn 'map_colour_ps_t0' (Join-Path $root 'src\display_map.hlsl')
+    if ($LASTEXITCODE) { throw 'Screen-t0 colour capture shader failed' }
+    $headers += 'map_colour_ps.h', 'map_colour_ps_t0.h'
     foreach ($pass in 'zero', 'fit', 'solve', 'composite', 'clear', 'glass_filter') {
         & $dxc -T cs_6_6 -HV 2021 -E $pass -WX -O3 -Fh "cs_$pass.h" -Vn "cs_$pass" (Join-Path $root 'src\overlay.hlsl')
         if ($LASTEXITCODE) { throw "Compute pass $pass failed" }
