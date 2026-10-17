@@ -27,12 +27,15 @@ Push-Location $build
 try {
     & $compiler /nologo /c /TC /W3 /MD /O2 (Join-Path $minhook 'src\buffer.c') (Join-Path $minhook 'src\hook.c') (Join-Path $minhook 'src\trampoline.c') (Join-Path $minhook 'src\hde\hde64.c')
     if ($LASTEXITCODE) { throw 'MinHook compilation failed' }
-    # Shaders -> one generated header (32 display-slot variants of the map shader, flat/VR/screen-t0, + 5 compute passes).
+    # Shaders -> one generated header (32 display-slot variants of the map shader, flat/brightness/VR/screen-t0, + compute passes).
     $headers = @()
     foreach ($slot in 0..31) {
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -WX -O3 -Fh "map_ps_$slot.h" -Vn "map_ps_$slot" (Join-Path $root 'src\display_map.hlsl')
         if ($LASTEXITCODE) { throw "Map shader $slot failed" }
         $headers += "map_ps_$slot.h"
+        & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D BRIGHTNESS=1 -WX -O3 -Fh "map_ps_b_$slot.h" -Vn "map_ps_b_$slot" (Join-Path $root 'src\display_map.hlsl')
+        if ($LASTEXITCODE) { throw "Brightness map shader $slot failed" }
+        $headers += "map_ps_b_$slot.h"
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D VR=1 -WX -O3 -Fh "map_ps_vr_$slot.h" -Vn "map_ps_vr_$slot" (Join-Path $root 'src\display_map.hlsl')
         if ($LASTEXITCODE) { throw "VR map shader $slot failed" }
         $headers += "map_ps_vr_$slot.h"

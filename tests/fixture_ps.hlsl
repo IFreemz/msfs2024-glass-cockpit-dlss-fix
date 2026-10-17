@@ -16,6 +16,7 @@ Texture2D<float4> base_texture : register(t0);
 Texture2D<float4> display_texture : register(t1);
 #endif
 SamplerState base_sampler : register(s1);
+cbuffer Instances : register(b2) { float4 instance_data[64]; }; // row 0 per instance: brightness (as the game's display shader)
 
 float3 srgb_to_linear(float3 c) { return select(c <= 0.04045, c / 12.92, pow(c * 0.947867 + 0.0521327, 2.4)); }
 
@@ -46,5 +47,8 @@ float4 main(CockpitVertex input) : SV_Target0
     float dirt = 0.5 + 0.25 * sin(glass_uv.x * 157.0 + sin(glass_uv.y * 71.0) * 3.0) + 0.25 * sin(glass_uv.y * 211.0 + glass_uv.x * 53.0);
     float3 glass = material[5].z * dirt * float3(0.9, 0.85, 0.8) + glare * float3(1.0, 0.9, 0.7);
     if (material[5].w > 0 && glass_uv.x > material[5].w) glass *= 0.25; // shadow edge
+#if !VR
+    c *= instance_data[min(input.instance, 15u) * 4].rgb * input.color;
+#endif
     return float4(c * material[2].rgb + material[3].rgb + glass, REFERENCE ? 0.5 : 1.0);
 }

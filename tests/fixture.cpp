@@ -333,11 +333,11 @@ int main(int argc, char** argv) {
             cost_tick(queue.Get()); // stands in for the present event: drives the add-on's cost measurement
         };
 
-        // Root signature shaped like the game's: VS b0-b2, PS b1/b3, SRV table t0-t1, static s1.
+        // Root signature shaped like the game's: VS b0-b2 (b2 also PS: per-instance brightness), PS b1/b3, SRV table t0-t1, static s1.
         std::array<D3D12_ROOT_PARAMETER, 6> params{};
         for (UINT i = 0; i < 5; ++i) {
             params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-            params[i].ShaderVisibility = i < 3 ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
+            params[i].ShaderVisibility = i == 2 ? D3D12_SHADER_VISIBILITY_ALL : i < 3 ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
             params[i].Descriptor.ShaderRegister = i < 3 ? i : i == 3 ? 1 : screen_t0 ? 4 : 3; // variant: material in b4
         }
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
@@ -448,11 +448,17 @@ int main(int argc, char** argv) {
         const D3D12_VERTEX_BUFFER_VIEW vbv{vb->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
         const D3D12_INDEX_BUFFER_VIEW ibv{ib->GetGPUVirtualAddress(), sizeof(indices), DXGI_FORMAT_R16_UINT};
         std::array<ComPtr<ID3D12Resource>, 2> globals, worlds, objects;
+        ComPtr<ID3D12Resource> objects_dim; // per-instance brightness 0.35 (dim modes: one atlas quad drawn dimmer)
         for (int k = 0; k < 2; ++k) {
-            const auto c = constants(k ? 0.25f : 0.0f);
+            auto c = constants(k ? 0.25f : 0.0f);
+            c.object[0] = {1, 1, 1, 1}; // instance 0's brightness (the display shader multiplies its output by row 0's rgb)
             globals[k] = buffer(device.Get(), sizeof(c.global), D3D12_HEAP_TYPE_UPLOAD); upload(globals[k].Get(), c.global.data(), sizeof(c.global));
             worlds[k] = buffer(device.Get(), sizeof(c.world), D3D12_HEAP_TYPE_UPLOAD); upload(worlds[k].Get(), c.world.data(), sizeof(c.world));
             objects[k] = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD); upload(objects[k].Get(), c.object.data(), sizeof(c.object));
+            if (!k) {
+                c.object[0] = {0.35f, 0.35f, 0.35f, 1};
+                objects_dim = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD); upload(objects_dim.Get(), c.object.data(), sizeof(c.object));
+            }
         }
         auto render_cb = buffer(device.Get(), 256, D3D12_HEAP_TYPE_UPLOAD);
         const float threshold[4]{0, 0, 0, 0}; upload(render_cb.Get(), threshold, sizeof(threshold));
@@ -735,7 +741,7 @@ int main(int argc, char** argv) {
             using Image = std::vector<std::array<float, 4>>;
             bool join = false;
             // The display as drawn: one quad, or (join) its two halves with their own textures.
-            bool band = false, inset = false, atlas = false, windows = false;
+            bool band = false, inset = false, atlas = false, windows = false, dim = false;
             auto window_material = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD);
             auto draw_display = [&] {
                 if (windows) {
@@ -747,7 +753,15 @@ int main(int argc, char** argv) {
                 }
                 if (band) { list->DrawIndexedInstanced(6, 1, 0, 19, 0); list->DrawIndexedInstanced(6, 1, 0, 25, 0); return; }
                 if (inset) { list->DrawIndexedInstanced(6, 1, 0, 31, 0); return; }
-                if (atlas) { for (int q = 0; q < 4; ++q) list->DrawIndexedInstanced(6, 1, 0, 37 + q * 6, 0); return; }
+                if (atlas) {
+                    for (int q = 0; q < 4; ++q) {
+                        // Dim: the third quad at its own brightness (like the Fenix A320's readouts on one texture).
+                        if (dim && q == 2) list->SetGraphicsRootConstantBufferView(2, objects_dim->GetGPUVirtualAddress());
+                        list->DrawIndexedInstanced(6, 1, 0, 37 + q * 6, 0);
+                        if (dim && q == 2) list->SetGraphicsRootConstantBufferView(2, objects[0]->GetGPUVirtualAddress());
+                    }
+                    return;
+                }
                 if (!join) { list->DrawIndexedInstanced(6, 1, 0, 1, 0); return; }
                 list->SetGraphicsRootDescriptorTable(5, table);
                 list->DrawIndexedInstanced(6, 1, 0, 7, 0);
@@ -847,7 +861,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; bool occluder = false; int occlusion = 0; bool blank = false; bool windows = false; };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; bool occluder = false; int occlusion = 0; bool blank = false; bool windows = false; bool dim = false; };
             const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 2048}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
                 {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
@@ -875,6 +889,9 @@ int main(int argc, char** argv) {
                 {"inset-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, false, false, 0, false, 1, true},
                 // Screens sharing one texture (A220, A340, A380).
                 {"still-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true}, {"atlas", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true},
+                // One texture, four meshes, one of them dimmer (per-instance brightness): each must keep its own brightness.
+                {"still-dim-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0, false, 0, false, false, true},
+                {"dim-atlas", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0, false, 0, false, false, true},
                 {"still-atlas-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, true}, {"atlas-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, true},
                 // The sim recycling screen textures (A220): every 12 frames the screen texture is destroyed and a new one
                 // made (it takes the same slot), shown at another brightness. "swap" = error on the 2 frames after each swap.
@@ -943,7 +960,7 @@ int main(int argc, char** argv) {
                 dlss_magenta = std::strstr(m.name, "trim") != nullptr || m.blank || m.windows;
                 set_full_size(m.full_size);
                 set_temporal(0);
-                join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas; windows = m.windows;
+                join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas; windows = m.windows; dim = m.dim;
                 if (m.windows) {
                     auto bright = material; bright[2] = {}; bright[3] = {1.5f, 1.3f, 1.0f, 0}; // the windows' own light (lit digits)
                     upload(window_material.Get(), bright.data(), sizeof(bright));

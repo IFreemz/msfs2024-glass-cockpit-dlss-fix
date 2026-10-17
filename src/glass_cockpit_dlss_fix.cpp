@@ -282,6 +282,7 @@ struct DisplayPipeline {
     ComPtr<ID3D12Device> device;
     bool vr = false;
     bool screen_t0 = false; // screen texture in t0 (display_ps_t0)
+    bool brightness = false; // the standard display shader: its map variant records each mesh's brightness (b2)
     std::array<std::atomic<ID3D12PipelineState*>, slot_count> variants{};
     std::array<std::atomic<bool>, slot_count> requested{};
     std::atomic<ID3D12PipelineState*> colour_variant{}; // screen capture: writes the screen's colour at draw time
@@ -303,6 +304,14 @@ DisplayPipeline* find_pipeline(uint64_t handle) {
 
 const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shaders{{
 #define SLOT(n) {map_ps_##n, sizeof(map_ps_##n)},
+    SLOT(0) SLOT(1) SLOT(2) SLOT(3) SLOT(4) SLOT(5) SLOT(6) SLOT(7)
+    SLOT(8) SLOT(9) SLOT(10) SLOT(11) SLOT(12) SLOT(13) SLOT(14) SLOT(15)
+    SLOT(16) SLOT(17) SLOT(18) SLOT(19) SLOT(20) SLOT(21) SLOT(22) SLOT(23)
+    SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
+#undef SLOT
+}};
+const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shaders_brightness{{
+#define SLOT(n) {map_ps_b_##n, sizeof(map_ps_b_##n)},
     SLOT(0) SLOT(1) SLOT(2) SLOT(3) SLOT(4) SLOT(5) SLOT(6) SLOT(7)
     SLOT(8) SLOT(9) SLOT(10) SLOT(11) SLOT(12) SLOT(13) SLOT(14) SLOT(15)
     SLOT(16) SLOT(17) SLOT(18) SLOT(19) SLOT(20) SLOT(21) SLOT(22) SLOT(23)
@@ -337,7 +346,7 @@ const std::pair<const unsigned char*, size_t>& map_shader(bool vr, bool screen_t
     return vr ? (screen_t0 ? map_shaders_vr_t0[slot] : map_shaders_vr[slot]) : screen_t0 ? map_shaders_t0[slot] : map_shaders[slot];
 }
 const std::pair<const unsigned char*, size_t>& map_shader(const DisplayPipeline& pipeline, unsigned slot) {
-    return map_shader(pipeline.vr, pipeline.screen_t0, slot);
+    return pipeline.brightness ? map_shaders_brightness[slot] : map_shader(pipeline.vr, pipeline.screen_t0, slot);
 }
 
 // Variant PSOs are compiled on a worker thread; draws are skipped (not stalled) until theirs is ready.
@@ -358,7 +367,15 @@ void worker() {
             log("variant_rejected slot=%u", slot); continue;
         }
         ID3D12PipelineState* created = nullptr;
-        const auto hr = pipeline->device->CreateGraphicsPipelineState(&clone, IID_PPV_ARGS(&created));
+        auto hr = pipeline->device->CreateGraphicsPipelineState(&clone, IID_PPV_ARGS(&created));
+        if (FAILED(hr) && !colour && pipeline->brightness) {
+            // The pipeline's root signature doesn't give the pixel shader the per-instance data (b2): the plain map
+            // shader instead (one brightness per screen texture, as before).
+            LOG_ONCE("display pipeline without per-mesh brightness (hr=0x%lx): plain screen map used", hr);
+            const auto& plain = map_shader(false, false, slot);
+            if (glass::clone_pipeline(pipeline->desc, {plain.first, plain.second}, clone))
+                hr = pipeline->device->CreateGraphicsPipelineState(&clone, IID_PPV_ARGS(&created));
+        }
         if (FAILED(hr)) { log("variant_failed slot=%u hr=0x%lx", slot, hr); continue; }
         if (colour) pipeline->colour_variant = created;
         else pipeline->variants[slot] = created;
@@ -411,6 +428,7 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     copy->device = device;
     copy->vr = vr;
     copy->screen_t0 = screen_t0;
+    copy->brightness = !vr && !screen_t0 && ps == display_ps;
     std::lock_guard lock(pipelines_mutex);
     for (size_t i = 0; i < max_pipelines; ++i) if (!pipeline_keys[i].load()) {
         pipeline_values[i] = copy;
@@ -1579,7 +1597,8 @@ bool create_composite(DeviceState& d) {
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.sums)))) return false;
     buffer.Width = slot_count * 3 * 16;
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.params)))) return false;
-    buffer.Width = 2 * slot_count * bounds_cells * bounds_cells * 16 + 256; // two halves of learnt edges, call counters
+    buffer.Width = 2 * slot_count * bounds_cells * bounds_cells * 16 + 256 + 256; // two halves of learnt edges, call counters,
+                                                                                   // per-slot brightness references
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.edge_bounds)))) return false;
     D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -2336,7 +2355,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     history_view.Format = DXGI_FORMAT_R16G16_UNORM;
     d.native->CreateUnorderedAccessView(temporal ? map->history_uv.Get() : nullptr, nullptr, &history_view, at(uav_base + 6));
     D3D12_UNORDERED_ACCESS_VIEW_DESC raw{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
-    raw.Buffer = {0, 2 * slot_count * bounds_cells * bounds_cells * 4 + 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+    raw.Buffer = {0, 2 * slot_count * bounds_cells * bounds_cells * 4 + 64 + 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
     d.native->CreateUnorderedAccessView(d.edge_bounds.Get(), nullptr, &raw, at(uav_base + 7));
     D3D12_UNORDERED_ACCESS_VIEW_DESC glass_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
     glass_view.Texture2DArray = {0, 0, map->layers, 0};

@@ -76,6 +76,16 @@ static const uint diag_base = 2 * bounds_bytes; // after the edge bounds: 64 cal
 uint bounds_half(uint call) { return (call >> 7) & 1; }
 static const float3 luma = float3(0.2126, 0.7152, 0.0722);
 static const float bounds_scale = 16777215.0;
+static const uint brightness_base = diag_base + 256; // per slot: reference brightness (float bits), then the proposed one
+
+float map_level(float4 m) { return exp2((m.w - round(m.w)) * 64); }
+
+float brightness_ratio(float4 m, uint slot)
+{
+    if (slot >= slot_count) return 1;
+    float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4));
+    return reference > 0 ? clamp(map_level(m) / reference, 1.0 / 4096, 4096) : 1;
+}
 
 float3 srgb_to_linear(float3 c)
 {
@@ -89,6 +99,11 @@ float3 srgb_to_linear(float3 c)
 // picture minus that, and any difference in sampling would show up in it as flicker around thin lines.
 static bool sim_sampling = false;
 
+// Per-mesh brightness: several meshes can show one screen texture, each at its own brightness (e.g. the Fenix A320's
+// readouts). The map's w carries it beside the slot (w = slot + 1 + log2(brightness) / 64); the screen texture is read
+// times this pixel's brightness relative to its slot's reference (the first brightness seen in the slot, kept for the
+// session: any fixed value works, the fitted gain absorbs it). 1 where the map has no brightness (other shaders).
+static float pixel_brightness = 1;
 float3 texture_tap(uint slot, float2 uv, float2 gx, float2 gy)
 {
     if ((flags & 512) && !sim_sampling) return displays[NonUniformResourceIndex(slot)].SampleLevel(display_sampler, uv, 0).rgb;
@@ -135,12 +150,12 @@ float3 sample_area(uint slot, float2 uv, float2 fx, float2 fy, uint n, bool soft
 float3 sample_display(uint slot, float2 uv, float2 dx, float2 dy)
 {
     uint n = sim_sampling || !(flags & 512) ? 2 : taps_for(slot, dx, dy);
-    if (n > 2) return srgb_to_linear(saturate(sample_area(slot, uv, dx, dy, n, false)));
+    if (n > 2) return srgb_to_linear(saturate(sample_area(slot, uv, dx, dy, n, false))) * pixel_brightness;
     static const float2 offsets[4] = { float2(0.125, 0.375), float2(0.375, -0.125), float2(-0.125, -0.375), float2(-0.375, 0.125) };
     float3 sum = 0;
     [unroll] for (uint i = 0; i < 4; ++i)
         sum += texture_tap(slot, uv + offsets[i].x * dx + offsets[i].y * dy, dx * 0.5, dy * 0.5);
-    return srgb_to_linear(saturate(sum * 0.25));
+    return srgb_to_linear(saturate(sum * 0.25)) * pixel_brightness;
 }
 
 // Smooth lines: what DLSS converges to on a still screen, without its history. DLSS averages each pixel over the area of
@@ -156,7 +171,7 @@ float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy)
     bool soft = (flags & 128) != 0;
     float spread = soft ? 2.0 : 1.0;
     float2 fx = dx * width.x * spread, fy = dy * width.y * spread;
-    return srgb_to_linear(saturate(sample_area(slot, uv, fx, fy, (flags & 512) ? max(taps_for(slot, fx, fy), 4) : 4, soft)));
+    return srgb_to_linear(saturate(sample_area(slot, uv, fx, fy, (flags & 512) ? max(taps_for(slot, fx, fy), 4) : 4, soft))) * pixel_brightness;
 }
 
 uint map_slot(float4 m)
@@ -298,6 +313,13 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
         float4 d = load_map(p + int2(0, 1)), u = load_map(p - int2(0, 1));
         float2 dx = map_slot(r) == slot ? r.xy - m.xy : map_slot(l) == slot ? m.xy - l.xy : 0;
         float2 dy = map_slot(d) == slot ? d.xy - m.xy : map_slot(u) == slot ? m.xy - u.xy : 0;
+        pixel_brightness = brightness_ratio(m, slot);
+        // A slot's first brightness becomes its reference (made final by the clear pass, after this frame's composite).
+        if (asfloat(edge_bounds.Load(brightness_base + slot * 4)) <= 0)
+        {
+            uint unused;
+            edge_bounds.InterlockedCompareExchange(brightness_base + 128 + slot * 4, 0, asuint(map_level(m)), unused);
+        }
         x = sample_display(slot, m.xy, dx, dy);
         y = scene.Load(int3(p, 0)).rgb;
         // Parts of the mesh that show one spot of the texture (see one_spot) carry no picture of it: the composite leaves
@@ -429,7 +451,7 @@ void glass_filter(uint3 id : SV_DispatchThreadID)
     // The view moved (the pixel shows another spot of its screen than last frame, by more than a quarter of a render
     // pixel): start over, the average belongs elsewhere now.
     float4 m = load_map(int2(id.xy)), r = load_map(int2(id.xy) + int2(1, 0)), d = load_map(int2(id.xy) + int2(0, 1));
-    float2 gx = r.w == m.w ? r.xy - m.xy : 0, gy = d.w == m.w ? d.xy - m.xy : 0;
+    float2 gx = map_slot(r) == map_slot(m) ? r.xy - m.xy : 0, gy = map_slot(d) == map_slot(m) ? d.xy - m.xy : 0;
     float step = max(length(gx), length(gy));
     // The map is drawn with this frame's camera jitter: the spot at the unjittered pixel position.
     float2 here = saturate(m.xy + jitter.x * gx + jitter.y * gy);
@@ -513,8 +535,9 @@ bool tap(int2 p, out float4 value)
 void continue_from(int2 q, float4 m, float2 location, float limit, out float2 uv, out float2 dx, out float2 dy)
 {
     float4 r = load_map(q + int2(1, 0)), l = load_map(q - int2(1, 0)), down = load_map(q + int2(0, 1)), up = load_map(q - int2(0, 1));
-    float2 to_r = r.w == m.w ? r.xy - m.xy : 1e3, to_l = l.w == m.w ? m.xy - l.xy : 1e3;
-    float2 to_d = down.w == m.w ? down.xy - m.xy : 1e3, to_u = up.w == m.w ? m.xy - up.xy : 1e3;
+    uint s = map_slot(m);
+    float2 to_r = map_slot(r) == s ? r.xy - m.xy : 1e3, to_l = map_slot(l) == s ? m.xy - l.xy : 1e3;
+    float2 to_d = map_slot(down) == s ? down.xy - m.xy : 1e3, to_u = map_slot(up) == s ? m.xy - up.xy : 1e3;
     float2 gx = length(to_r) <= length(to_l) ? to_r : to_l, gy = length(to_d) <= length(to_u) ? to_d : to_u;
     if (length(gx) > limit) gx = 0;
     if (length(gy) > limit) gy = 0;
@@ -687,10 +710,10 @@ void composite(uint3 id : SV_DispatchThreadID)
     float band_share = 0; // share of this pixel on a bezel band (all of it one texture spot): left to the upscaler
     float2 join_uv = 0, join_dx = 0, join_dy = 0; // two screen textures meeting in this pixel: the other one, and its share
     uint join_slot = slot_count;
-    float join_share = 0;
+    float join_share = 0, join_brightness = 1;
     bool filled = false;
     float coverage = 1; // stable screen edges: share of this pixel on the screen
-    bool inside = covered && a.w == b.w && a.w == c.w && a.w == d.w;
+    bool inside = covered && map_slot(a) == map_slot(b) && map_slot(a) == map_slot(c) && map_slot(a) == map_slot(d);
     bool edge_pixel = false;
     if (!inside && (flags & 256))
     {
@@ -720,7 +743,7 @@ void composite(uint3 id : SV_DispatchThreadID)
                 float near_share = near_known && other_known ? 0.5 * (saturate(0.5 + d_near) + saturate(0.5 - d_other))
                                  : near_known ? saturate(0.5 + d_near) : other_known ? saturate(0.5 - d_other) : 0.5;
                 a = taps[k]; coverage = 1; edge_pixel = true;
-                join_slot = map_slot(taps[other]); join_share = 1 - near_share;
+                join_slot = map_slot(taps[other]); join_share = 1 - near_share; join_brightness = brightness_ratio(taps[other], join_slot);
             }
             else
             {
@@ -832,8 +855,9 @@ void composite(uint3 id : SV_DispatchThreadID)
         if (nearest > edge_stretch) return;
         float4 r = load_map(nearest_q + int2(1, 0)), l = load_map(nearest_q - int2(1, 0));
         float4 down = load_map(nearest_q + int2(0, 1)), up = load_map(nearest_q - int2(0, 1));
-        float2 gx = r.w == m.w ? r.xy - m.xy : l.w == m.w ? m.xy - l.xy : 0;
-        float2 gy = down.w == m.w ? down.xy - m.xy : up.w == m.w ? m.xy - up.xy : 0;
+        uint ms = map_slot(m);
+        float2 gx = map_slot(r) == ms ? r.xy - m.xy : map_slot(l) == ms ? m.xy - l.xy : 0;
+        float2 gy = map_slot(down) == ms ? down.xy - m.xy : map_slot(up) == ms ? m.xy - up.xy : 0;
         float2 o = location - float2(nearest_q);
         uv = m.xy + o.x * gx + o.y * gy;
         dx = gx * map_per_output.x;
@@ -842,6 +866,8 @@ void composite(uint3 id : SV_DispatchThreadID)
         filled = true;
     }
     uint slot = map_slot(a);
+    pixel_brightness = inside ? lerp(lerp(brightness_ratio(a, slot), brightness_ratio(b, slot), f.x), lerp(brightness_ratio(c, slot), brightness_ratio(d, slot), f.x), f.y)
+                              : brightness_ratio(a, slot);
 
     // Edge fade: the display's edge in the map moves with the camera jitter every frame, and a hard cut there crawls
     // (and shows thin lines some aircraft have at the edge of their screen picture sharper than the sim does). Fade
@@ -856,7 +882,7 @@ void composite(uint3 id : SV_DispatchThreadID)
         {
             int2 q = cell + int2(t % 6 - 2, t / 6 - 2);
             float2 dist = abs(float2(q) - location);
-            if (load_map(q).w == a.w) inside += max(3 - dist.x, 0) * max(3 - dist.y, 0);
+            if (map_slot(load_map(q)) == slot) inside += max(3 - dist.x, 0) * max(3 - dist.y, 0);
         }
         float inside_pixels = saturate((inside / 81 - 2.0 / 3) * 3) * 2;
         // Wider fades: the tent only measures up to 2 render pixels; further in, look for the edge along 8 directions.
@@ -938,7 +964,10 @@ void composite(uint3 id : SV_DispatchThreadID)
     if (join_share > 0)
     {
         float4 join_gain = params[join_slot * 3];
+        float own_brightness = pixel_brightness;
+        pixel_brightness = join_brightness;
         if (join_gain.w > 0) content = lerp(content, sample_lines(join_slot, join_uv, join_dx, join_dy) * join_gain.rgb, join_share);
+        pixel_brightness = own_brightness;
     }
 
     // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder around this pixel: its soft average and
@@ -1041,4 +1070,7 @@ void clear(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID)
     }
     if (all(id.xy < map_size) && all(group.xy < (map_size + 7) / 8) && tiles[group.xy]) map_rw[uint3(id.xy, layer)] = 0;
     if (all(id.xy == 0)) edge_bounds.Store(diag_base + ((diag_index + 1) & 63) * 4, 0);
+    // Brightness references: a slot's first proposed one becomes final now (this frame's fit and composite used none).
+    if (id.y == 0 && id.x < slot_count && edge_bounds.Load(brightness_base + id.x * 4) == 0)
+        edge_bounds.Store(brightness_base + id.x * 4, edge_bounds.Load(brightness_base + 128 + id.x * 4));
 }
