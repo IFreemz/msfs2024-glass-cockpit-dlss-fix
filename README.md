@@ -13,7 +13,8 @@ It works with every aircraft that uses the simulator's cockpit display shaders, 
 cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headsets and GPUs.
 
 > Unofficial community mod. Not affiliated with Microsoft, Asobo, NVIDIA, AMD or any aircraft developer.
-> Please report problems (see [Troubleshooting](#troubleshooting)).
+> Please report problems (see [Troubleshooting](#troubleshooting)). After 1.0.0, updates will be small hotfixes only
+> for a while.
 
 **About this project:** Glass Cockpit DLSS Fix is developed by IFreemz. It was first released here on 11 October 2026
 (v0.6.0), and every version since has been published from this repository. Official downloads: the
@@ -25,6 +26,7 @@ the official add-on). Other packages, rebuilds or pages are unofficial; for thos
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Settings](#settings)
+- [Before you report a problem: what to try](#before-you-report-a-problem-what-to-try)
 - [Compatibility](#compatibility)
 - [Troubleshooting](#troubleshooting)
 - [How the fix works](#how-the-fix-works)
@@ -81,29 +83,114 @@ puts them back):
 | Flip jitter direction | Only needed if the screen text shimmers when the camera is still |
 | Glass layer (0-100 %, default 100 %) | How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens. Lower values can help if quickly changing numbers leave a milky trail |
 
-Under **Troubleshooting → Experimental fixes** (collapsed, **all off by default except UV seam fix, Full-size sampling
-and Stable screen edges**; for problems that only some aircraft have, "Reset experimental fixes" puts them all back to
+Under **Troubleshooting → Experimental fixes** (collapsed, **all off by default except UV seam fix, Full-size sampling,
+Stable screen edges and Occlusion check**; for problems that only some aircraft have, "Reset experimental fixes" puts them all back to
 default):
 
 | Setting | What it does |
 |---|---|
 | Full-size sampling (on) | Reads the screens only from their full-size picture, with more samples where a screen is small on your monitor. Off: also from the smaller copies the GPU keeps for distant screens, which can shimmer when you zoom out |
 | Stable screen edges (on) | Keeps the pixels along each screen's edge from shimmering: where a screen ends is learnt over a few frames instead of judged anew every frame. Untick it if a screen's edge looks cut off or too wide |
+| Occlusion check (on) | Leaves the sim's own picture wherever something sits in front of a screen (a sidestick, a hand, the yoke), using the sim's depth buffer. Off: a screen can be drawn over things in front of it, e.g. the A380 EFB over the sidestick |
 | Calm glass at symbols (off) | Right next to symbols and digits, draws the glass effects (dirt, glare, reflections) without their finest detail, which can shimmer there. On some screens it can add shimmer instead, so it's off by default |
-| Occlusion check (off) | Leaves the sim's own picture wherever something sits in front of a screen (a sidestick, a hand, the yoke), using the sim's depth buffer. Off: a screen can be drawn over things in front of it, e.g. the A380 EFB over the sidestick |
-| Dark screen fix (off) | Keeps very dark screens fixed in strong sunlight (e.g. the F/A-18E Super Hornet). Off by default since 0.8.3, because it made some other screens drop out of the fix (e.g. the iFly EFB) |
+| Dark screen fix (off) | Keeps very dark screens fixed in strong sunlight (e.g. the F/A-18E Super Hornet). Off by default since 0.8.3, because it can also let the fix draw over a screen whose picture it can't redraw |
 | UV seam fix (on) | Removes thin dashed lines where a screen's picture meets a part of the same screen that uses another area of its image (FSS E-Jets: the line between the picture and its bezel band), and keeps those edges smooth on low DLSS modes. If a screen edge looks worse with it on, untick it and please report the aircraft |
-| Soft-edged line smoothing (off) | Line smoothing weighted towards each pixel's centre over a wider area: smoother screens with less shimmer while the view moves. A matter of taste; needs Line smoothing above 0 |
-| Temporal anti-aliasing (off) | Smooths screen text and lines over several frames, like the sim's own TAA, without the trails (the history is dropped wherever a screen's picture changes). Try it with Line smoothing at 0-20. Uses about 100 MB more video memory at 4K |
+| Soft-edged line smoothing (off) | Line smoothing weighted towards each pixel's centre over a wider area: smoother screens with less shimmer while the view moves. Plain Line smoothing works well on most aircraft; this is an alternative if screens still shimmer while you move your head. A matter of taste; needs Line smoothing above 0 |
+| Temporal anti-aliasing (off) | Smooths screen text and lines over several frames, like the sim's own TAA, without the trails (the history is dropped wherever a screen's picture changes). Plain Line smoothing works well on most aircraft; this is an alternative if you want sharper text that still doesn't stair-step, with Line smoothing at 0-20. Uses about 100 MB more video memory at 4K |
+| Edge trim (0-400) | The reverse of the edge stretcher: leaves the outer edge of every screen to the sim's own picture, in hundredths of a render pixel. For screens whose edge shows a sliver of something that isn't there, or jagged or flickering edges: **50 calms most flickering or shimmering screen edges**, up to 150 for aircraft with stronger edge problems. Within that band the upscaler's trails come back |
 | Detail clamp (0-100 %) | Keeps the fixed screens within the brightness the sim itself draws around each pixel. Hides texture detail too thin for the sim to show. **Can make screens flicker**, the more the lower the DLSS render resolution: almost none with DLAA and Quality, more with Balanced and Performance. Lower it if that bothers you, or if small text looks duller than with the fix off |
 | Edge fade (0-250) | Fades screen edges into the sim's own picture, in hundredths of a render pixel (100 = 1 pixel). Can calm jaggy or crawling screen edges. Above about 200 it can flicker |
 | Angle softening (0-100 %) | Draws screens seen at a steep angle softer, like the sim does. Screens seen straight on are unchanged |
 | Edge stretcher (0-400) | Extends screens outwards over their frame, in hundredths of a render pixel, continuing their picture. For screens that don't quite reach their frame |
-| Edge trim (0-400) | The reverse of the edge stretcher: leaves the outer edge of every screen to the sim's own picture, in hundredths of a render pixel. For screens whose edge shows a sliver of something that isn't there, or jagged edges (e.g. 150-350 calms the A380 pedestal screens). Within that band the upscaler's trails come back |
 
 The tab shows "Experimental fixes changed" while any of them is on.
 
 ReShade presets and effects keep working as usual on top of the fix.
+
+## Before you report a problem: what to try
+
+Most visual problems on a particular aircraft can be fixed with a setting. Please try the ones below before opening an
+issue: it's quicker for you, and if none of them helps, your report tells me exactly what was already ruled out.
+
+### How to try a setting
+
+1. In the cockpit, open the ReShade menu (**Home** key) and go to the **Glass Cockpit DLSS Fix** tab.
+2. Open **Troubleshooting → Experimental fixes** (or **Advanced**). Hover over any option to see what it does.
+3. Change one thing at a time and look at the problem screen for a few seconds. Changes take effect immediately and
+   are remembered between sessions.
+4. To compare with stock DLSS/FSR, toggle the whole fix with **Ctrl+Shift+F9**. **Ctrl+Shift+F11** tints every screen
+   the fix covers green, so you can see which screens it handles.
+5. Made it worse? **Reset experimental fixes** (or **Reset to defaults** under Advanced) puts everything back.
+
+The tab shows "Experimental fixes changed" while any of them differs from the default, so you can always see that
+something was changed.
+
+### Which setting for which problem
+
+| What you see | Try first | Then |
+|---|---|---|
+| Screen edges flicker, shimmer or crawl, especially while moving | **Edge trim** 50 | Edge trim up to 150; Edge fade 100 |
+| A sliver of something that isn't there along a screen's edge, or the edge looks cut off or too wide | **Edge trim** 50 | Untick Stable screen edges |
+| A thin dashed or light line where a screen's picture meets its frame | Keep **UV seam fix** ticked | Detail clamp 100 |
+| A screen doesn't quite reach its frame (a gap at the edge) | **Edge stretcher** 100 | Up to 300 |
+| A screen is drawn over something in front of it (sidestick, hand, yoke) | Keep **Occlusion check** ticked | Report it with a capture |
+| Small screens shimmer when you zoom out or lean back | Keep **Full-size sampling** ticked | Line smoothing 40-50 |
+| Digits or symbols shimmer or sparkle, mostly in sun glare | **Calm glass at symbols** | Glass layer 50-70 % |
+| Quickly changing numbers leave a milky trail | **Glass layer** 50-70 % | Calm glass at symbols |
+| Text and lines look too jagged | **Line smoothing** 40-50 | Soft-edged line smoothing, or Temporal anti-aliasing with Line smoothing 0-20 |
+| Text and lines look too soft or blurry | **Line smoothing** 15-25 | Untick Soft-edged line smoothing and Temporal anti-aliasing |
+| A very dark screen drops out of the fix (green tint goes away) in strong sun | **Dark screen fix** | |
+| Screens seen from a steep angle look sharper than the rest of the cockpit | **Angle softening** 50 | |
+| Screen text shimmers even when the camera is completely still | **Flip jitter direction** (Advanced) | |
+
+If a screen is never fixed at all (no green tint), settings won't help: see [What to send with a bug report](#what-to-send-with-a-bug-report).
+
+### The options in detail
+
+**Edge trim** (0-400, off by default). Leaves a thin band at the outer edge of every screen to the sim's own picture.
+The fix redraws each screen exactly up to where it ends; on some aircraft that edge moves a little with the camera
+jitter every frame and flickers, or shows a sliver of the frame next to it. Edge trim hands that band back to DLSS/FSR,
+which draws it smoothly. **50 calms most flickering or shimmering edges**; go up to 150 for aircraft with stronger
+edge problems. The values are hundredths of a render pixel (100 = one pixel at the sim's internal resolution). Side
+effect: within that band, DLSS/FSR's trails come back, so keep it as low as works.
+
+**Stable screen edges** (on by default). Learns over a few frames where each screen ends, instead of judging it anew
+every frame, so the pixels along the edges don't shimmer. Untick it if a screen's edge looks cut off or a little too
+wide.
+
+**Occlusion check** (on by default). Uses the sim's depth buffer to find anything sitting in front of a screen (a
+sidestick, a yoke, your hands in VR, an EFB arm) and leaves those pixels to the sim's own picture, so the fix never
+draws a screen over them. If something in front of a screen still gets painted over, please report it with a capture.
+
+**Full-size sampling** (on by default, Ctrl+Shift+F7 to toggle). Reads the screen pictures only at full size, with
+more samples where a screen is small on your monitor. Off, the fix also uses the smaller copies the GPU keeps for
+distant screens, like the sim does, which can shimmer when you zoom out or lean back.
+
+**Calm glass at symbols** (off by default). Right next to digits, symbols and lines, the glass effects (dirt, glare,
+reflections) are drawn without their finest detail. That detail comes from the upscaler's picture and can shimmer
+along the edges of symbols, especially in sun glare. Try it if digits sparkle or shimmer while the rest of the screen
+is fine. Side effect: on some screens it can add shimmer instead, and something drawn over a screen (a highlight, a
+cursor) can look a little softer; untick it again if so.
+
+Plain **Line smoothing** (on the main tab) works well on most aircraft. The next two options are alternatives that
+solve slightly different problems; try them only if Line smoothing alone doesn't look right to you.
+
+**Soft-edged line smoothing** (off by default). A different flavour of Line smoothing: weighted towards each pixel's
+centre over a wider area. Try it if screens still shimmer while you move your head. Screens look smoother with less
+shimmer while the view moves, at the cost of slightly softer text. A matter of taste; it needs Line smoothing above 0.
+
+**Temporal anti-aliasing** (off by default). Smooths screen text and lines over several frames, like the sim's own TAA,
+but without the trails: the history is thrown away wherever a screen's picture changes. Try it with Line smoothing at
+0-20 if you want the sharpest text that still doesn't stair-step. Uses about 100 MB more video memory at 4K. It and
+Soft-edged line smoothing are alternatives: ticking one unticks the other.
+
+**Glass layer** (Advanced, 0-100 %, default 100 %). How much of the sim's glass effects (dirt, glare, reflections,
+shadows) is kept on fixed screens. 100 % looks the most like the sim; lower values give cleaner, flatter screens and
+can help if quickly changing numbers leave a milky trail or digits shimmer in the sun. At 0 % the screens are drawn
+with no glass effects at all.
+
+The older options (UV seam fix, Dark screen fix, Detail clamp, Edge fade, Angle softening, Edge stretcher, Flip jitter
+direction) are described in the [Settings](#settings) tables above.
 
 ## Compatibility
 
@@ -117,7 +204,7 @@ ReShade presets and effects keep working as usual on top of the fix.
 | iniBuilds A330 | Tested |
 | iniBuilds A340 | Tested (0.7.2 or newer; in VR 0.7.3 or newer) |
 | iniBuilds A350 | Tested |
-| iniBuilds A380 | Tested (1.0.0 or newer: the EFB stays fixed when only part of it is in view; tick Occlusion check if a screen is drawn over the sidestick) |
+| iniBuilds A380 | Tested (1.0.0 or newer: the EFB stays fixed when only part of it is in view, and screens are no longer drawn over the sidestick) |
 | PMDG 737 | Tested by the community (also in VR) |
 | PMDG 777 | Tested by the community (also in VR) |
 | FlightFX C750 | Tested by the community (0.7.6 or newer) |
@@ -171,7 +258,8 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
 - **Standalone DLSS Glass Cockpit Refresh** ([wesimglide.org](https://wesimglide.org/otherdata/tools/Standalone-DLSS-Glass-Cockpit-Refresh.html)):
   a third-party package of this add-on with ReShade built in, by WeSimGlide. For problems with it, follow the support
   steps on its page. Don't use it together with this add-on (the fix would run twice).
-- **OptiShade:** the OptiShade developer is building this fix into OptiShade.
+- **OptiShade** (<OPTISHADE LINK>): bundles this add-on (an OptiShade update with 1.0.0 is coming soon). Use one or
+  the other, not both: with OptiShade, don't also install the `.addon64` from here.
 - **Multi Frame Generation unlocks for RTX 40:**
   - **RenoDX MFG unlock add-on:** tested, works together with this fix.
   - **[RTX40MFG-Unlock](https://github.com/dashdogy/RTX40MFG-Unlock) by dashdogy:** tested with v1.4.2 (installed as
@@ -193,6 +281,9 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
 Open the ReShade menu (**Home**) and the **Glass Cockpit DLSS Fix** tab first. It shows what works and what doesn't
 (GPU, upscaler running, cockpit shader found, screens recorded, fix drawn) and explains any problem in plain words.
 It has an **Open log folder** button and a **Copy report** button for bug reports.
+
+For something you can *see* on fixed screens (flickering edges, shimmer, lines, blur, things drawn over), first try
+the settings in [Before you report a problem: what to try](#before-you-report-a-problem-what-to-try).
 
 ### What to send with a bug report
 
@@ -236,9 +327,10 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Screen lines look jagged / too soft | Adjust Line smoothing |
 | Dashed light line along the edge of a screen's picture (e.g. FSS E-Jets) | Update to 0.8.3 or newer and keep **UV seam fix** ticked under Troubleshooting → Experimental fixes. If a line remains, try **Detail clamp** (can add some flicker on DLSS Balanced/Performance) |
 | Dark screens drop out of the fix (green tint goes away) in strong sun | Tick **Dark screen fix** under Troubleshooting → Experimental fixes |
+| Fixed screens shimmer with Frame Generation on (steady with it off) | Update to 1.0.0 or newer |
 | Screens change colour for a moment while the camera or aircraft moves (most often with Frame Generation) | Update to 0.8.3 or newer (1.0.0 or newer in VR) |
-| A screen is drawn over something in front of it (a sidestick, a hand, the yoke) | Tick **Occlusion check** under Troubleshooting → Experimental fixes |
-| A sliver of something that isn't there, or a jagged band, along a screen's edge | Try **Edge trim** (e.g. 150) under Troubleshooting → Experimental fixes |
+| A screen is drawn over something in front of it (a sidestick, a hand, the yoke) | Make sure **Occlusion check** is ticked under Troubleshooting → Experimental fixes (on by default) |
+| Screen edges flicker or shimmer, or show a sliver of something that isn't there | Set **Edge trim** to 50 under Troubleshooting → Experimental fixes (up to 150 for aircraft with stronger edge problems) |
 | No log after flying a Fenix aircraft, or the log is called `glass-cockpit-dlss-fix-<number>.log` | Fixed in 1.0.0: a helper program the sim starts with some aircraft (e.g. Fenix) kept the log file open after the sim quit, so the next session couldn't write one. 1.0.0 logs under a numbered name when that happens; send that file |
 | Screen text shimmers when the camera is still | Tick **Flip jitter direction** in the Advanced section under Troubleshooting. If it's already ticked (the tab says "Advanced settings changed"), click **Reset to defaults** |
 | Screens flicker in brightness (G-Sync / FreeSync monitor) | VRR flicker from a changing frame rate, most visible on dark screens. Turn on V-Sync, or cap the frame rate a few fps below your refresh rate |
@@ -274,8 +366,8 @@ no measurable FPS difference with the fix on or off in testing.
 - A screen whose picture the add-on can't redraw is left to DLSS/FSR, so it looks like stock.
 - A thin band at each screen's edge (about one render pixel) still comes from the upscaler (Edge fade and Edge
   stretcher under Experimental fixes can help on some aircraft).
-- Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) is covered by it, unless
-  **Occlusion check** is ticked (Experimental fixes).
+- Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) is left to the upscaler by
+  the Occlusion check (on by default); with it off, the screen is drawn over it.
 - Sim updates that change the cockpit display shader stop the fix (the sim then just looks like stock DLSS/FSR)
   until the add-on is updated.
 
@@ -291,7 +383,7 @@ Versions up to 0.8.3 remain MIT. Third-party components are listed in [THIRD_PAR
 ## Official downloads and redistribution
 
 The only official downloads are the [GitHub releases](https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix/releases)
-(each release lists the SHA-256 checksum of the add-on file). OptiShade bundles the official add-on with permission.
+(each release lists the SHA-256 checksum of the add-on file). OptiShade bundles the official add-on with explicit permission (see [NOTICE.md](NOTICE.md)).
 
 You may redistribute and modify the add-on under the GPL-3 terms. In short, for builds that contain 1.0.0 or later code:
 
@@ -306,3 +398,6 @@ program's interface, link to the official releases, and let me know about your b
 right place for support.
 
 If an antivirus flags a download, check that it came from the official releases and that its SHA-256 matches.
+
+**Using AI agents or other automated tools to build on this project** (a wrapper, an installer, a bundle): see
+[AGENTS.md](AGENTS.md) for the licence terms in short.

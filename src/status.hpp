@@ -15,7 +15,7 @@ struct Experimental {
     int full_size = 1; // full-size sampling on/off (on by default; off = the game's mip levels)
     int calm_glass = 0; // calm glass at symbols on/off (off by default; no glass detail from the upscaler next to symbols)
     int edge_trim = 0; // hundredths of a render pixel of each screen's edge left to the upscaler (the reverse of edge_stretch)
-    int occlusion_check = 0; // occlusion check on/off (screen pixels with something in front of them left to the upscaler)
+    int occlusion_check = 1; // occlusion check on/off (on by default; screen pixels with something in front of them left to the upscaler)
     bool operator==(const Experimental&) const = default;
 };
 

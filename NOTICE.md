@@ -26,6 +26,19 @@ warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Gen
    to name, promote or endorse modified versions, except to state truthfully where the work comes from (for example
    "based on Glass Cockpit DLSS Fix by IFreemz").
 
+## Additional permission: OptiShade (GPL-3.0 section 7)
+
+As the copyright holder, IFreemz gives Gravy, the developer of OptiShade, and OptiShade itself explicit permission
+to download, bundle and redistribute the official, unmodified release builds of Glass Cockpit DLSS Fix (all versions,
+including 1.0.0 and later) together with OptiShade, including installing and updating them automatically for
+OptiShade's users. This applies whatever licence OptiShade itself uses; bundling the add-on does not place OptiShade
+under the GPL, and OptiShade does not have to provide the add-on's source code itself, since it is public at the link
+above. The only conditions are that the builds stay unmodified and that OptiShade keeps the attribution "Glass Cockpit
+DLSS Fix by IFreemz" with the link above visible to its users (for example on its add-on list or About page).
+
+This permission covers only the official, unmodified release builds. Anything that modifies the add-on or reuses its
+code falls under the GPL-3.0 and the additional terms above as usual.
+
 ## Licence history
 
 Versions up to and including 0.8.3 were released under the MIT licence and remain available under it. Versions

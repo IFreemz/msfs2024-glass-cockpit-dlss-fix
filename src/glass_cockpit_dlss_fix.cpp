@@ -114,7 +114,7 @@ std::atomic<int> stable_edges{1};
 std::atomic<int> calm_glass{0};
 // Occlusion check (experimental, on/off): screen pixels where the sim's depth buffer shows something closer to the camera
 // than the screen (a sidestick, a hand, the yoke drawn after the screen) are left to the upscaler.
-std::atomic<int> occlusion_check{0};
+std::atomic<int> occlusion_check{1};
 // Depth direction of the cockpit display pipelines' depth test: 0 unknown, 1 reversed (closer = larger), 2 standard.
 std::atomic<int> depth_direction{0};
 std::atomic<uint32_t> bounds_reset{0}; // slots whose learnt edges must be forgotten (the slot took another texture)
@@ -2916,7 +2916,7 @@ void load_settings() {
     stable_edges = GetPrivateProfileIntW(L"experimental", L"stable_edges", 1, settings_path().c_str()) != 0;
     mip0_only = GetPrivateProfileIntW(L"experimental", L"full_size_sampling", 1, settings_path().c_str()) != 0;
     calm_glass = GetPrivateProfileIntW(L"experimental", L"calm_glass", 0, settings_path().c_str()) != 0;
-    occlusion_check = GetPrivateProfileIntW(L"experimental", L"occlusion_check", 0, settings_path().c_str()) != 0;
+    occlusion_check = GetPrivateProfileIntW(L"experimental", L"occlusion_check", 1, settings_path().c_str()) != 0;
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;

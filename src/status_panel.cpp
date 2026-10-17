@@ -139,33 +139,40 @@ void draw(reshade::api::effect_runtime*) {
         ImGui::SetItemTooltip("Keeps the pixels along each screen's edge from shimmering: where a screen ends is learnt over a few frames\n"
             "instead of judged anew every frame. Turn off if a screen's edge looks cut off or too wide.");
         e.stable_edges = stable ? 1 : 0;
+        bool occlusion = e.occlusion_check != 0;
+        changed |= ImGui::Checkbox("Occlusion check (on by default)", &occlusion);
+        ImGui::SetItemTooltip("Leaves the sim's own picture wherever something sits in front of a screen (a sidestick, a hand, the yoke),\n"
+            "using the sim's depth buffer. Off: a screen can be drawn over things in front of it, e.g. the A380 EFB over the sidestick.");
+        e.occlusion_check = occlusion ? 1 : 0;
         bool calm_glass = e.calm_glass != 0;
         changed |= ImGui::Checkbox("Calm glass at symbols", &calm_glass);
         ImGui::SetItemTooltip("Right next to symbols and lines, the glass effects (dirt, glare, reflections) are drawn without their finest\n"
             "detail, which flickers there (e.g. along the E-Jet's altitude and vertical speed tapes). Away from symbols nothing changes.\n"
             "Turn off if something drawn over a screen (a highlight, a cursor) looks blurred.");
         e.calm_glass = calm_glass ? 1 : 0;
-        bool occlusion = e.occlusion_check != 0;
-        changed |= ImGui::Checkbox("Occlusion check (test)", &occlusion);
-        ImGui::SetItemTooltip("Leaves the sim's own picture wherever something sits in front of a screen (a sidestick, a hand, the yoke),\n"
-            "using the sim's depth buffer. Off: a screen can be drawn over things in front of it, e.g. the A380 EFB over the sidestick.");
-        e.occlusion_check = occlusion ? 1 : 0;
         bool dark = e.dark_screens != 0;
         changed |= ImGui::Checkbox("Dark screen fix", &dark);
         ImGui::SetItemTooltip("Keeps mostly black screens with thin symbols (e.g. the F/A-18E's) fixed in strong sun glare.\n"
-            "Can also let the fix draw over a screen it shouldn't, e.g. the iFly 737 EFB.");
+            "Can also let the fix draw over a screen whose picture it can't redraw.");
         e.dark_screens = dark ? 1 : 0;
         // One or the other: ticking one unticks the other.
         bool soft = e.soft_smoothing != 0, temporal = e.temporal_aa != 0;
         if (ImGui::Checkbox("Soft-edged line smoothing", &soft)) { changed = true; if (soft) temporal = false; }
         ImGui::SetItemTooltip("Line smoothing weighted towards each pixel's centre over a wider area: smoother screens with less shimmer\n"
-            "while the view moves. A matter of taste. Needs Line smoothing above 0.");
-        if (ImGui::Checkbox("Temporal anti-aliasing (test)", &temporal)) { changed = true; if (temporal) soft = false; }
+            "while the view moves. Plain Line smoothing works well on most aircraft; try this if screens still shimmer\n"
+            "while you move your head. A matter of taste. Needs Line smoothing above 0.");
+        if (ImGui::Checkbox("Temporal anti-aliasing", &temporal)) { changed = true; if (temporal) soft = false; }
         ImGui::SetItemTooltip("Smooths screen text and lines over several frames, like the sim's own TAA, without the trails:\n"
-            "the history is dropped wherever a screen's picture changes. Try it with Line smoothing at 0-20.\n"
+            "the history is dropped wherever a screen's picture changes. Plain Line smoothing works well on most aircraft;\n"
+            "try this if you want sharper text that still doesn't stair-step, with Line smoothing at 0-20.\n"
             "Uses some extra video memory (about 100 MB at 4K).");
         e.soft_smoothing = soft ? 1 : 0;
         e.temporal_aa = temporal ? 1 : 0;
+        changed |= ImGui::SliderInt("Edge trim", &e.edge_trim, 0, 400, e.edge_trim ? "%d" : "off", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::SetItemTooltip("Leaves the outer edge of every screen to the sim's own picture, in hundredths of a render pixel\n"
+            "(100 = 1 pixel). The reverse of the edge stretcher: for screens whose fixed edge shows a sliver of something\n"
+            "that isn't there, or jagged edges. 50 calms most flickering or shimmering screen edges; up to 150 for aircraft\n"
+            "with stronger edge problems. Within that band the upscaler's trails come back.");
         changed |= ImGui::SliderInt("Detail clamp", &e.detail_clamp, 0, 100, e.detail_clamp ? "%d%%" : "off", ImGuiSliderFlags_AlwaysClamp);
         ImGui::SetItemTooltip("Keeps the fixed screens within the brightness the sim itself draws around each pixel.\n"
             "Hides texture detail too thin for the sim to show, e.g. a dashed line where a screen's picture meets its bezel.\n"
@@ -178,10 +185,6 @@ void draw(reshade::api::effect_runtime*) {
         changed |= ImGui::SliderInt("Edge stretcher", &e.edge_stretch, 0, 400, e.edge_stretch ? "%d" : "off", ImGuiSliderFlags_AlwaysClamp);
         ImGui::SetItemTooltip("Extends screens outwards over their frame, in hundredths of a render pixel (100 = 1 pixel),\n"
             "continuing their picture. For screens that don't quite reach their frame.");
-        changed |= ImGui::SliderInt("Edge trim", &e.edge_trim, 0, 400, e.edge_trim ? "%d" : "off", ImGuiSliderFlags_AlwaysClamp);
-        ImGui::SetItemTooltip("Leaves the outer edge of every screen to the sim's own picture, in hundredths of a render pixel\n"
-            "(100 = 1 pixel). The reverse of the edge stretcher: for screens whose fixed edge shows a sliver of something\n"
-            "that isn't there, or jagged edges. Within that band the upscaler's trails come back.");
         if (ImGui::Button("Reset experimental fixes")) { e = {}; changed = true; }
         if (changed) glass::set_experimental(e);
         ImGui::TreePop();
