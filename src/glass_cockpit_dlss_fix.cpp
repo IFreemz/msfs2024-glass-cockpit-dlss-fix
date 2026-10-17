@@ -881,6 +881,27 @@ void on_init_pipeline(api::device*, api::pipeline_layout, uint32_t count, const 
         std::unique_lock lock(hashes_mutex);
         if (pipeline_hashes.size() < 65536) pipeline_hashes[pipeline.handle] = {vs, ps};
     }
+    // Diagnostics (iFly): the shaders that draw on top of the cockpit displays after the screen draw (the window
+    // cover meshes the pixel probe finds over the MCP, radios, CDUs and EFB) are saved once for inspection.
+    static constexpr uint64_t dump_list[] = {0x6b0660bbcb426bd9, 0xfb8e33990f71004d, 0x7bbb1bf736faf5a9, 0xd11731990aa5c2df,
+        0x8abf4fb02e418213, 0x8ec2cf8028c57b19, 0x0fa5d2bc549a53d1};
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& o = subobjects[i];
+        if (!o.data || !o.count || (o.type != api::pipeline_subobject_type::vertex_shader && o.type != api::pipeline_subobject_type::pixel_shader)) continue;
+        const auto& shader = *static_cast<const api::shader_desc*>(o.data);
+        const uint64_t hash = o.type == api::pipeline_subobject_type::vertex_shader ? vs : ps;
+        if (!shader.code || std::find(std::begin(dump_list), std::end(dump_list), hash) == std::end(dump_list)) continue;
+        static std::mutex dumped_mutex;
+        static std::set<uint64_t> dumped;
+        { std::lock_guard lock(dumped_mutex); if (!dumped.insert(hash).second) continue; }
+        std::error_code error;
+        const auto directory = addon_directory / L"glass-cockpit-shader-dumps";
+        std::filesystem::create_directories(directory, error);
+        char name[64]{};
+        snprintf(name, sizeof(name), "%s_%016llx.dxil", o.type == api::pipeline_subobject_type::vertex_shader ? "vs" : "ps", hash);
+        std::ofstream(directory / name, std::ios::binary).write(static_cast<const char*>(shader.code), std::streamsize(shader.code_size));
+        log("shader_dump %s pso=%p (saved for inspection)", name, reinterpret_cast<void*>(pipeline.handle));
+    }
     if (ps != display_ps || find_pipeline(pipeline.handle)) return;
     static std::atomic<int> logged{0};
     if (logged++ >= 16) return;
@@ -953,7 +974,7 @@ void on_init_view(api::device* device, api::resource resource, api::resource_usa
         Signature d{};
         if (read_bytes(reinterpret_cast<const void*>(view.handle), d.bytes.data(), descriptor_size)) {
             std::lock_guard lock(diag_mutex);
-            if (diag_views.size() >= 65536) diag_views.clear();
+            if (diag_views.size() >= 262144) diag_views.clear();
             diag_views[d] = {uint32_t(r.texture.width), r.texture.height, uint32_t(r.texture.format), uint32_t(r.usage),
                 uint16_t(r.texture.depth_or_layers), uint16_t(r.texture.samples), uint16_t(r.texture.levels)};
         }
@@ -1393,7 +1414,12 @@ void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& d
                 ViewInfo info{};
                 bool described = false;
                 { std::lock_guard lock(diag_mutex); if (const auto d = diag_views.find(sig); d != diag_views.end()) { info = d->second; described = true; } }
-                if (!described) continue;
+                if (!described) {
+                    // Bound, but its view is unknown (made before the add-on loaded, or forgotten).
+                    snprintf(item, sizeof(item), " t%u=?", r.reg + k);
+                    p.textures += item;
+                    continue;
+                }
                 snprintf(item, sizeof(item), " t%u=other(%ux%u mips=%u fmt=%u usage=0x%x)", r.reg + k, info.width, info.height, unsigned(info.levels), info.format, info.usage);
                 p.textures += item;
                 continue;
