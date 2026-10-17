@@ -912,27 +912,6 @@ void on_init_pipeline(api::device*, api::pipeline_layout, uint32_t count, const 
         std::unique_lock lock(hashes_mutex);
         if (pipeline_hashes.size() < 65536) pipeline_hashes[pipeline.handle] = {vs, ps};
     }
-    // Diagnostics (iFly): the shaders that draw on top of the cockpit displays after the screen draw (the window
-    // cover meshes the pixel probe finds over the MCP, radios, CDUs and EFB) are saved once for inspection.
-    static constexpr uint64_t dump_list[] = {0x6b0660bbcb426bd9, 0xfb8e33990f71004d, 0x7bbb1bf736faf5a9, 0xd11731990aa5c2df,
-        0x8abf4fb02e418213, 0x8ec2cf8028c57b19, 0x0fa5d2bc549a53d1};
-    for (uint32_t i = 0; i < count; ++i) {
-        const auto& o = subobjects[i];
-        if (!o.data || !o.count || (o.type != api::pipeline_subobject_type::vertex_shader && o.type != api::pipeline_subobject_type::pixel_shader)) continue;
-        const auto& shader = *static_cast<const api::shader_desc*>(o.data);
-        const uint64_t hash = o.type == api::pipeline_subobject_type::vertex_shader ? vs : ps;
-        if (!shader.code || std::find(std::begin(dump_list), std::end(dump_list), hash) == std::end(dump_list)) continue;
-        static std::mutex dumped_mutex;
-        static std::set<uint64_t> dumped;
-        { std::lock_guard lock(dumped_mutex); if (!dumped.insert(hash).second) continue; }
-        std::error_code error;
-        const auto directory = addon_directory / L"glass-cockpit-shader-dumps";
-        std::filesystem::create_directories(directory, error);
-        char name[64]{};
-        snprintf(name, sizeof(name), "%s_%016llx.dxil", o.type == api::pipeline_subobject_type::vertex_shader ? "vs" : "ps", hash);
-        std::ofstream(directory / name, std::ios::binary).write(static_cast<const char*>(shader.code), std::streamsize(shader.code_size));
-        log("shader_dump %s pso=%p (saved for inspection)", name, reinterpret_cast<void*>(pipeline.handle));
-    }
     if (ps != display_ps || find_pipeline(pipeline.handle)) return;
     static std::atomic<int> logged{0};
     if (logged++ >= 16) return;

@@ -199,6 +199,10 @@ void draw(reshade::api::effect_runtime*) {
         if (ImGui::Button("Reset to defaults")) { glass::set_jitter_positive(true); glass::set_glass_strength(100); }
         ImGui::TreePop();
     }
+    // About (GPL-3.0 section 7(b) notice, see NOTICE.md).
+    ImGui::Separator();
+    ImGui::TextColored(grey, "%s %s by %s - GPL-3.0 (see NOTICE.md) - github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix", GLASS_NAME, GLASS_VERSION_STRING, GLASS_AUTHOR);
+    ImGui::TextColored(grey, "Official downloads: GitHub releases only.");
 }
 }
 
