@@ -759,6 +759,7 @@ struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
     bool in_pass = false;
     uint32_t generation = 0;
     D3D12_RECT scissor{}; // the game's first scissor rectangle (pixel probe restores it)
+    uint64_t pass_rt0 = 0; UINT pass_targets = 0; // inside a render pass: its first render target (pixel probe)
     bool scissor_known = false;
 };
 
@@ -1083,15 +1084,15 @@ void on_bind_scissors(api::command_list* list, uint32_t first, uint32_t count, c
     if (!enabled.load(std::memory_order_relaxed) || first != 0 || !count || !rects) return;
     if (auto state = list->get_private_data<ListState>()) { state->scissor = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom}; state->scissor_known = true; }
 }
-void on_begin_pass(api::command_list* list, uint32_t, const api::render_pass_render_target_desc*, const api::render_pass_depth_stencil_desc*) {
+void on_begin_pass(api::command_list* list, uint32_t count, const api::render_pass_render_target_desc* rts, const api::render_pass_depth_stencil_desc*) {
     CpuScope scope(cpu_passes);
     if (!enabled.load(std::memory_order_relaxed)) return;
-    if (auto state = list->get_private_data<ListState>()) state->in_pass = true;
+    if (auto state = list->get_private_data<ListState>()) { state->in_pass = true; state->pass_targets = count; state->pass_rt0 = count && rts ? rts[0].view.handle : 0; }
 }
 void on_end_pass(api::command_list* list) {
     CpuScope scope(cpu_passes);
     if (!enabled.load(std::memory_order_relaxed)) return;
-    if (auto state = list->get_private_data<ListState>()) { state->in_pass = false; state->target_count = 0; state->depth = {}; }
+    if (auto state = list->get_private_data<ListState>()) { state->in_pass = false; state->target_count = 0; state->depth = {}; state->pass_targets = 0; state->pass_rt0 = 0; }
 }
 
 extern std::atomic<int> capture_requested; // screen capture (below)
@@ -1354,14 +1355,19 @@ constexpr uint64_t pixel_probe_frames = 4;
 std::atomic<uint32_t> pixel_probe_used{0};
 std::atomic<int> pixel_probe_hits{-1}; // offline test: draws that reached the pixel in the last probe (-1: none done)
 std::atomic<int> pixel_probe_display_hits{-1};
+std::mutex pixel_probe_pending_mutex;
+std::vector<uint32_t> pixel_probe_pending; // queries ended inside render passes, not yet resolved
 struct ProbedDraw { uint64_t pso = 0, vs = 0, ps = 0; uint32_t count = 0, instances = 0, first = 0; int32_t base_vertex = 0; bool indexed = false, display = false;
+    bool in_pass = false; int indirect = -1; // indirect: the command type (not re-issued: its count buffer is unknown)
     UINT targets = 0; uint32_t rt_w = 0, rt_h = 0, rt_format = 0; std::string textures; };
 std::mutex pixel_probe_mutex;
 std::vector<ProbedDraw> pixel_probe_draws;
-void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& draw) noexcept try {
-    if (!state.device || !state.device->probe_queries || state.in_pass || !state.target_count) return;
+void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& draw, int indirect = -1) noexcept try {
+    const uint64_t rt0 = state.in_pass ? state.pass_rt0 : uint64_t(state.targets[0].ptr);
+    const UINT target_count = state.in_pass ? state.pass_targets : state.target_count;
+    if (!state.device || !state.device->probe_queries || !target_count || !rt0) return;
     auto device = list->get_device();
-    const auto rt = device->get_resource_from_view({uint64_t(state.targets[0].ptr)});
+    const auto rt = device->get_resource_from_view({rt0});
     if (!rt.handle) return;
     const auto t = device->get_resource_desc(rt);
     // The scene at the upscaler's render size only (not shadow maps, reflections, gauges or post-processing).
@@ -1369,19 +1375,30 @@ void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& d
     const uint32_t index = pixel_probe_used.fetch_add(1);
     if (index >= pixel_probe_max) return;
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native());
-    const LONG cx = LONG(t.texture.width / 2), cy = LONG(t.texture.height / 2);
-    const D3D12_RECT pixel{cx, cy, cx + 1, cy + 1};
-    native->RSSetScissorRects(1, &pixel);
-    native->BeginQuery(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
-    if (draw.indexed) native->DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
-    else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
-    native->EndQuery(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
-    native->ResolveQueryData(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index, 1, state.device->probe_readback.Get(), uint64_t(index) * 8);
-    const D3D12_RECT whole{0, 0, LONG(t.texture.width), LONG(t.texture.height)};
-    native->RSSetScissorRects(1, state.scissor_known ? &state.scissor : &whole);
+    // Indirect draws are not re-issued (ExecuteIndirect may take its draw count from a buffer the event doesn't pass):
+    // they are only listed as found at this size.
+    if (indirect < 0) {
+        const LONG cx = LONG(t.texture.width / 2), cy = LONG(t.texture.height / 2);
+        const D3D12_RECT pixel{cx, cy, cx + 1, cy + 1};
+        native->RSSetScissorRects(1, &pixel);
+        native->BeginQuery(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
+        if (draw.indexed) native->DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
+        else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
+        native->EndQuery(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
+        if (state.in_pass) {
+            // No copies inside a render pass: resolved at a later present (pixel_probe_resolve).
+            std::lock_guard lock(pixel_probe_pending_mutex);
+            pixel_probe_pending.push_back(index);
+        } else {
+            native->ResolveQueryData(state.device->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index, 1, state.device->probe_readback.Get(), uint64_t(index) * 8);
+        }
+        const D3D12_RECT whole{0, 0, LONG(t.texture.width), LONG(t.texture.height)};
+        native->RSSetScissorRects(1, state.scissor_known ? &state.scissor : &whole);
+    }
     ProbedDraw p;
+    p.in_pass = state.in_pass; p.indirect = indirect;
     p.pso = state.pso; p.count = draw.count; p.instances = draw.instances; p.first = draw.first; p.base_vertex = draw.base_vertex; p.indexed = draw.indexed;
-    p.display = state.display != nullptr; p.targets = state.target_count; p.rt_w = t.texture.width; p.rt_h = t.texture.height; p.rt_format = uint32_t(t.texture.format);
+    p.display = state.display != nullptr; p.targets = target_count; p.rt_w = t.texture.width; p.rt_h = t.texture.height; p.rt_format = uint32_t(t.texture.format);
     {
         std::shared_lock lock(hashes_mutex);
         if (const auto found = pipeline_hashes.find(state.pso); found != pipeline_hashes.end()) { p.vs = found->second.first; p.ps = found->second.second; }
@@ -1436,6 +1453,21 @@ void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& d
     pixel_probe_draws[index] = std::move(p);
 } catch (...) {}
 
+// Called once per present: once the probed frames are submitted, resolves the queries ended inside render passes.
+void pixel_probe_resolve(api::command_queue* queue, uint64_t now) {
+    const uint64_t frame = pixel_probe_frame.load();
+    if (frame == UINT64_MAX || now != frame + pixel_probe_frames + 1 || !queue || !main_state || !main_state->probe_queries) return;
+    std::vector<uint32_t> pending;
+    { std::lock_guard lock(pixel_probe_pending_mutex); pending.swap(pixel_probe_pending); }
+    if (pending.empty()) return;
+    auto list = queue->get_immediate_command_list();
+    if (!list) return;
+    auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native());
+    for (const uint32_t index : pending)
+        native->ResolveQueryData(main_state->probe_queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, index, 1, main_state->probe_readback.Get(), uint64_t(index) * 8);
+    queue->flush_immediate_command_list();
+}
+
 // Called once per present: logs a finished pixel probe.
 void pixel_probe_flush(uint64_t now) {
     const uint64_t frame = pixel_probe_frame.load();
@@ -1451,19 +1483,35 @@ void pixel_probe_flush(uint64_t now) {
     std::lock_guard lock(pixel_probe_mutex);
     int hits = 0, display_hits = 0;
     std::set<std::tuple<uint64_t, uint32_t, uint32_t, int32_t>> seen; // the same draw in several frames: once
+    std::set<uint64_t> indirect_seen;
     for (uint32_t i = 0; i < used && i < pixel_probe_draws.size(); ++i) {
-        if (!samples[i]) continue;
         const auto& p = pixel_probe_draws[i];
+        if (p.indirect >= 0) {
+            if (indirect_seen.insert(p.pso).second)
+                log("pixel_probe indirect (not testable) type=%d pso=%p vs=%016llx ps=%016llx draws=%u stride=%u in_pass=%d targets=%u rt0=%ux%u format=%u%s",
+                    p.indirect, reinterpret_cast<void*>(p.pso), p.vs, p.ps, p.count, p.first, int(p.in_pass), p.targets, p.rt_w, p.rt_h, p.rt_format, p.textures.c_str());
+            continue;
+        }
+        if (!samples[i]) continue;
         if (!seen.emplace(p.pso, p.count, p.first, p.base_vertex).second) continue;
         ++hits; display_hits += p.display;
-        log("pixel_probe hit samples=%llu pso=%p vs=%016llx ps=%016llx display=%d %s count=%u first=%u base_vertex=%d instances=%u targets=%u rt0=%ux%u format=%u%s",
+        log("pixel_probe hit samples=%llu pso=%p vs=%016llx ps=%016llx display=%d %s count=%u first=%u base_vertex=%d instances=%u in_pass=%d targets=%u rt0=%ux%u format=%u%s",
             samples[i], reinterpret_cast<void*>(p.pso), p.vs, p.ps, int(p.display), p.indexed ? "indexed" : "plain", p.count, p.first, p.base_vertex, p.instances,
-            p.targets, p.rt_w, p.rt_h, p.rt_format, p.textures.c_str());
+            int(p.in_pass), p.targets, p.rt_w, p.rt_h, p.rt_format, p.textures.c_str());
     }
     log("pixel_probe done: %u draws probed at %ux%u over %llu frames, %d distinct draws reach the middle pixel (%d of them screen draws)", used,
         last_render_w.load(), last_render_h.load(), pixel_probe_frames, hits, display_hits);
     pixel_probe_hits = hits; pixel_probe_display_hits = display_hits;
     pixel_probe_draws.clear();
+}
+
+// Indirect draws at render size are only listed by the pixel probe (see pixel_probe).
+bool on_draw_indirect(api::command_list* list, api::indirect_command type, api::resource, uint64_t, uint32_t draw_count, uint32_t stride) {
+    if (!enabled.load(std::memory_order_relaxed) || type == api::indirect_command::dispatch) return false;
+    if (present_count.load(std::memory_order_relaxed) - pixel_probe_frame.load(std::memory_order_relaxed) >= pixel_probe_frames) return false;
+    if (auto state = list->get_private_data<ListState>())
+        pixel_probe(list, *state, {type == api::indirect_command::draw_indexed, draw_count, 1, stride, 0, 0}, int(type));
+    return false;
 }
 
 bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, uint32_t first_instance) {
@@ -2960,6 +3008,7 @@ void on_present(api::effect_runtime* runtime) {
     measure_cost(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr, runtime->get_device()->get_private_data<DeviceState>(),
         present_count.load(std::memory_order_relaxed));
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
+    pixel_probe_resolve(queue, present_count.load(std::memory_order_relaxed));
     pixel_probe_flush(present_count.load(std::memory_order_relaxed));
     if (chord && runtime->is_key_pressed(VK_F8)) glass::request_capture();
     if (chord && runtime->is_key_pressed(VK_F10)) glass::request_pixel_probe();
@@ -3068,6 +3117,7 @@ void set_enabled(bool on) {
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
 void request_pixel_probe() {
     if (!main_state || pixel_probe_frame.load() != UINT64_MAX) return;
+    { std::lock_guard lock(pixel_probe_pending_mutex); pixel_probe_pending.clear(); }
     if (!main_state->probe_queries) {
         D3D12_QUERY_HEAP_DESC heap{D3D12_QUERY_HEAP_TYPE_OCCLUSION, pixel_probe_max, 0};
         D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
@@ -3141,7 +3191,7 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghostin
     X(bind_pipeline, on_bind_pipeline) X(bind_descriptor_tables, on_bind_tables) \
     X(bind_render_targets_and_depth_stencil, on_bind_targets) X(begin_render_pass, on_begin_pass) X(end_render_pass, on_end_pass) \
     X(draw, on_draw) X(draw_indexed, on_draw_indexed) X(reshade_present, on_present) X(init_pipeline, on_init_pipeline) \
-    X(copy_texture_region, on_copy_region) X(bind_scissor_rects, on_bind_scissors)
+    X(copy_texture_region, on_copy_region) X(bind_scissor_rects, on_bind_scissors) X(draw_or_dispatch_indirect, on_draw_indirect)
 
 // ReShade unloads its add-ons when the last device goes away and loads them again for the next one (e.g. when another
 // mod such as OptiScaler creates and releases a device at startup). The module stays pinned (its hooks must stay
