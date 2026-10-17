@@ -464,6 +464,7 @@ int main(int argc, char** argv) {
         // second = the join test's bottom texture: the pattern's lower half, black in its top rows; the top texture then
         // has a bright line along its bottom rows (as the E-Jet PFD's halves meet: brown, a light line, black).
         bool cursor = false; // band test: a parked mouse cursor over the band's texture spot
+        bool blank = false; // blank test: the screen's picture is all black (no contrast to match the brightness on)
         auto upload_display = [&](UINT scroll, bool join = false, bool second = false) {
             ID3D12Resource* const target = second ? display2.Get() : display.Get();
             bool& initialised = second ? display2_initialised : display_initialised;
@@ -471,6 +472,7 @@ int main(int argc, char** argv) {
             std::vector<std::array<float, 4>> level(768 * 768);
             for (UINT y = 0; y < 768; ++y) for (UINT x = 0; x < 768; ++x) {
                 auto p = pattern(x, (y + scroll + (second ? 384 : 0)) % 768);
+                if (blank) p = {0, 0, 0, 255};
                 if (join && !second && y >= 764) p = {230, 230, 230, 255};
                 if (join && !second && y >= 700 && y < 764 && p[0] + p[1] + p[2] == 0) p = {90, 50, 25, 255}; // brown above the join
                 if (join && second && y < 4) p = {0, 0, 0, 255};
@@ -823,7 +825,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; bool occluder = false; int occlusion = 0; };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; bool occluder = false; int occlusion = 0; bool blank = false; };
             const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 2048}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
                 {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
@@ -874,7 +876,10 @@ int main(int argc, char** argv) {
                 {"still-occluder-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, true, 1},
                 {"still-occluder-trim", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 200, true, 1},
                 {"still-occluder-trim-0", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, true, 1},
-                {"still-occluder-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0, true, 1}};
+                {"still-occluder-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0, true, 1},
+                // The screen's picture goes blank (all black) after it was matched (A380 EFB: only its blank side in view).
+                // The fake DLSS output is magenta: "blank_dropped" = share of the screen left to the upscaler afterwards.
+                {"still-blank", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, false, 0, true}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
@@ -909,8 +914,8 @@ int main(int argc, char** argv) {
                 set_trim(m.trim);
                 set_occlusion(m.occlusion || occlusion_everywhere);
                 occluder = {};
-                double occluder_error = 0, ring_trimmed = 0; uint64_t occluder_n = 0, ring_n = 0;
-                dlss_magenta = std::strstr(m.name, "trim") != nullptr;
+                double occluder_error = 0, ring_trimmed = 0, blank_dropped = 0; uint64_t occluder_n = 0, ring_n = 0, blank_n = 0;
+                dlss_magenta = std::strstr(m.name, "trim") != nullptr || m.blank;
                 set_full_size(m.full_size);
                 set_temporal(0);
                 join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas;
@@ -927,6 +932,7 @@ int main(int argc, char** argv) {
                 for (int t = 0; t < frame_count; ++t) {
                     if (t == 1) set_temporal(m.temporal); // the first frame without history (like switching it on)
                     if (t == change_at) { upload_display(8, join); upload_display(8, join, true); }
+                    if (m.blank && t == measure_from) { blank = true; upload_display(0, join); blank = false; }
                     if (m.swap && t > 0 && t % 12 == 0) {
                         // A new screen texture (the old one destroyed first, so the new one gets its slot), at another brightness.
                         display = nullptr;
@@ -986,6 +992,9 @@ int main(int argc, char** argv) {
                             ends[e][0] = (clip[0] / clip[3] + 1) * 0.5f * output_w;
                             ends[e][1] = (1 - clip[1] / clip[3]) * 0.5f * output_h;
                         }
+                    if (m.blank && t >= measure_from + 10)
+                        for (size_t i = 0; i < out.size(); ++i)
+                            if (ideal[i][3] >= 0.999f) { blank_dropped += std::clamp(out[i][0], 0.0f, 1.0f); ++blank_n; }
                     if (m.occluder && t >= measure_from && t < change_at)
                         // Inside the occluder, 3 output pixels in from its edge (the jitter moves the fix's view of it).
                         for (LONG y = occluder.top * 3 / 2 + 3; y < occluder.bottom * 3 / 2 - 3; ++y) for (LONG x = occluder.left * 3 / 2 + 3; x < occluder.right * 3 / 2 - 3; ++x) {
@@ -1083,6 +1092,10 @@ int main(int argc, char** argv) {
                 }
                 if (m.occluder) std::printf(" occluder_error=%.4f", occluder_error / std::max<uint64_t>(occluder_n, 1));
                 if (m.occluder && dlss_magenta) std::printf(" ring_trimmed=%.3f", ring_trimmed / std::max<uint64_t>(ring_n, 1));
+                if (m.blank) {
+                    std::printf(" blank_dropped=%.3f", blank_dropped / std::max<uint64_t>(blank_n, 1));
+                    upload_display(0, join);
+                }
                 if (dlss_magenta) std::printf(" trim_flicker=%.4f trimmed=%.3f", trim_flicker / std::max<uint64_t>(trim_flicker_n, 1), trimmed / std::max<uint64_t>(trim_n, 1));
                 if (m.join || m.band) std::printf(" %s_error=%.4f %s_flicker=%.4f", m.band ? "band" : "join", join_error / std::max<uint64_t>(join_n, 1), m.band ? "band" : "join", join_flicker / std::max<uint64_t>(join_flicker_n, 1));
                 std::printf("\n");

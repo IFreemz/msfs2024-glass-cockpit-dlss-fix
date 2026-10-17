@@ -452,6 +452,10 @@ void solve(uint3 id : SV_DispatchThreadID)
         variance[c] = v[7 + c] / n - mx[c] * mx[c]; covariance[c] = v[10 + c] / n - mx[c] * my[c];
         pooled_variance += variance[c]; pooled_covariance += covariance[c]; pooled_scene_variance += max(v[13 + c] * 1024 / n - my[c] * my[c], 0.0);
     }
+    // No contrast in the part of the screen's texture in view (e.g. only the blank side of the A380 EFB, at the edge of
+    // the view): nothing to learn the brightness from. A screen already matched keeps its match; one never matched stays
+    // with the upscaler (see below).
+    if (pooled_variance <= 3e-6 && previous_a.w > 0) { params[slot * 3] = previous_a; return; }
     float3 a, b;
     [unroll] for (uint c = 0; c < 3; ++c)
     {
