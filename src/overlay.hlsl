@@ -347,8 +347,15 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Per-pixel remainder against last frame's gain (glass layer: dirt, glare, reflections, shadows).
+    // Per-pixel remainder against last frame's gain (glass layer: dirt, glare, reflections, shadows). That gain was fitted
+    // with the brightness reference then: rescaled to this call's, as the solve pass does (in VR the eyes can see
+    // different meshes of one screen texture, so the reference changes with every call).
     float4 gain = active ? params[slot * 3] : 0;
+    if (active)
+    {
+        float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4)), fitted = asfloat(edge_bounds.Load(brightness_fitted + slot * 4));
+        if (reference > 0 && fitted > 0) gain.rgb *= reference / fitted;
+    }
     if (all(p < int2(map_size))) residual[p] = active && gain.w > 0 ? float4(y - gain.rgb * x, slot + 1 + (outline ? 64 : 0)) : 0;
     if ((flags & 65536) && all(p < int2(map_size))) fit_input[p] = active ? float4(x, slot + 1) : 0;
     if (index == 0 && all(group.xy < (map_size + 7) / 8)) tiles[group.xy] = tile_slot < slot_count ? tile_slot + 1 : 0;

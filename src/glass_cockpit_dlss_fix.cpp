@@ -2255,13 +2255,15 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     }
     uint32_t pending = map->views.load();
     uint32_t call_in_present = 0;
+    int recovered_call = -1; // VR: the views count was used up, this call's view from its place since the last present
     if (map->layers > 1) {
-        // Diagnostics (VR): which view this call is, counted from the last present, next to what the views count says.
+        // VR: which view this call is, counted from the last present. In VR sessions it matched the views count on every
+        // call (the sim upscales each frame's views in one go between presents).
         const uint64_t now = present_count.load(std::memory_order_relaxed);
         if (map->call_present.exchange(now) != now) map->calls_this_present = 0;
         call_in_present = map->calls_this_present++;
         static std::atomic<int> logged{0};
-        if (logged++ < 400) log("vr_call present=%llu call_in_present=%u pending=%u layers=%u recorded=%llu output=%p", now, call_in_present, pending,
+        if (logged++ < 64) log("vr_call present=%llu call_in_present=%u pending=%u layers=%u recorded=%llu output=%p", now, call_in_present, pending,
             map->layers, map->recorded_present.load(), output);
     }
     do {
@@ -2270,6 +2272,15 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         // frame order). Without views to tell apart, fix it anyway while screens are being drawn; a second call in the
         // same frame finds the map already cleared and changes nothing.
         if (!pending && map->layers == 1 && present_count.load(std::memory_order_relaxed) - map->recorded_present.load() <= 8) break;
+        // VR, the same: screens recorded lately but the count used up (the next frame's screens recorded first). The view
+        // comes from the call's place since the last present instead of the count.
+        if (!pending && map->layers > 1 && call_in_present < map->layers &&
+            present_count.load(std::memory_order_relaxed) - map->recorded_present.load() <= 8) {
+            recovered_call = int(call_in_present);
+            static std::atomic<int> logged{0};
+            if (logged++ < 8) log("note VR %s call %u found the views count used up: fixed by its place since the last present", u.name, call_in_present);
+            break;
+        }
         if (!pending) {
             // Diagnostics: an upscaler call that found this frame's screens already composited.
             static std::atomic<int> logged{0};
@@ -2279,7 +2290,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         }
     } while (!map->views.compare_exchange_weak(pending, pending - 1));
     const bool fresh = pending > 0;
-    const UINT layer = map->layers > 1 ? layer_for_call(map->layers - pending, map->layers, output) : 0; // VR: pending > 0 here
+    const UINT layer = map->layers > 1 ? layer_for_call(recovered_call >= 0 ? UINT(recovered_call) : map->layers - pending, map->layers, output) : 0;
     const auto out = output->GetDesc(), in = colour->GetDesc();
     // Any float or UNORM colour output the compute pass can write (DLSS in MSFS: R11G11B10_FLOAT).
     const DXGI_FORMAT out_format = typed(out.Format), in_format = typed(in.Format);
