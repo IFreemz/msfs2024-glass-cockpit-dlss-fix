@@ -33,6 +33,18 @@ inline bool clone_pipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& original,
         blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     }
     result.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    // Replayed right after the game's own draw, against the depth it just wrote: only the triangle the game kept passes
+    // (a screen mesh can hold layers drawn in either order, e.g. the iFly 737's CDU and radio displays have a backing
+    // plate 0.2 mm off the screen, after it in the mesh). A tiny bias towards the camera (16 float steps) absorbs
+    // rounding differences between the two pipelines; layers millimetres apart stay apart.
+    const auto func = original.DepthStencilState.DepthFunc;
+    if (func == D3D12_COMPARISON_FUNC_GREATER || func == D3D12_COMPARISON_FUNC_GREATER_EQUAL) {
+        result.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+        result.RasterizerState.DepthBias = original.RasterizerState.DepthBias + 16; // on top of the game's own bias
+    } else if (func == D3D12_COMPARISON_FUNC_LESS || func == D3D12_COMPARISON_FUNC_LESS_EQUAL) {
+        result.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        result.RasterizerState.DepthBias = original.RasterizerState.DepthBias - 16;
+    }
     result.CachedPSO = {};
     return true;
 }

@@ -1096,26 +1096,27 @@ void on_end_pass(api::command_list* list) {
 }
 
 extern std::atomic<int> capture_requested; // screen capture (below)
-void replay(api::command_list* list, ListState& state, const glass::Draw& draw) noexcept try {
+// Returns true when it issued the game's draw itself (the original call is then skipped).
+bool replay(api::command_list* list, ListState& state, const glass::Draw& draw) noexcept try {
     auto& device = *state.device;
-    if (state.in_pass || !state.target_count || !state.depth.ptr || !draw.count || !draw.instances) { note(stats.unsupported_draw, "render_pass_or_targets"); return; }
+    if (state.in_pass || !state.target_count || !state.depth.ptr || !draw.count || !draw.instances) { note(stats.unsupported_draw, "render_pass_or_targets"); return false; }
     std::pair<uint32_t, uint32_t> binding;
     {
         std::shared_lock lock(device.layouts_mutex);
         const auto found = device.display_bindings.find(state.layout);
-        if (found == device.display_bindings.end() || state.layout != reinterpret_cast<uint64_t>(state.display->root.Get())) { note(stats.unsupported_draw, "root_layout"); return; }
+        if (found == device.display_bindings.end() || state.layout != reinterpret_cast<uint64_t>(state.display->root.Get())) { note(stats.unsupported_draw, "root_layout"); return false; }
         binding = found->second[state.display->screen_t0 ? 0 : 1];
     }
-    if (binding.first >= state.tables.size()) { note(stats.unsupported_draw, "root_layout"); return; }
+    if (binding.first >= state.tables.size()) { note(stats.unsupported_draw, "root_layout"); return false; }
     const auto table = state.tables[binding.first];
-    if (!table) { note(stats.unsupported_draw, "t1_table_unbound"); return; }
+    if (!table) { note(stats.unsupported_draw, "t1_table_unbound"); return false; }
     api::descriptor_heap heap{}; uint32_t offset = 0;
     list->get_device()->get_descriptor_heap_offset({table}, binding.second, 0, &heap, &offset);
-    if (!heap.handle) { note(stats.unsupported_draw, "descriptor_heap_unknown"); return; }
+    if (!heap.handle) { note(stats.unsupported_draw, "descriptor_heap_unknown"); return false; }
     auto native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
     Signature s{};
     if (!read_bytes(reinterpret_cast<const void*>(native_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(offset) * descriptor_size), s.bytes.data(), descriptor_size)) {
-        note(stats.unknown_texture, "descriptor_unreadable"); return;
+        note(stats.unknown_texture, "descriptor_unreadable"); return false;
     }
     Texture texture;
     bool recognised = false;
@@ -1143,10 +1144,10 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
                 native_heap, offset, hex(s).c_str(), uint64_t(signatures.size()), uint64_t(tracked_count), described ? "described" : "unknown",
                 info.width, info.height, info.format, info.usage, info.layers, info.samples, info.levels);
         }
-        note(stats.unknown_texture, "texture_not_recognised"); return;
+        note(stats.unknown_texture, "texture_not_recognised"); return false;
     }
     const int slot = slot_of(texture.resource, texture.format);
-    if (slot < 0) { note(stats.unsupported_draw, "slots_full"); return; }
+    if (slot < 0) { note(stats.unsupported_draw, "slots_full"); return false; }
     {
         // Diagnostics: each distinct draw of a screen texture once (several panels can share one texture, e.g. the iFly
         // 737's CDU and radios: are they separate draws?).
@@ -1158,14 +1159,14 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
                 draw.count, draw.first, draw.base_vertex, draw.instances);
     }
     auto pso = variant(state.display, unsigned(slot));
-    if (!pso) return;
+    if (!pso) return false;
     const auto target = list->get_device()->get_resource_from_view({state.targets[0].ptr});
-    if (!target.handle) { note(stats.unsupported_draw, "target_unknown"); return; }
+    if (!target.handle) { note(stats.unsupported_draw, "target_unknown"); return false; }
     const auto desc = reinterpret_cast<ID3D12Resource*>(target.handle)->GetDesc();
     // VR draws all views at once into a layered target; the map gets the same layers.
     const UINT layers = state.display->vr ? std::clamp<UINT>(desc.DepthOrArraySize, 1, 8) : 1;
     auto map = map_for(device, UINT(desc.Width), desc.Height, layers);
-    if (!map) { note(stats.unsupported_draw, "map_allocation"); return; }
+    if (!map) { note(stats.unsupported_draw, "map_allocation"); return false; }
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native());
     const auto rtv = map->rtv->GetCPUDescriptorHandleForHeapStart();
     {
@@ -1176,6 +1177,9 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
             map->initialised = true;
         } else transition(native, map->texture.Get(), map_resting, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
+    // The game's draw first (its state is still bound), then the map against the depth it wrote (see clone_pipeline).
+    if (draw.indexed) native->DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
+    else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
     // Viewport, scissor, root arguments and mesh buffers stay exactly as the game bound them.
     native->SetPipelineState(pso);
     native->OMSetRenderTargets(1, &rtv, FALSE, &state.depth);
@@ -1224,7 +1228,8 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
     map->recorded_present = present_count.load(std::memory_order_relaxed);
     if (stats.replays++ == 0) log("milestone first cockpit screen recorded (render target %ux%u)", UINT(desc.Width), desc.Height);
     if (layers > 1) LOG_ONCE("milestone first VR cockpit screen recorded (render target %ux%u, %u views)", UINT(desc.Width), desc.Height, layers);
-} catch (...) { note(stats.unsupported_draw, "exception"); }
+    return true;
+} catch (...) { note(stats.unsupported_draw, "exception"); return false; }
 
 // VR probe window (in presents), started when the upscaler runs at a size with no cockpit map (VR or another view).
 std::atomic<uint64_t> probe_until{0};
@@ -1522,8 +1527,7 @@ bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
     if (state && state->display) ++stats.display_draws;
-    if (state && state->display && state->generation == generation.load(std::memory_order_relaxed)) replay(list, *state, {false, count, instances, first, first_instance, 0});
-    return false;
+    return state && state->display && state->generation == generation.load(std::memory_order_relaxed) && replay(list, *state, {false, count, instances, first, first_instance, 0});
 }
 bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances, uint32_t first, int32_t vertex, uint32_t first_instance) {
     CpuScope scope(cpu_draws);
@@ -1533,8 +1537,7 @@ bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
     if (state && state->display) ++stats.display_draws;
-    if (state && state->display && state->generation == generation.load(std::memory_order_relaxed)) replay(list, *state, {true, count, instances, first, first_instance, vertex});
-    return false;
+    return state && state->display && state->generation == generation.load(std::memory_order_relaxed) && replay(list, *state, {true, count, instances, first, first_instance, vertex});
 }
 
 
