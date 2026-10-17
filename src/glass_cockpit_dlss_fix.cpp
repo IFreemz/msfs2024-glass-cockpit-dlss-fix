@@ -713,6 +713,7 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     // Screen capture: each screen texture's colour at the moment the sim drew it (render size, kept as a render target).
     std::mutex draw_colour_mutex;
     ComPtr<ID3D12Resource> draw_colour;
+    std::vector<ComPtr<ID3D12Resource>> draw_colour_retired;
     ComPtr<ID3D12DescriptorHeap> draw_colour_rtv;
     // Pixel probe: one occlusion query per probed draw, resolved into a readback buffer.
     ComPtr<ID3D12QueryHeap> probe_queries;
@@ -1158,13 +1159,18 @@ void replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
     if (draw.indexed) native->DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
     else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
     // Screen capture: the screen texture's colour as the sim draws it (it can differ from what the fix reads later).
-    if (capture_requested.load(std::memory_order_relaxed) > 0 && layers == 1) {
+    // Only at the upscaler's render size: the sim also draws the screens into smaller targets (reflections).
+    if (capture_requested.load(std::memory_order_relaxed) > 0 && layers == 1 && desc.Width == last_render_w.load() && desc.Height == last_render_h.load()) {
         if (auto colour = colour_variant(state.display)) {
             D3D12_CPU_DESCRIPTOR_HANDLE colour_rtv{};
             {
                 std::lock_guard lock(device.draw_colour_mutex);
-                if (device.draw_colour && (device.draw_colour->GetDesc().Width != desc.Width || device.draw_colour->GetDesc().Height != desc.Height)) device.draw_colour = nullptr;
-                if (!device.draw_colour) {
+                // Another render size: the old target is kept (the GPU may still be drawing into it), a new one made.
+                if (device.draw_colour && (device.draw_colour->GetDesc().Width != desc.Width || device.draw_colour->GetDesc().Height != desc.Height)) {
+                    device.draw_colour_retired.push_back(device.draw_colour);
+                    device.draw_colour = nullptr;
+                }
+                if (!device.draw_colour && device.draw_colour_retired.size() < 4) {
                     D3D12_HEAP_PROPERTIES colour_heap{D3D12_HEAP_TYPE_DEFAULT};
                     D3D12_RESOURCE_DESC colour_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, desc.Width, desc.Height, 1, 1, glass::map_format, {1, 0},
                         D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
@@ -1320,7 +1326,9 @@ void screen_probe(api::command_list* list, const ListState& state, uint32_t coun
 // the same as for it). The draws that reach that pixel are logged with their shaders, render target and the cockpit-
 // screen textures their pixel shader can read: shows how whatever is in the middle of the view is drawn.
 constexpr uint32_t pixel_probe_max = 8192;
-std::atomic<uint64_t> pixel_probe_frame{UINT64_MAX}; // present count whose draws are probed
+std::atomic<uint64_t> pixel_probe_frame{UINT64_MAX}; // first present count whose draws are probed (then a few more:
+                                                     // with frame generation the scene is recorded across presents)
+constexpr uint64_t pixel_probe_frames = 4;
 std::atomic<uint32_t> pixel_probe_used{0};
 std::atomic<int> pixel_probe_hits{-1}; // offline test: draws that reached the pixel in the last probe (-1: none done)
 std::atomic<int> pixel_probe_display_hits{-1};
@@ -1334,6 +1342,8 @@ void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& d
     const auto rt = device->get_resource_from_view({uint64_t(state.targets[0].ptr)});
     if (!rt.handle) return;
     const auto t = device->get_resource_desc(rt);
+    // The scene at the upscaler's render size only (not shadow maps, reflections, gauges or post-processing).
+    if (t.texture.width != last_render_w.load() || t.texture.height != last_render_h.load()) return;
     const uint32_t index = pixel_probe_used.fetch_add(1);
     if (index >= pixel_probe_max) return;
     auto native = reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native());
@@ -1392,7 +1402,7 @@ void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& d
 // Called once per present: logs a finished pixel probe.
 void pixel_probe_flush(uint64_t now) {
     const uint64_t frame = pixel_probe_frame.load();
-    if (frame == UINT64_MAX || now < frame + 4 || !main_state || !main_state->probe_readback) return;
+    if (frame == UINT64_MAX || now < frame + pixel_probe_frames + 4 || !main_state || !main_state->probe_readback) return;
     pixel_probe_frame = UINT64_MAX;
     const uint32_t used = std::min(pixel_probe_used.load(), pixel_probe_max);
     void* data = nullptr;
@@ -1403,15 +1413,18 @@ void pixel_probe_flush(uint64_t now) {
     main_state->probe_readback->Unmap(0, &none);
     std::lock_guard lock(pixel_probe_mutex);
     int hits = 0, display_hits = 0;
+    std::set<std::tuple<uint64_t, uint32_t, uint32_t, int32_t>> seen; // the same draw in several frames: once
     for (uint32_t i = 0; i < used && i < pixel_probe_draws.size(); ++i) {
         if (!samples[i]) continue;
         const auto& p = pixel_probe_draws[i];
+        if (!seen.emplace(p.pso, p.count, p.first, p.base_vertex).second) continue;
         ++hits; display_hits += p.display;
         log("pixel_probe hit samples=%llu pso=%p vs=%016llx ps=%016llx display=%d %s count=%u first=%u base_vertex=%d instances=%u targets=%u rt0=%ux%u format=%u%s",
             samples[i], reinterpret_cast<void*>(p.pso), p.vs, p.ps, int(p.display), p.indexed ? "indexed" : "plain", p.count, p.first, p.base_vertex, p.instances,
             p.targets, p.rt_w, p.rt_h, p.rt_format, p.textures.c_str());
     }
-    log("pixel_probe done: %u draws probed, %d reach the middle pixel (%d of them screen draws)", used, hits, display_hits);
+    log("pixel_probe done: %u draws probed at %ux%u over %llu frames, %d distinct draws reach the middle pixel (%d of them screen draws)", used,
+        last_render_w.load(), last_render_h.load(), pixel_probe_frames, hits, display_hits);
     pixel_probe_hits = hits; pixel_probe_display_hits = display_hits;
     pixel_probe_draws.clear();
 }
@@ -1420,7 +1433,7 @@ bool on_draw(api::command_list* list, uint32_t count, uint32_t instances, uint32
     CpuScope scope(cpu_draws);
     if (!enabled.load(std::memory_order_relaxed)) return false;
     auto state = list->get_private_data<ListState>();
-    if (state && present_count.load(std::memory_order_relaxed) == pixel_probe_frame.load(std::memory_order_relaxed)) pixel_probe(list, *state, {false, count, instances, first, first_instance, 0});
+    if (state && present_count.load(std::memory_order_relaxed) - pixel_probe_frame.load(std::memory_order_relaxed) < pixel_probe_frames) pixel_probe(list, *state, {false, count, instances, first, first_instance, 0});
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
     if (state && state->display) ++stats.display_draws;
@@ -1431,7 +1444,7 @@ bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances
     CpuScope scope(cpu_draws);
     if (!enabled.load(std::memory_order_relaxed)) return false;
     auto state = list->get_private_data<ListState>();
-    if (state && present_count.load(std::memory_order_relaxed) == pixel_probe_frame.load(std::memory_order_relaxed)) pixel_probe(list, *state, {true, count, instances, first, first_instance, vertex});
+    if (state && present_count.load(std::memory_order_relaxed) - pixel_probe_frame.load(std::memory_order_relaxed) < pixel_probe_frames) pixel_probe(list, *state, {true, count, instances, first, first_instance, vertex});
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(list, *state, count, instances);
     if (state && !state->display && present_count.load(std::memory_order_relaxed) < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(list, *state, count, instances);
     if (state && state->display) ++stats.display_draws;
