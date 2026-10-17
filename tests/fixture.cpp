@@ -428,8 +428,8 @@ int main(int argc, char** argv) {
                 else { v.uv[0] = (positions[i][0] + 0.7f) / 1.4f; v.uv[1] = (top - y) / (top - bottom); }
                 std::fill(std::begin(v.color), std::end(v.color), 1.0f);
             }
-        // Windows test: four windows over most of the screen, drawn with the screen's texture but all their texture
-        // coordinates on one spot, and a brighter material (like the iFly 737's radio windows: their digits come from
+        // Windows test: four windows over most of the screen, drawn with the screen's texture but their texture
+        // coordinates (almost) on one spot, and a brighter material (like the iFly 737's radio windows: their digits come from
         // elsewhere). Vertices 61-84.
         for (size_t q = 0; q < 4; ++q)
             for (size_t i = 0; i < 6; ++i) {
@@ -438,7 +438,8 @@ int main(int argc, char** argv) {
                 const float x0 = right ? 0.08f : -0.62f, x1 = right ? 0.62f : -0.08f, y0 = lower ? -0.62f : 0.08f, y1 = lower ? -0.08f : 0.62f;
                 v.position[0] = positions[i][0] > 0 ? x1 : x0; v.position[1] = positions[i][1] > 0 ? y1 : y0; v.position[2] = 0.399f; v.position[3] = 1;
                 v.tangent[0] = v.tangent[3] = v.normal[2] = 1;
-                v.uv[0] = 0.004f; v.uv[1] = 0.06f;
+                // Almost one spot: less than half a texel across the whole window (as on the iFly, not exactly constant).
+                v.uv[0] = 0.004f + (positions[i][0] > 0 ? 0.0005f : 0.0f); v.uv[1] = 0.06f + (positions[i][1] > 0 ? 0.0f : 0.0005f);
                 std::fill(std::begin(v.color), std::end(v.color), 1.0f);
             }
         auto vb = buffer(device.Get(), sizeof(vertices), D3D12_HEAP_TYPE_UPLOAD); upload(vb.Get(), vertices.data(), sizeof(vertices));

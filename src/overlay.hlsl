@@ -103,6 +103,16 @@ uint taps_for(uint slot, float2 fx, float2 fy)
     return clamp(uint(ceil(texels / 1.5)), 2, 8);
 }
 
+// Texture coordinates that hardly move across a render pixel (dx, dy: per render pixel): the mesh shows less than 1/32 of
+// a texel per render pixel, one spot of the texture stretched over it (a bezel band, or the iFly 737's CDU backings and
+// radio windows, whose picture comes from elsewhere). No real screen is magnified that much.
+bool one_spot(uint slot, float2 dx, float2 dy)
+{
+    float w, h;
+    displays[NonUniformResourceIndex(slot)].GetDimensions(w, h);
+    return length(dx * float2(w, h)) + length(dy * float2(w, h)) < 1.0 / 32;
+}
+
 // n x n taps over the footprint fx, fy around uv (rotated grid: no two taps share a row or column); soft: Gaussian
 // weights (sigma 0.4 of the footprint) over a footprint twice as wide, given as such by the caller.
 float3 sample_area(uint slot, float2 uv, float2 fx, float2 fy, uint n, bool soft)
@@ -290,10 +300,9 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
         float2 dy = map_slot(d) == slot ? d.xy - m.xy : map_slot(u) == slot ? m.xy - u.xy : 0;
         x = sample_display(slot, m.xy, dx, dy);
         y = scene.Load(int3(p, 0)).rgb;
-        // Parts of the mesh whose texture coordinates all point at one spot (a bezel band, or the iFly 737's radio windows,
-        // whose digits come from elsewhere) carry no picture of the texture: the composite leaves them to the upscaler,
-        // and what the sim shows there would only drag the brightness match down.
-        active = all(isfinite(y)) && length(dx) + length(dy) >= 1e-7;
+        // Parts of the mesh that show one spot of the texture (see one_spot) carry no picture of it: the composite leaves
+        // them to the upscaler, and what the sim shows there would only drag the brightness match down.
+        active = all(isfinite(y)) && !one_spot(slot, dx, dy);
         y = clamp(y, 0, 1024);
         // Fine detail: differences to the right and lower neighbour on the same display. Sun glare and other smooth
         // light on the glass hardly changes these, so dark screens with thin symbols still score well in the sun.
@@ -722,7 +731,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     }
     if (edge_pixel)
     {
-        if (length(dx) + length(dy) < 1e-7) return; // the edge of a bezel band (one texture spot): the upscaler's
+        if (one_spot(map_slot(a), dx / map_per_output.x, dy / map_per_output.y)) return; // the edge of a bezel band (one texture spot): the upscaler's
     }
     else if (inside)
     {
@@ -730,7 +739,7 @@ void composite(uint3 id : SV_DispatchThreadID)
         dx = lerp(b.xy - a.xy, d.xy - c.xy, f.y) * map_per_output.x;
         dy = lerp(c.xy - a.xy, d.xy - b.xy, f.x) * map_per_output.y;
         // All four render pixels around point at one texture spot: a bezel band, not screen content (see below).
-        if ((flags & 32) && length(dx) + length(dy) < 1e-7) return;
+        if ((flags & 32) && one_spot(map_slot(a), dx / map_per_output.x, dy / map_per_output.y)) return;
         // UV seam: one screen mesh whose texture coordinates jump between neighbouring pixels (e.g. the FSS E-Jets'
         // bezel band points at the texture's corner, right next to the picture). Blending across the jump samples
         // whatever lies between in the texture: a thin line along the seam that the sim never draws. Continue the

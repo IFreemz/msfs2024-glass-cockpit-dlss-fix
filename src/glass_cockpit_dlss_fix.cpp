@@ -1782,6 +1782,7 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
                 a[11], a[3] > 0 ? "fixed" : "skipped");
             summary << line;
         }
+        std::vector<uint8_t> map_records;
         for (const auto& image : frames[f].images) {
             const bool map_image = image.name == "map";
             const auto a = area(image.width, image.height, map_image);
@@ -1806,7 +1807,16 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
                     const float v = std::clamp(std::isfinite(c[i]) ? c[i] * (image.name == "fit-input" ? 1.0f : scale) : 0.0f, 0.0f, 1.0f);
                     out[i] = uint8_t(std::lround((v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1 / 2.4f) - 0.055f) * 255));
                 }
-                out[3] = 255;
+                // fit-input: alpha = slot + 1 where the brightness match counted the pixel, 0 where it didn't.
+                out[3] = image.name == "fit-input" ? uint8_t(std::clamp(std::isfinite(c[3]) ? c[3] : 0.0f, 0.0f, 255.0f) + 0.5f) : 255;
+                // The first frame's map at full precision, screen pixels only (the PNG holds 8 bits of each coordinate):
+                // per pixel uint16 x, y; float u, v, depth; uint16 slot.
+                if (map_image && f == 0 && c[3] > 0.5f) {
+                    const uint16_t xy[2]{uint16_t(x), uint16_t(y)}, slot16 = uint16_t(c[3] + 0.5f) - 1;
+                    const size_t at = map_records.size();
+                    map_records.resize(at + 18);
+                    std::memcpy(&map_records[at], xy, 4); std::memcpy(&map_records[at + 4], c.data(), 12); std::memcpy(&map_records[at + 16], &slot16, 2);
+                }
             }
             const auto file = folder / (L"frame" + std::to_wstring(f) + L"-" + std::wstring(image.name.begin(), image.name.end()) + L".png");
             const HRESULT result = decoded ? save_png(file, w, h, rgba) : E_NOTIMPL;
@@ -1814,6 +1824,11 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
                 << (decoded ? (SUCCEEDED(result) ? " saved" : " save failed") : " format not supported") << "\n";
             for (const auto& [slot, box] : slots)
                 summary << "    screen slot " << slot << ": map pixels " << box[0] << "," << box[1] << " to " << box[2] << "," << box[3] << " (" << box[4] << " pixels)\n";
+        }
+        if (!map_records.empty()) {
+            std::ofstream raw(folder / (L"frame" + std::to_wstring(f) + L"-map-precise.bin"), std::ios::binary);
+            raw.write(reinterpret_cast<const char*>(map_records.data()), std::streamsize(map_records.size()));
+            summary << "  map-precise: " << map_records.size() / 18 << " screen pixels (uint16 x, y; float u, v, depth; uint16 slot)\n";
         }
     }
     summary.close();
