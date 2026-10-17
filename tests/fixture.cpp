@@ -777,7 +777,7 @@ int main(int argc, char** argv) {
                 transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 submit();
                 // The fake DLSS output: the ideal picture (no ghost); the fix redraws the screen over it.
-                for (size_t i = 0; i < prefill.size(); ++i) prefill[i] = encode_r11g11b10(dlss_magenta ? std::array<float, 3>{1, 0, 1} : std::array<float, 3>{ideal[i][0], ideal[i][1], ideal[i][2]});
+                for (size_t i = 0; i < prefill.size(); ++i) prefill[i] = encode_r11g11b10(dlss_magenta && !(occluder.right > occluder.left && ideal[i][3] <= 0) ? std::array<float, 3>{1, 0, 1} : std::array<float, 3>{ideal[i][0], ideal[i][1], ideal[i][2]});
                 if (dlss_shift[0] != 0 || dlss_shift[1] != 0)
                     for (UINT y = 1; y + 1 < output_h; ++y) for (UINT x = 1; x + 1 < output_w; ++x) {
                         const float sx = x + dlss_shift[0], sy = y + dlss_shift[1];
@@ -873,6 +873,7 @@ int main(int argc, char** argv) {
                 {"occluder", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, true, 1},
                 {"still-occluder-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, true, 1},
                 {"still-occluder-trim", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 200, true, 1},
+                {"still-occluder-trim-0", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, true, 1},
                 {"still-occluder-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0, true, 1}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
@@ -908,8 +909,8 @@ int main(int argc, char** argv) {
                 set_trim(m.trim);
                 set_occlusion(m.occlusion || occlusion_everywhere);
                 occluder = {};
-                double occluder_error = 0; uint64_t occluder_n = 0;
-                dlss_magenta = std::strstr(m.name, "trim") != nullptr && !m.occluder;
+                double occluder_error = 0, ring_trimmed = 0; uint64_t occluder_n = 0, ring_n = 0;
+                dlss_magenta = std::strstr(m.name, "trim") != nullptr;
                 set_full_size(m.full_size);
                 set_temporal(0);
                 join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas;
@@ -993,6 +994,16 @@ int main(int argc, char** argv) {
                             ++occluder_n;
                         }
                     const float jx_ = ends[1][0] - ends[0][0], jy_ = ends[1][1] - ends[0][1], jlen = std::sqrt(jx_ * jx_ + jy_ * jy_);
+                    if (m.occluder && dlss_magenta && t >= measure_from && t < change_at)
+                        // Screen pixels 3-10 output pixels around the occluder: edge trim must not cut there (the occluder isn't
+                        // the screen's edge). Share left to the (magenta) upscaler.
+                        for (LONG y = occluder.top * 3 / 2 - 10; y < occluder.bottom * 3 / 2 + 10; ++y) for (LONG x = occluder.left * 3 / 2 - 10; x < occluder.right * 3 / 2 + 10; ++x) {
+                            const LONG ox = std::max({occluder.left * 3 / 2 - x, x - (occluder.right * 3 / 2 - 1), 0L}), oy = std::max({occluder.top * 3 / 2 - y, y - (occluder.bottom * 3 / 2 - 1), 0L});
+                            if (std::max(ox, oy) < 3) continue;
+                            const size_t i = size_t(y) * output_w + x;
+                            if (ideal[i][3] < 0.999f || ideal[i][1] <= 0.05f) continue;
+                            ring_trimmed += std::clamp(1 - out[i][1] / ideal[i][1], 0.0f, 1.0f); ++ring_n;
+                        }
                     if (dlss_magenta && t == measure_from) {
                         trim_zone.assign(out.size(), 0);
                         for (UINT y = 8; y + 8 < output_h; ++y) for (UINT x = 8; x + 8 < output_w; ++x) {
@@ -1071,6 +1082,7 @@ int main(int argc, char** argv) {
                     upload(materials[0].Get(), material.data(), sizeof(material));
                 }
                 if (m.occluder) std::printf(" occluder_error=%.4f", occluder_error / std::max<uint64_t>(occluder_n, 1));
+                if (m.occluder && dlss_magenta) std::printf(" ring_trimmed=%.3f", ring_trimmed / std::max<uint64_t>(ring_n, 1));
                 if (dlss_magenta) std::printf(" trim_flicker=%.4f trimmed=%.3f", trim_flicker / std::max<uint64_t>(trim_flicker_n, 1), trimmed / std::max<uint64_t>(trim_n, 1));
                 if (m.join || m.band) std::printf(" %s_error=%.4f %s_flicker=%.4f", m.band ? "band" : "join", join_error / std::max<uint64_t>(join_n, 1), m.band ? "band" : "join", join_flicker / std::max<uint64_t>(join_flicker_n, 1));
                 std::printf("\n");

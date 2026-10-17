@@ -872,7 +872,10 @@ void composite(uint3 id : SV_DispatchThreadID)
             [loop] for (int tx = -radius; tx <= radius + 1; ++tx)
             {
                 int2 q = cell + int2(tx, ty);
-                if (any(q < 0) || any(q >= int2(map_size)) || map_slot(load_map(q)) < slot_count) continue;
+                if (any(q < 0) || any(q >= int2(map_size))) continue;
+                // Something in front of the screen (occlusion check, z = -1) is not its edge: no trim around it.
+                float4 v = load_map(q);
+                if (map_slot(v) < slot_count || v.z < 0) continue;
                 nearest = min(nearest, length(float2(q) - location));
             }
         float dist = nearest - 0.5; // render pixels from the screen's end (half way to the first pixel off it)
