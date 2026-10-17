@@ -76,7 +76,11 @@ static const uint diag_base = 2 * bounds_bytes; // after the edge bounds: 64 cal
 uint bounds_half(uint call) { return (call >> 7) & 1; }
 static const float3 luma = float3(0.2126, 0.7152, 0.0722);
 static const float bounds_scale = 16777215.0;
-static const uint brightness_base = diag_base + 256; // per slot: reference brightness (float bits), then the proposed one
+// Per slot (float bits): the brightness reference this frame uses, the one the stored match was fitted with, and the
+// brightest mesh seen this frame (the next frame's reference; meshes drawn black, e.g. unpowered, don't count).
+static const uint brightness_base = diag_base + 256;
+static const uint brightness_fitted = brightness_base + 128, brightness_next = brightness_base + 256;
+static const float brightness_floor = 1.0 / 1048576; // below: a mesh drawn black
 
 float map_level(float4 m) { return exp2((m.w - round(m.w)) * 64); }
 
@@ -84,7 +88,7 @@ float brightness_ratio(float4 m, uint slot)
 {
     if (slot >= slot_count) return 1;
     float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4));
-    return reference > 0 ? clamp(map_level(m) / reference, 1.0 / 4096, 4096) : 1;
+    return reference > 0 ? clamp(map_level(m) / reference, 0, 16) : 1;
 }
 
 float3 srgb_to_linear(float3 c)
@@ -314,12 +318,6 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
         float2 dx = map_slot(r) == slot ? r.xy - m.xy : map_slot(l) == slot ? m.xy - l.xy : 0;
         float2 dy = map_slot(d) == slot ? d.xy - m.xy : map_slot(u) == slot ? m.xy - u.xy : 0;
         pixel_brightness = brightness_ratio(m, slot);
-        // A slot's first brightness becomes its reference (made final by the clear pass, after this frame's composite).
-        if (asfloat(edge_bounds.Load(brightness_base + slot * 4)) <= 0)
-        {
-            uint unused;
-            edge_bounds.InterlockedCompareExchange(brightness_base + 128 + slot * 4, 0, asuint(map_level(m)), unused);
-        }
         x = sample_display(slot, m.xy, dx, dy);
         y = scene.Load(int3(p, 0)).rgb;
         // Parts of the mesh that show one spot of the texture (see one_spot) carry no picture of it: the composite leaves
@@ -397,6 +395,10 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
             if (slot == first)
             {
                 accumulate(slot, x, y, detail);
+                // The slot's brightest mesh this frame: the next frame's brightness reference.
+                float level = map_level(m);
+                float brightest = WaveActiveMax(level >= brightness_floor && isfinite(level) ? level : 0);
+                if (WaveIsFirstLane() && brightest > 0) { uint unused; edge_bounds.InterlockedMax(brightness_next + slot * 4, asuint(brightest), unused); }
                 done = true;
             }
         }
@@ -476,6 +478,11 @@ void solve(uint3 id : SV_DispatchThreadID)
         sums.Store<uint64_t>(base + i * 8, 0);
     }
     float4 previous_a = params[slot * 3], previous_b = params[slot * 3 + 1], previous_q = params[slot * 3 + 2];
+    // The screen texture is read times each mesh's brightness relative to the slot's reference: when the reference
+    // changed since the stored match was fitted, the match is rescaled to it (the same picture, no jump).
+    float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4)), fitted = asfloat(edge_bounds.Load(brightness_fitted + slot * 4));
+    if (reference > 0 && fitted > 0 && reference != fitted) previous_a.rgb *= reference / fitted;
+    if (reference > 0) edge_bounds.Store(brightness_fitted + slot * 4, asuint(reference));
     if (flags & 1) previous_a.w = 0;
     // The slot took another screen texture (the sim recycles them): its brightness match belongs to the old one. Start
     // over, and leave the screen to the upscaler until the new one has enough samples (a wrong match would flash).
@@ -1070,7 +1077,11 @@ void clear(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID)
     }
     if (all(id.xy < map_size) && all(group.xy < (map_size + 7) / 8) && tiles[group.xy]) map_rw[uint3(id.xy, layer)] = 0;
     if (all(id.xy == 0)) edge_bounds.Store(diag_base + ((diag_index + 1) & 63) * 4, 0);
-    // Brightness references: a slot's first proposed one becomes final now (this frame's fit and composite used none).
-    if (id.y == 0 && id.x < slot_count && edge_bounds.Load(brightness_base + id.x * 4) == 0)
-        edge_bounds.Store(brightness_base + id.x * 4, edge_bounds.Load(brightness_base + 128 + id.x * 4));
+    // Brightness references: the brightest mesh of this frame becomes the next frame's (kept if the slot wasn't seen).
+    if (id.y == 0 && id.x < slot_count)
+    {
+        uint brightest = edge_bounds.Load(brightness_next + id.x * 4);
+        if (brightest) edge_bounds.Store(brightness_base + id.x * 4, brightest);
+        edge_bounds.Store(brightness_next + id.x * 4, 0);
+    }
 }

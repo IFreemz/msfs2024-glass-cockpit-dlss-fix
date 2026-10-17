@@ -448,7 +448,7 @@ int main(int argc, char** argv) {
         const D3D12_VERTEX_BUFFER_VIEW vbv{vb->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
         const D3D12_INDEX_BUFFER_VIEW ibv{ib->GetGPUVirtualAddress(), sizeof(indices), DXGI_FORMAT_R16_UINT};
         std::array<ComPtr<ID3D12Resource>, 2> globals, worlds, objects;
-        ComPtr<ID3D12Resource> objects_dim; // per-instance brightness 0.35 (dim modes: one atlas quad drawn dimmer)
+        ComPtr<ID3D12Resource> objects_dim, objects_off; // per-instance brightness 0.35 (dim modes), 0 (power-on mode)
         for (int k = 0; k < 2; ++k) {
             auto c = constants(k ? 0.25f : 0.0f);
             c.object[0] = {1, 1, 1, 1}; // instance 0's brightness (the display shader multiplies its output by row 0's rgb)
@@ -458,6 +458,8 @@ int main(int argc, char** argv) {
             if (!k) {
                 c.object[0] = {0.35f, 0.35f, 0.35f, 1};
                 objects_dim = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD); upload(objects_dim.Get(), c.object.data(), sizeof(c.object));
+                c.object[0] = {0, 0, 0, 1};
+                objects_off = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD); upload(objects_off.Get(), c.object.data(), sizeof(c.object));
             }
         }
         auto render_cb = buffer(device.Get(), 256, D3D12_HEAP_TYPE_UPLOAD);
@@ -741,7 +743,7 @@ int main(int argc, char** argv) {
             using Image = std::vector<std::array<float, 4>>;
             bool join = false;
             // The display as drawn: one quad, or (join) its two halves with their own textures.
-            bool band = false, inset = false, atlas = false, windows = false, dim = false;
+            bool band = false, inset = false, atlas = false, windows = false, dim = false, unpowered = false;
             auto window_material = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD);
             auto draw_display = [&] {
                 if (windows) {
@@ -753,13 +755,15 @@ int main(int argc, char** argv) {
                 }
                 if (band) { list->DrawIndexedInstanced(6, 1, 0, 19, 0); list->DrawIndexedInstanced(6, 1, 0, 25, 0); return; }
                 if (inset) { list->DrawIndexedInstanced(6, 1, 0, 31, 0); return; }
+                if (unpowered) list->SetGraphicsRootConstantBufferView(2, objects_off->GetGPUVirtualAddress());
                 if (atlas) {
                     for (int q = 0; q < 4; ++q) {
                         // Dim: the third quad at its own brightness (like the Fenix A320's readouts on one texture).
-                        if (dim && q == 2) list->SetGraphicsRootConstantBufferView(2, objects_dim->GetGPUVirtualAddress());
+                        if (dim && q == 2) list->SetGraphicsRootConstantBufferView(2, (unpowered ? objects_off : objects_dim)->GetGPUVirtualAddress());
                         list->DrawIndexedInstanced(6, 1, 0, 37 + q * 6, 0);
-                        if (dim && q == 2) list->SetGraphicsRootConstantBufferView(2, objects[0]->GetGPUVirtualAddress());
+                        if (dim && q == 2) list->SetGraphicsRootConstantBufferView(2, (unpowered ? objects_off : objects[0])->GetGPUVirtualAddress());
                     }
+                    if (unpowered) list->SetGraphicsRootConstantBufferView(2, objects[0]->GetGPUVirtualAddress());
                     return;
                 }
                 if (!join) { list->DrawIndexedInstanced(6, 1, 0, 1, 0); return; }
@@ -861,7 +865,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; bool occluder = false; int occlusion = 0; bool blank = false; bool windows = false; bool dim = false; };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; bool occluder = false; int occlusion = 0; bool blank = false; bool windows = false; bool dim = false; bool power_on = false; };
             const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 2048}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
                 {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
@@ -892,6 +896,8 @@ int main(int argc, char** argv) {
                 // One texture, four meshes, one of them dimmer (per-instance brightness): each must keep its own brightness.
                 {"still-dim-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0, false, 0, false, false, true},
                 {"dim-atlas", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0, false, 0, false, false, true},
+                // The same, unpowered (drawn black) for the first 10 frames: the brightness reference must not stay at "off".
+                {"still-dim-atlas-power-on", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0, false, 0, false, false, true, true},
                 {"still-atlas-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, true}, {"atlas-edges-off", 35, 0, 0.0007f, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, true},
                 // The sim recycling screen textures (A220): every 12 frames the screen texture is destroyed and a new one
                 // made (it takes the same slot), shown at another brightness. "swap" = error on the 2 frames after each swap.
@@ -977,6 +983,7 @@ int main(int argc, char** argv) {
                 double error = 0, flicker = 0, after_change = 0, edge_error = 0, edge_flicker = 0, join_error = 0, join_flicker = 0;
                 uint64_t error_n = 0, flicker_n = 0, change_n = 0, edge_n = 0, edge_flicker_n = 0, join_n = 0, join_flicker_n = 0;
                 for (int t = 0; t < frame_count; ++t) {
+                    unpowered = m.power_on && t < 10;
                     if (t == 1) set_temporal(m.temporal); // the first frame without history (like switching it on)
                     if (t == change_at) { upload_display(8, join); upload_display(8, join, true); }
                     if (m.blank && t == measure_from) { blank = true; upload_display(0, join); blank = false; }

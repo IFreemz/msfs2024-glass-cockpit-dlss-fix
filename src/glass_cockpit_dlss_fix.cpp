@@ -1597,7 +1597,7 @@ bool create_composite(DeviceState& d) {
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.sums)))) return false;
     buffer.Width = slot_count * 3 * 16;
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.params)))) return false;
-    buffer.Width = 2 * slot_count * bounds_cells * bounds_cells * 16 + 256 + 256; // two halves of learnt edges, call counters,
+    buffer.Width = 2 * slot_count * bounds_cells * bounds_cells * 16 + 256 + 512; // two halves of learnt edges, call counters,
                                                                                    // per-slot brightness references
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.edge_bounds)))) return false;
     D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
@@ -2107,12 +2107,14 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
                 // fit-input: alpha = slot + 1 where the brightness match counted the pixel, 0 where it didn't.
                 out[3] = image.name == "fit-input" ? uint8_t(std::clamp(std::isfinite(c[3]) ? c[3] : 0.0f, 0.0f, 255.0f) + 0.5f) : 255;
                 // The first frame's map at full precision, screen pixels only (the PNG holds 8 bits of each coordinate):
-                // per pixel uint16 x, y; float u, v, depth; uint16 slot.
+                // per pixel uint16 x, y; float u, v, depth; uint16 slot; float brightness (the mesh's, see display_map.hlsl).
                 if (map_image && f == 0 && c[3] > 0.5f) {
                     const uint16_t xy[2]{uint16_t(x), uint16_t(y)}, slot16 = uint16_t(c[3] + 0.5f) - 1;
+                    const float level = std::exp2((c[3] - std::round(c[3])) * 64);
                     const size_t at = map_records.size();
-                    map_records.resize(at + 18);
+                    map_records.resize(at + 22);
                     std::memcpy(&map_records[at], xy, 4); std::memcpy(&map_records[at + 4], c.data(), 12); std::memcpy(&map_records[at + 16], &slot16, 2);
+                    std::memcpy(&map_records[at + 18], &level, 4);
                 }
             }
             const auto file = folder / (L"frame" + std::to_wstring(f) + L"-" + std::wstring(image.name.begin(), image.name.end()) + L".png");
@@ -2125,7 +2127,7 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
         if (!map_records.empty()) {
             std::ofstream raw(folder / (L"frame" + std::to_wstring(f) + L"-map-precise.bin"), std::ios::binary);
             raw.write(reinterpret_cast<const char*>(map_records.data()), std::streamsize(map_records.size()));
-            summary << "  map-precise: " << map_records.size() / 18 << " screen pixels (uint16 x, y; float u, v, depth; uint16 slot)\n";
+            summary << "  map-precise: " << map_records.size() / 22 << " screen pixels (uint16 x, y; float u, v, depth; uint16 slot; float brightness)\n";
         }
     }
     summary.close();
@@ -2355,7 +2357,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     history_view.Format = DXGI_FORMAT_R16G16_UNORM;
     d.native->CreateUnorderedAccessView(temporal ? map->history_uv.Get() : nullptr, nullptr, &history_view, at(uav_base + 6));
     D3D12_UNORDERED_ACCESS_VIEW_DESC raw{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
-    raw.Buffer = {0, 2 * slot_count * bounds_cells * bounds_cells * 4 + 64 + 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+    raw.Buffer = {0, 2 * slot_count * bounds_cells * bounds_cells * 4 + 64 + 128, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
     d.native->CreateUnorderedAccessView(d.edge_bounds.Get(), nullptr, &raw, at(uav_base + 7));
     D3D12_UNORDERED_ACCESS_VIEW_DESC glass_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
     glass_view.Texture2DArray = {0, 0, map->layers, 0};
