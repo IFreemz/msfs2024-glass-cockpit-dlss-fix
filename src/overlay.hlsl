@@ -20,7 +20,8 @@ cbuffer Constants : register(b0)
     float smoothing;         // weight of the new fit per frame
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
                              // bit 3: smooth lines, bit 4: dark screen fix, bit 5: UV seam fix, bit 6: temporal anti-aliasing,
-                             // bit 7: soft-edged line smoothing, bit 8: stable screen edges, bit 9: full-size sampling
+                             // bit 7: soft-edged line smoothing, bit 8: stable screen edges, bit 9: full-size sampling,
+                             // bit 14: occlusion check (depth input bound), bit 15: reversed depth (closer = larger)
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -39,6 +40,7 @@ cbuffer Constants : register(b0)
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
 Texture2D<float4> scene : register(t1);     // DLSS input colour (render resolution, pre-exposed linear)
 Texture2D<float4> displays[32] : register(t2);
+Texture2D<float> scene_depth : register(t34); // the upscaler's depth input (render resolution; occlusion check)
 RWTexture2D<float4> output : register(u0);  // DLSS output, R11G11B10_FLOAT
 RWTexture2D<uint> tiles : register(u1);     // per 8x8 map tile: display slot + 1 this frame (0 = none)
 RWStructuredBuffer<float4> params : register(u2); // per slot: [3s] = a.rgb, valid; [3s+1] = b.rgb, samples; [3s+2] = mean screen.rgb, fit quality
@@ -189,9 +191,26 @@ void accumulate(uint slot, float3 x, float3 y, float3 detail)
     }
 }
 
+// Occlusion check: something drawn after a screen in front of it (a sidestick, a hand, the yoke) is closer to the camera
+// in the sim's final depth buffer than the screen surface the map recorded there. Compared as 1 / distance (reversed depth
+// is about that already; for standard depth 1 - depth is), with 1.5 % slack: the map keeps depth at half precision, and
+// a screen's cover glass or a decal on it sits only millimetres in front.
+bool occluded(int2 p, float screen_depth)
+{
+    float depth = scene_depth.Load(int3(p, 0));
+    bool reversed = (flags & 32768) != 0;
+    float scene_near = reversed ? depth : 1 - depth, screen_near = reversed ? screen_depth : 1 - screen_depth;
+    return scene_near > screen_near * 1.015 + 1e-6;
+}
+
+// The map at render pixel p. With the occlusion check, a screen pixel with something in front of it reads as no screen,
+// marked by z = -1.
 float4 load_map(int2 p)
 {
-    return all(p >= 0) && all(p < int2(map_size)) ? map.Load(int4(p, layer, 0)) : 0;
+    if (any(p < 0) || any(p >= int2(map_size))) return 0;
+    float4 m = map.Load(int4(p, layer, 0));
+    if ((flags & 16384) && m.w > 0.5 && occluded(p, m.z)) return float4(0, 0, -1, 0);
+    return m;
 }
 
 // Distance in output pixels from texture coordinates uv (per-pixel gradients dx, dy) to the nearest learnt edge of the
@@ -638,6 +657,9 @@ void composite(uint3 id : SV_DispatchThreadID)
     if (!tiles[uint2(cell) / 8] && !tiles[min(uint2(cell + 1) / 8, tile_size - 1)]) return;
     float4 a, b, c, d;
     bool covered = tap(cell, a) & tap(cell + int2(1, 0), b) & tap(cell + int2(0, 1), c) & tap(cell + int2(1, 1), d);
+    // Next to something in front of the screen, the upscaler's picture: the learnt edges and the edge stretcher would
+    // continue the screen over it.
+    if (!covered && min(min(a.z, b.z), min(c.z, d.z)) < 0) return;
     float2 f = location - cell;
     float2 uv, dx, dy;
     float2 seam_uv = 0, seam_dx = 0, seam_dy = 0; // UV seam: the other side, and its share of this pixel

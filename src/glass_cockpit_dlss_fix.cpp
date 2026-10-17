@@ -82,7 +82,7 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
 // ring_size: descriptor sets in flight, one per upscaler call. With DLSS Frame Generation the sim calls the upscaler up to
 // three times per frame, and the GPU can be several frames behind the CPU (more so with the game in the background): a set
 // must not be rewritten while the GPU may still read it.
-constexpr unsigned slot_count = 32, ring_size = 32, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 10;
+constexpr unsigned slot_count = 32, ring_size = 32, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 11; // + depth (t34)
 constexpr unsigned bounds_cells = 64; // stable screen edges: cells per side of each screen texture's grid
 std::filesystem::path addon_directory;
 ID3D12Device* main_device = nullptr;
@@ -112,6 +112,11 @@ std::atomic<int> stable_edges{1};
 // remainder around the pixel, without the sharp detail taken from the upscaler's picture: DLSS's lines sit slightly
 // elsewhere than the redrawn ones, and that difference changes every frame.
 std::atomic<int> calm_glass{0};
+// Occlusion check (experimental, on/off): screen pixels where the sim's depth buffer shows something closer to the camera
+// than the screen (a sidestick, a hand, the yoke drawn after the screen) are left to the upscaler.
+std::atomic<int> occlusion_check{0};
+// Depth direction of the cockpit display pipelines' depth test: 0 unknown, 1 reversed (closer = larger), 2 standard.
+std::atomic<int> depth_direction{0};
 std::atomic<uint32_t> bounds_reset{0}; // slots whose learnt edges must be forgotten (the slot took another texture)
 std::atomic<uint32_t> debug_flags{0}; // offline test only: extra shader flag bits
 // Line smoothing 0-50 %: 0 = the screen texture as sharp as the sim samples it, 35 = default, 50 = DLSS-like.
@@ -396,6 +401,11 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
         pipeline_values[i] = copy;
         pipeline_keys[i].store(reinterpret_cast<uint64_t>(pso), std::memory_order_release);
         if (stats.display_pipelines++ == 0) log("milestone cockpit display shader found (glass cockpit screens can be recognised)");
+        const auto func = desc.DepthStencilState.DepthFunc;
+        const int direction = !desc.DepthStencilState.DepthEnable ? 0
+            : func == D3D12_COMPARISON_FUNC_GREATER || func == D3D12_COMPARISON_FUNC_GREATER_EQUAL ? 1
+            : func == D3D12_COMPARISON_FUNC_LESS || func == D3D12_COMPARISON_FUNC_LESS_EQUAL ? 2 : 0;
+        if (direction && depth_direction.exchange(direction) != direction) log("depth direction %s (display depth test %u)", direction == 1 ? "reversed" : "standard", unsigned(func));
         log("display_pipeline pso=%p root=%p targets=%u depth_format=%u vr=%d screen_t0=%d", pso, desc.pRootSignature, desc.NumRenderTargets,
             unsigned(desc.DSVFormat), vr, screen_t0);
         if (vr) LOG_ONCE("milestone VR cockpit display shader found");
@@ -1259,15 +1269,16 @@ bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances
 // ---------------------------------------------------------------------------------------------------------------
 // Composite after DLSS.
 bool create_composite(DeviceState& d) {
-    D3D12_DESCRIPTOR_RANGE ranges[3]{
+    D3D12_DESCRIPTOR_RANGE ranges[4]{
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, uav_base, 0, 0, 0},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, uav_base},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 6, 5, 0, uav_base + 4}}; // u4 is the root UAV (fit sums)
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 6, 5, 0, uav_base + 4}, // u4 is the root UAV (fit sums)
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, uav_base, 0, uav_base + 10}}; // t34: the upscaler's depth input
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = {0, 0, 22};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable = {3, ranges};
+    params[1].DescriptorTable = {4, ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[2].Descriptor = {4, 0};
     D3D12_STATIC_SAMPLER_DESC sampler{D3D12_FILTER_ANISOTROPIC, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -1401,7 +1412,20 @@ struct Upscale {
     unsigned render_w = 0, render_h = 0;
     float jitter_x = 0, jitter_y = 0;
     D3D12_RESOURCE_STATES colour_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ID3D12Resource* depth = nullptr; // render-resolution depth input (occlusion check)
+    D3D12_RESOURCE_STATES depth_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 };
+
+// Shader-readable format of a depth buffer.
+DXGI_FORMAT depth_srv_format(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_R32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
 void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept;
 
 DXGI_FORMAT typed(DXGI_FORMAT format) { return DXGI_FORMAT(api::format_to_default_typed(api::format(format))); }
@@ -1449,6 +1473,10 @@ void composite_dlss(ID3D12GraphicsCommandList* supplied, const NVSDK_NGX_Paramet
             render_w, render_h, o.Width, o.Height, unsigned(o.Format), unsigned(c.Format), jitter_x, jitter_y);
     }
     Upscale u{"DLSS", colour, output, render_w, render_h, jitter_x, jitter_y};
+    unsigned depth_base[2]{};
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &depth_base[0]);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &depth_base[1]);
+    if (!depth_base[0] && !depth_base[1]) u.depth = ngx_resource(*params, NVSDK_NGX_Parameter_Depth);
     composite(supplied, u);
 } catch (...) { ++stats.composite_skipped; }
 
@@ -1469,6 +1497,8 @@ void composite_fsr(const ffxDispatchDescUpscale& desc) noexcept try {
         desc.renderSize.width, desc.renderSize.height, desc.jitterOffset.x, desc.jitterOffset.y,
         d3d12_state(desc.color.state), d3d12_state(desc.output.state)};
     if (!u.colour || !u.output) { note(stats.composite_skipped, "fsr_inputs_missing"); return; }
+    u.depth = static_cast<ID3D12Resource*>(desc.depth.resource);
+    u.depth_state = d3d12_state(desc.depth.state);
     {
         const auto o = u.output->GetDesc(), c = u.colour->GetDesc();
         LOG_ONCE("milestone first FSR frame render=%ux%u output=%llux%u output_format=%u colour_format=%u jitter=%g,%g colour_state=0x%x output_state=0x%x",
@@ -2007,11 +2037,28 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     d.native->CreateUnorderedAccessView(map->glass_history.Get(), nullptr, &glass_view, at(uav_base + 8));
     glass_view.Format = DXGI_FORMAT_R16G16_UNORM;
     d.native->CreateUnorderedAccessView(map->glass_history_uv.Get(), nullptr, &glass_view, at(uav_base + 9));
+    // The upscaler's depth input for the occlusion check (a null view when the check is off or the input unusable: not at
+    // render size, multisampled, an array (VR), or a depth direction the display shader doesn't tell).
+    ID3D12Resource* depth = nullptr;
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth_view{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    depth_view.Texture2D.MipLevels = 1;
+    const int direction = depth_direction.load(std::memory_order_relaxed);
+    if (occlusion_check.load(std::memory_order_relaxed) && u.depth && map->layers == 1) {
+        const auto z = u.depth->GetDesc();
+        const DXGI_FORMAT format = depth_srv_format(z.Format);
+        const bool usable = direction && format != DXGI_FORMAT_UNKNOWN && z.Width == render_w && z.Height == render_h &&
+            z.DepthOrArraySize == 1 && z.SampleDesc.Count == 1;
+        if (usable) { depth = u.depth; depth_view.Format = format; }
+        static std::atomic<int> logged{0};
+        if (logged++ < 4) log("occlusion_check %s depth input %p %llux%u format=%u layers=%u samples=%u state=0x%x usable=%d direction=%d", u.name, u.depth,
+            z.Width, z.Height, unsigned(z.Format), unsigned(z.DepthOrArraySize), z.SampleDesc.Count, unsigned(u.depth_state), usable, direction);
+    }
+    d.native->CreateShaderResourceView(depth, &depth_view, at(uav_base + 10));
 
     struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp, angle_soften;
         UINT history_info, frame_index, bounds_reset, diag_index; float edge_trim; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
-        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u) | (temporal ? 64u : 0u) | (soft_smoothing ? 128u : 0u) | (stable_edges ? 256u : 0u) | (mip0_only ? 512u : 0u) | (calm_glass ? 4096u : 0u) | debug_flags.load(),
+        jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u) | (temporal ? 64u : 0u) | (soft_smoothing ? 128u : 0u) | (stable_edges ? 256u : 0u) | (mip0_only ? 512u : 0u) | (calm_glass ? 4096u : 0u) | (depth ? 16384u : 0u) | (direction == 1 ? 32768u : 0u) | debug_flags.load(),
         smoothing_percent / 50.0f, layer, glass_percent / 100.0f, edge_fade_percent / 100.0f,
         edge_stretch_percent / 100.0f, detail_clamp_percent / 100.0f,
         angle_soften_percent / 100.0f, history_info, frame_index, bounds_reset.exchange(0), d.diag_index, edge_trim_percent / 100.0f};
@@ -2030,6 +2077,8 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     const bool output_moved = u.output_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     if (colour_moved) transition(native, colour, u.colour_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (output_moved) transition(native, output, u.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const bool depth_moved = depth && !(u.depth_state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (depth_moved) transition(native, depth, u.depth_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     uav_barrier(native); // the upscaler just wrote the output
     // Screen capture: the sim's raw frame, the upscaler's output and the screen map, before the fix.
     CaptureFrame capture;
@@ -2168,6 +2217,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     }
     if (colour_moved) transition(native, colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, u.colour_state);
     if (output_moved) transition(native, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, u.output_state);
+    if (depth_moved) transition(native, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, u.depth_state);
     // Callers of NGX evaluate and ffxDispatch restore their own heaps, root signature and pipeline afterwards.
     last_render_w = render_w; last_render_h = render_h; last_out_w = out_w; last_out_h = out_h;
     last_composite_present = present_count.load(std::memory_order_relaxed);
@@ -2498,6 +2548,7 @@ void load_settings() {
     stable_edges = GetPrivateProfileIntW(L"experimental", L"stable_edges", 1, settings_path().c_str()) != 0;
     mip0_only = GetPrivateProfileIntW(L"experimental", L"full_size_sampling", 1, settings_path().c_str()) != 0;
     calm_glass = GetPrivateProfileIntW(L"experimental", L"calm_glass", 0, settings_path().c_str()) != 0;
+    occlusion_check = GetPrivateProfileIntW(L"experimental", L"occlusion_check", 0, settings_path().c_str()) != 0;
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
@@ -2522,6 +2573,7 @@ void save_settings() {
     WritePrivateProfileStringW(L"experimental", L"stable_edges", std::to_wstring(stable_edges.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"full_size_sampling", mip0_only.load() ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"calm_glass", std::to_wstring(calm_glass.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"occlusion_check", std::to_wstring(occlusion_check.load()).c_str(), settings_path().c_str());
 }
 
 // One measurement window every 10 s: 120 frames, reported ~30 frames later (the GPU has finished them by then).
@@ -2710,7 +2762,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing, stable_edges, int(mip0_only.load()), calm_glass, edge_trim_percent}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
+    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing, stable_edges, int(mip0_only.load()), calm_glass, edge_trim_percent, occlusion_check}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
@@ -2762,9 +2814,10 @@ void set_experimental(const Experimental& e) {
     stable_edges = e.stable_edges ? 1 : 0;
     mip0_only = e.full_size != 0;
     calm_glass = e.calm_glass ? 1 : 0;
+    occlusion_check = e.occlusion_check ? 1 : 0;
     save_settings();
-    log("setting seam_fix=%d full_size_sampling=%d stable_edges=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d", seam_fix.load(), int(mip0_only.load()), stable_edges.load(),
-        dark_screen_fix.load(), detail_clamp_percent.load(), edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load());
+    log("setting seam_fix=%d full_size_sampling=%d stable_edges=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d", seam_fix.load(), int(mip0_only.load()), stable_edges.load(),
+        dark_screen_fix.load(), detail_clamp_percent.load(), edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
 }
 void set_glass_strength(int percent) { glass_percent = std::clamp(percent, 0, 100); save_settings(); log("setting glass_strength=%d", glass_percent.load()); }
 }
@@ -2844,9 +2897,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     log("Glass Cockpit DLSS Fix %s (built " __DATE__ " " __TIME__ ")", overlay_version);
     log("windows %lu.%lu.%lu  game=%ls", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, executable);
     log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
-    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d",
+    log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d",
         module, fixture, enabled.load(), jitter_positive.load(), smoothing_percent.load(), int(extra_smoothing.load()), glass_percent.load(), detail_clamp_percent.load(),
-        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), dark_screen_fix.load(), seam_fix.load(), int(mip0_only.load()), stable_edges.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load());
+        edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), dark_screen_fix.load(), seam_fix.load(), int(mip0_only.load()), stable_edges.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
     log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint");
     scan_modules();
     std::thread(worker).detach();
@@ -2864,6 +2917,7 @@ extern "C" __declspec(dllexport) void GlassFixGlassStrength(int percent) { glass
 extern "C" __declspec(dllexport) void GlassFixStableEdges(int on) { stable_edges = on ? 1 : 0; }
 extern "C" __declspec(dllexport) void GlassFixCalmGlass(int on) { calm_glass = on ? 1 : 0; }
 extern "C" __declspec(dllexport) void GlassFixEdgeTrim(int hundredths) { edge_trim_percent = std::clamp(hundredths, 0, max_edge_trim); }
+extern "C" __declspec(dllexport) void GlassFixOcclusionCheck(int on) { occlusion_check = on ? 1 : 0; }
 extern "C" __declspec(dllexport) void GlassFixFullSize(int on) { mip0_only = on != 0; }
 extern "C" __declspec(dllexport) void GlassFixDebugFlags(uint32_t bits) { debug_flags = bits; }
 // Offline test host: one call per frame stands in for the present event (cost window of 4 frames, reported 2 later).

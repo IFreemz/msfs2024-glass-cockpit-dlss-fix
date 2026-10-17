@@ -78,7 +78,7 @@ constexpr UINT render_w = 1280, render_h = 720, output_w = 1920, output_h = 1080
 const std::array<float, 3> gain{1.6f, 1.2f, 0.9f}, offset{0.02f, 0.01f, 0.03f};
 
 struct Params final : NVSDK_NGX_Parameter {
-    ID3D12Resource *colour = nullptr, *output = nullptr;
+    ID3D12Resource *colour = nullptr, *output = nullptr, *depth = nullptr;
     float jitter_x = 0, jitter_y = 0;
     void Set(const char*, unsigned long long) override {}
     void Set(const char*, float) override {}
@@ -105,7 +105,8 @@ struct Params final : NVSDK_NGX_Parameter {
         return NVSDK_NGX_Result_Success;
     }
     NVSDK_NGX_Result Get(const char* key, ID3D12Resource** value) const override {
-        *value = !std::strcmp(key, NVSDK_NGX_Parameter_Color) ? colour : !std::strcmp(key, NVSDK_NGX_Parameter_Output) ? output : nullptr;
+        *value = !std::strcmp(key, NVSDK_NGX_Parameter_Color) ? colour : !std::strcmp(key, NVSDK_NGX_Parameter_Output) ? output
+            : !std::strcmp(key, NVSDK_NGX_Parameter_Depth) ? depth : nullptr;
         return *value ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_FAIL_InvalidParameter;
     }
     NVSDK_NGX_Result Get(const char* key, void** value) const override {
@@ -592,7 +593,7 @@ int main(int argc, char** argv) {
         auto eye_colour = vr ? texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST) : nullptr;
         auto final_views = vr ? texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, UINT16(views)) : nullptr;
         D3D12_CLEAR_VALUE depth_clear{DXGI_FORMAT_D32_FLOAT}; depth_clear.DepthStencil.Depth = 1;
-        auto depth = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &stencil_clear, UINT16(views));
+        auto depth = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear, UINT16(views));
         const float magenta[4]{1, 0, 1, 1};
         D3D12_CLEAR_VALUE magenta_clear{DXGI_FORMAT_R11G11B10_FLOAT, {1, 0, 1, 1}};
         auto output = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R11G11B10_FLOAT,
@@ -620,7 +621,10 @@ int main(int argc, char** argv) {
             D3D12_DEPTH_STENCIL_VIEW_DESC layered{DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2DARRAY};
             layered.Texture2DArray = {0, 0, views};
             device->CreateDepthStencilView(depth.Get(), &layered, dsv(0));
-        } else device->CreateDepthStencilView(depth.Get(), nullptr, dsv(0));
+        } else {
+            D3D12_DEPTH_STENCIL_VIEW_DESC plain{DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2D};
+            device->CreateDepthStencilView(depth.Get(), &plain, dsv(0));
+        }
         device->CreateDepthStencilView(ref_depth.Get(), nullptr, dsv(1));
 
         auto bind = [&](ID3D12PipelineState* pso, int variant) {
@@ -752,6 +756,11 @@ int main(int argc, char** argv) {
             };
             float dlss_shift[2]{};
             bool dlss_magenta = false; // trim test: the fake DLSS output is magenta (shows which pixels the fix left alone)
+            // Occlusion test: something in front of the screen (a sidestick), drawn after it into colour and depth (render
+            // pixels; the same spot at output size is in the ideal picture). The upscaler gets the depth buffer.
+            D3D12_RECT occluder{};
+            const float occluder_colour[4]{0.2f, 0.12f, 0.05f, 1};
+            ngx.depth = depth.Get();
             auto run = [&](const Image& ideal, float jx, float jy) {
                 list->ClearRenderTargetView(rtv(0), black.Color, 0, nullptr);
                 list->ClearDepthStencilView(dsv(0), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
@@ -760,7 +769,12 @@ int main(int argc, char** argv) {
                 list->RSSetViewports(1, &vp); list->RSSetScissorRects(1, &sc);
                 auto r0 = rtv(0), d0 = dsv(0); list->OMSetRenderTargets(1, &r0, FALSE, &d0);
                 draw_display();
+                if (occluder.right > occluder.left) {
+                    list->ClearDepthStencilView(dsv(0), D3D12_CLEAR_FLAG_DEPTH, 0, 0, 1, &occluder);
+                    list->ClearRenderTargetView(rtv(0), occluder_colour, 1, &occluder);
+                }
                 transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 submit();
                 // The fake DLSS output: the ideal picture (no ghost); the fix redraws the screen over it.
                 for (size_t i = 0; i < prefill.size(); ++i) prefill[i] = encode_r11g11b10(dlss_magenta ? std::array<float, 3>{1, 0, 1} : std::array<float, 3>{ideal[i][0], ideal[i][1], ideal[i][2]});
@@ -793,6 +807,7 @@ int main(int argc, char** argv) {
                 copy(list.Get(), output.Get(), out_rb);
                 transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
                 submit();
                 Image result(size_t(output_w) * output_h);
                 void* mapped = nullptr; check(out_rb.buffer->Map(0, nullptr, &mapped));
@@ -808,7 +823,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < image.size(); ++i) { for (int k = 0; k < 3; ++k) png[i * 4 + k] = BYTE(std::clamp(image[i][k], 0.0f, 1.0f) * 255); png[i * 4 + 3] = 255; }
                 save_png(here / ("motion-" + name + ".png"), output_w, output_h, output_w * 4, png.data());
             };
-            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; };
+            struct Mode { const char* name; int smoothing, temporal; float speed = 0.0007f; int gaussian = 0; int stable = 1; int glass = 0; uint32_t debug = 0; int full_size = 1; bool join = false; bool sun = false; int calm = 1; bool band = false; float scale = 1; bool inset = false; bool atlas = false; bool swap = false; int trim = 0; bool occluder = false; int occlusion = 0; };
             const Mode modes[]{{"still-glass", 35, 0, 0, 0, 1, 100}, {"still-glass-smooth", 35, 0, 0, 0, 1, 100, 2048}, {"still-glass-fullsize-off", 35, 0, 0, 0, 1, 100, 0, 0},
                 {"glass", 35, 0, 0.0007f, 0, 1, 100}, {"still-no-glass", 35, 0, 0, 0, 1, 0},
                 {"still-edges-off", 35, 0, 0, 0, 0}, {"still-edges-on", 35, 0, 0, 0, 1}, {"edges-off", 35, 0, 0.0007f, 0, 0}, {"edges-on", 35, 0, 0.0007f, 0, 1},
@@ -850,7 +865,15 @@ int main(int argc, char** argv) {
                 {"still-trim-0-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0},
                 {"still-trim-0-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0},
                 {"still-trim-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 200},
-                {"still-trim-join", 35, 0, 0, 0, 1, 0, 0, 1, true, false, 0, false, 1, false, false, false, 200}};
+                {"still-trim-join", 35, 0, 0, 0, 1, 0, 0, 1, true, false, 0, false, 1, false, false, false, 200},
+                // Something in front of the screen (A380 sidestick over the EFB): "occluder" = error on it (the fix must leave
+                // it alone). "-check-off" shows the problem without the occlusion check.
+                {"still-occluder-check-off", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, true, 0},
+                {"still-occluder", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, true, 1},
+                {"occluder", 35, 0, 0.0007f, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, true, 1},
+                {"still-occluder-edges-off", 35, 0, 0, 0, 0, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, true, 1},
+                {"still-occluder-trim", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 200, true, 1},
+                {"still-occluder-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true, false, 0, true, 1}};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
@@ -865,7 +888,10 @@ int main(int argc, char** argv) {
             const auto set_debug = reinterpret_cast<void (*)(uint32_t)>(GetProcAddress(addon, "GlassFixDebugFlags"));
             const auto set_calm = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixCalmGlass"));
             const auto set_trim = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixEdgeTrim"));
-            require(set_glass && set_full_size && set_debug && set_calm && set_trim, "exports missing");
+            const auto set_occlusion = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixOcclusionCheck"));
+            require(set_glass && set_full_size && set_debug && set_calm && set_trim && set_occlusion, "exports missing");
+            bool occlusion_everywhere = false; // --occlusion: the check on in every mode (it must change nothing without an occluder)
+            for (int i = 1; i < argc; ++i) if (!std::strcmp(argv[i], "--occlusion")) occlusion_everywhere = true;
             Sleep(1500); // let the background PSO compile finish
             const char* only = nullptr; // --only <text>: just the modes whose name contains it
             for (int i = 1; i + 1 < argc; ++i) if (!std::strcmp(argv[i], "--only")) only = argv[i + 1];
@@ -880,7 +906,10 @@ int main(int argc, char** argv) {
                 set_debug(m.debug);
                 set_calm(m.calm);
                 set_trim(m.trim);
-                dlss_magenta = std::strstr(m.name, "trim") != nullptr;
+                set_occlusion(m.occlusion || occlusion_everywhere);
+                occluder = {};
+                double occluder_error = 0; uint64_t occluder_n = 0;
+                dlss_magenta = std::strstr(m.name, "trim") != nullptr && !m.occluder;
                 set_full_size(m.full_size);
                 set_temporal(0);
                 join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas;
@@ -918,7 +947,20 @@ int main(int argc, char** argv) {
                         material[4] = {0.25f, 0.3f, 0.15f, 0.8f}; material[5] = {0, 0, 0.06f, 0.55f};
                         upload(materials[0].Get(), material.data(), sizeof(material));
                     }
-                    const auto ideal = truth();
+                    auto ideal = truth();
+                    if (m.occluder) {
+                        if (t == 0) {
+                            // A bar over the middle third of the screen, 40 render pixels wide.
+                            UINT x0 = output_w, y0 = output_h, x1 = 0, y1 = 0;
+                            for (UINT y = 0; y < output_h; ++y) for (UINT x = 0; x < output_w; ++x)
+                                if (ideal[size_t(y) * output_w + x][3] >= 0.999f) { x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y); }
+                            const LONG cx = LONG((x0 + x1) / 3), cy0 = LONG(y0 + (y1 - y0) / 3), cy1 = LONG(y1 - (y1 - y0) / 6);
+                            occluder = {cx - 20, cy0 * 2 / 3, cx + 20, cy1 * 2 / 3};
+                        }
+                        for (UINT y = 0; y < output_h; ++y) for (UINT x = 0; x < output_w; ++x)
+                            if ((x + 0.5f) / 1.5f >= occluder.left && (x + 0.5f) / 1.5f < occluder.right && (y + 0.5f) / 1.5f >= occluder.top && (y + 0.5f) / 1.5f < occluder.bottom)
+                                ideal[size_t(y) * output_w + x] = {occluder_colour[0], occluder_colour[1], occluder_colour[2], 0};
+                    }
                     if (m.sun) {
                         material[4] = {0.25f + 0.004f * std::sin(t * 2.1f), 0.3f, 0.15f, 0.8f * (1 + 0.08f * std::sin(t * 2.9f))};
                         material[5] = {0, 0, 0.06f, 0.55f + 0.0015f * std::sin(t * 1.7f)};
@@ -942,6 +984,13 @@ int main(int argc, char** argv) {
                             for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) clip[j] += p[k] * c.global[k][j];
                             ends[e][0] = (clip[0] / clip[3] + 1) * 0.5f * output_w;
                             ends[e][1] = (1 - clip[1] / clip[3]) * 0.5f * output_h;
+                        }
+                    if (m.occluder && t >= measure_from && t < change_at)
+                        // Inside the occluder, 3 output pixels in from its edge (the jitter moves the fix's view of it).
+                        for (LONG y = occluder.top * 3 / 2 + 3; y < occluder.bottom * 3 / 2 - 3; ++y) for (LONG x = occluder.left * 3 / 2 + 3; x < occluder.right * 3 / 2 - 3; ++x) {
+                            const size_t i = size_t(y) * output_w + x;
+                            for (int k = 0; k < 3; ++k) occluder_error += std::abs(double(out[i][k]) - occluder_colour[k]) / 3;
+                            ++occluder_n;
                         }
                     const float jx_ = ends[1][0] - ends[0][0], jy_ = ends[1][1] - ends[0][1], jlen = std::sqrt(jx_ * jx_ + jy_ * jy_);
                     if (dlss_magenta && t == measure_from) {
@@ -1021,6 +1070,7 @@ int main(int argc, char** argv) {
                     material[2] = {gain[0], gain[1], gain[2], 0};
                     upload(materials[0].Get(), material.data(), sizeof(material));
                 }
+                if (m.occluder) std::printf(" occluder_error=%.4f", occluder_error / std::max<uint64_t>(occluder_n, 1));
                 if (dlss_magenta) std::printf(" trim_flicker=%.4f trimmed=%.3f", trim_flicker / std::max<uint64_t>(trim_flicker_n, 1), trimmed / std::max<uint64_t>(trim_n, 1));
                 if (m.join || m.band) std::printf(" %s_error=%.4f %s_flicker=%.4f", m.band ? "band" : "join", join_error / std::max<uint64_t>(join_n, 1), m.band ? "band" : "join", join_flicker / std::max<uint64_t>(join_flicker_n, 1));
                 std::printf("\n");

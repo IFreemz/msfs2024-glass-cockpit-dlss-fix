@@ -35,10 +35,13 @@ using NgxEvaluateC = NVSDK_NGX_Result (*)(ID3D12GraphicsCommandList*, const NVSD
 
 #define NVSDK_NGX_Parameter_Color "Color"
 #define NVSDK_NGX_Parameter_Output "Output"
+#define NVSDK_NGX_Parameter_Depth "Depth"
 #define NVSDK_NGX_Parameter_Jitter_Offset_X "Jitter.Offset.X"
 #define NVSDK_NGX_Parameter_Jitter_Offset_Y "Jitter.Offset.Y"
 #define NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X "DLSS.Input.Color.Subrect.Base.X"
 #define NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y "DLSS.Input.Color.Subrect.Base.Y"
+#define NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X "DLSS.Input.Depth.Subrect.Base.X"
+#define NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y "DLSS.Input.Depth.Subrect.Base.Y"
 #define NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X "DLSS.Output.Subrect.Base.X"
 #define NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y "DLSS.Output.Subrect.Base.Y"
 #define NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width "DLSS.Render.Subrect.Dimensions.Width"
