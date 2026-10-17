@@ -38,6 +38,10 @@ float4 main(CockpitVertex input) : SV_Target0
     return float4(screen_texture.SampleLevel(base_sampler, input.uv.xy, 0).rgb, 1);
 #endif
 #else
-    return float4(input.uv.xy, input.position.z, DISPLAY_SLOT + 1);
+    // Texture coordinates whole periods away from the texture (the iFly 737's captain EFB: v = -2..-1.25, drawn by the
+    // sim's repeating sampler) are brought back into it; slightly past an edge stays as it is (clamped like before).
+    float2 uv = input.uv.xy;
+    uv = select(or(uv < -0.05, uv > 1.05), uv - floor(uv), uv);
+    return float4(uv, input.position.z, DISPLAY_SLOT + 1);
 #endif
 }
