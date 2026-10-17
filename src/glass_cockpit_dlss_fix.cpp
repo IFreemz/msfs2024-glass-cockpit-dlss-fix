@@ -1385,11 +1385,21 @@ void pixel_probe(api::command_list* list, ListState& state, const glass::Draw& d
                 std::shared_lock lock(textures_mutex);
                 if (const auto found = signatures.find(sig); found != signatures.end()) resource = found->second.resource;
             }
-            if (!resource) continue;
+            char item[160];
+            if (!resource) {
+                // Any other 2D texture: what its view was made of (no resource pointer; usage bits: 0x10 render target,
+                // 0x80 unordered access, 0x8 shader resource).
+                ViewInfo info{};
+                bool described = false;
+                { std::lock_guard lock(diag_mutex); if (const auto d = diag_views.find(sig); d != diag_views.end()) { info = d->second; described = true; } }
+                if (!described) continue;
+                snprintf(item, sizeof(item), " t%u=other(%ux%u mips=%u fmt=%u usage=0x%x)", r.reg + k, info.width, info.height, unsigned(info.levels), info.format, info.usage);
+                p.textures += item;
+                continue;
+            }
             const auto d = resource->GetDesc();
             int slot = -1;
             for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() == resource) slot = int(i);
-            char item[128];
             snprintf(item, sizeof(item), " t%u=%p(%llux%u mips=%u fmt=%u slot=%d)", r.reg + k, resource, uint64_t(d.Width), d.Height, unsigned(d.MipLevels), unsigned(d.Format), slot);
             p.textures += item;
         }
@@ -1718,6 +1728,20 @@ struct CaptureFrame {
 };
 constexpr int capture_frame_count = 4, capture_spacing = 5; // 4 frames, every 5th fixed frame (~0.3 s)
 std::atomic<int> capture_countdown{0};
+// The capture waits (up to capture_wait_limit presents) until the draw-time colour shaders of every cockpit display
+// pipeline are compiled: they compile in the background, and the captured frames span only a third of a second.
+std::atomic<uint64_t> capture_wait_until{0};
+constexpr uint64_t capture_wait_limit = 300;
+bool colour_variants_ready() {
+    std::lock_guard lock(pipelines_mutex);
+    for (size_t i = 0; i < max_pipelines; ++i)
+        if (pipeline_keys[i].load() && pipeline_values[i] && !pipeline_values[i]->vr) {
+            if (pipeline_values[i]->colour_variant.load()) continue;
+            colour_variant(pipeline_values[i]); // requests it if not yet
+            return false;
+        }
+    return true;
+}
 // Frames sent to the monitor, consecutively from the request (frame generation's frames included).
 constexpr int capture_present_count = 8;
 std::atomic<int> capture_presents_left{0};
@@ -2286,7 +2310,15 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     // Screen capture: the sim's raw frame, the upscaler's output and the screen map, before the fix.
     CaptureFrame capture;
     // Every capture_spacing-th fixed frame while a capture is requested (the frames then span ~0.5 s of motion).
-    const bool capturing = capture_requested.load(std::memory_order_relaxed) > 0 && capture_countdown.fetch_sub(1) <= 0;
+    bool waiting = false;
+    if (const uint64_t until = capture_wait_until.load(std::memory_order_relaxed); until && capture_requested.load(std::memory_order_relaxed) > 0) {
+        if (colour_variants_ready() || present_count.load(std::memory_order_relaxed) >= until) {
+            if (capture_wait_until.exchange(0)) log("capture starting (draw-time colour shaders %s)", colour_variants_ready() ? "ready" : "not all ready: some screens missing in draw-input");
+            capture_countdown = 1; // this frame's screens were drawn before the shaders were ready
+        }
+        waiting = true;
+    }
+    const bool capturing = !waiting && capture_requested.load(std::memory_order_relaxed) > 0 && capture_countdown.fetch_sub(1) <= 0;
     if (capturing) capture_countdown = capture_spacing - 1;
     if (capturing) {
         capture = {{}, {}, u.name, render_w, render_h, out_w, out_h, layer, jitter_x, jitter_y, -1, false};
@@ -3034,7 +3066,8 @@ void request_capture() {
     capture_folder = addon_directory / name;
     capture_frames.clear();
     capture_message = "Capturing... (fly with the screens in view)";
-    capture_countdown = 3; // a few frames first: the draw-time colour shaders compile in the background
+    capture_countdown = 0;
+    capture_wait_until = present_count.load() + capture_wait_limit; // until the draw-time colour shaders are ready
     capture_presents_left = capture_present_count;
     capture_requested = capture_frame_count;
     log("capture requested: %ls", capture_folder.c_str());
