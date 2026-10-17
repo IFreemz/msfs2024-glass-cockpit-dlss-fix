@@ -44,4 +44,8 @@ try {
     if ($LASTEXITCODE) { throw "Offline frame generation repeat test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --fsr --vr --nested
     if ($LASTEXITCODE) { throw "Offline nested upscaler VR test failed ($LASTEXITCODE)" }
+    # The screen capture tool writes its pictures (and what the brightness match read); the capture folders it makes are removed.
+    & .\FlightSimulator2024.exe --motion --only still-edges-on --capture
+    if ($LASTEXITCODE) { throw "Offline screen capture test failed ($LASTEXITCODE)" }
+    Get-ChildItem -Filter 'glass-capture-*' | Remove-Item -Recurse -Force
 } finally { Pop-Location }

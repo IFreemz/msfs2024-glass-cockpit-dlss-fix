@@ -1100,6 +1100,37 @@ int main(int argc, char** argv) {
                 if (m.join || m.band) std::printf(" %s_error=%.4f %s_flicker=%.4f", m.band ? "band" : "join", join_error / std::max<uint64_t>(join_n, 1), m.band ? "band" : "join", join_flicker / std::max<uint64_t>(join_flicker_n, 1));
                 std::printf("\n");
             }
+            // --capture: the screen capture tool writes its pictures, including what the brightness match read.
+            bool capture_test = false;
+            for (int i = 1; i < argc; ++i) if (!std::strcmp(argv[i], "--capture")) capture_test = true;
+            if (capture_test) {
+                const auto capture = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixCaptureTest"));
+                require(capture != nullptr, "exports missing");
+                const auto started = std::filesystem::file_time_type::clock::now();
+                capture(1);
+                for (int t = 0; t < 40; ++t) {
+                    const auto c = constants(0, 1);
+                    upload(globals[0].Get(), c.global.data(), sizeof(c.global));
+                    run(truth(), jitters[t % 8][0], jitters[t % 8][1]);
+                    capture(0);
+                }
+                std::filesystem::path folder;
+                for (int wait = 0; wait < 100 && folder.empty(); ++wait) {
+                    Sleep(100);
+                    for (const auto& entry : std::filesystem::directory_iterator(here))
+                        if (entry.is_directory() && entry.path().filename().wstring().rfind(L"glass-capture-", 0) == 0 && entry.last_write_time() >= started - std::chrono::seconds(2) &&
+                            std::filesystem::exists(entry.path().parent_path() / (entry.path().filename().wstring() + L".zip")))
+                            folder = entry.path();
+                }
+                require(!folder.empty(), "capture not written");
+                std::ifstream summary_file(folder / L"summary.txt");
+                const std::string summary((std::istreambuf_iterator<char>(summary_file)), std::istreambuf_iterator<char>());
+                const bool fit_saved = summary.find("fit-input: ") != std::string::npos && summary.find("fit-input: 1280x720") != std::string::npos &&
+                    std::filesystem::exists(folder / L"frame0-fit-input.png");
+                const bool map_saved = summary.find("screen slot") != std::string::npos;
+                std::printf("capture %s: fit_input=%s map_screens=%s\n", folder.filename().string().c_str(), fit_saved ? "saved" : "MISSING", map_saved ? "yes" : "NO");
+                require(fit_saved && map_saved, "capture incomplete");
+            }
             set_temporal(0); set_smooth(0);
             return 0;
         }

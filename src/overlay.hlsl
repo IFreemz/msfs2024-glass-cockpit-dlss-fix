@@ -21,7 +21,8 @@ cbuffer Constants : register(b0)
     uint flags;              // bit 0: reset smoothing, bit 1: debug green tint, bit 2: DLSS output readable (typed UAV load),
                              // bit 3: smooth lines, bit 4: dark screen fix, bit 5: UV seam fix, bit 6: temporal anti-aliasing,
                              // bit 7: soft-edged line smoothing, bit 8: stable screen edges, bit 9: full-size sampling,
-                             // bit 14: occlusion check (depth input bound), bit 15: reversed depth (closer = larger)
+                             // bit 14: occlusion check (depth input bound), bit 15: reversed depth (closer = larger),
+                             // bit 16: screen capture (fit_input written)
     float line_width;        // smooth lines: footprint scale, percent / 50 (1 = DLSS-like, the 50 % maximum)
     uint layer;              // map layer of this upscaler call (VR: one layer per view, in call order)
     float glass_strength;    // share of the glass layer (dirt, glare, reflections, shadows) kept, 0..1 (Advanced setting)
@@ -59,6 +60,8 @@ RWByteAddressBuffer edge_bounds : register(u8);
 // and shadow edges a little differently every frame; DLSS averages that out, a single frame's glass layer flickers.
 RWTexture2DArray<float4> glass_history : register(u9);
 RWTexture2DArray<float2> glass_history_uv : register(u10); // where on its screen texture that render pixel was then
+// Screen capture only: per render pixel the screen texture as the brightness match reads it (rgb), w = slot + 1.
+RWTexture2D<float4> fit_input : register(u11);
 SamplerState display_sampler : register(s0);
 
 static const uint slot_count = 32;
@@ -315,6 +318,7 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     // Per-pixel remainder against last frame's gain (glass layer: dirt, glare, reflections, shadows).
     float4 gain = active ? params[slot * 3] : 0;
     if (all(p < int2(map_size))) residual[p] = active && gain.w > 0 ? float4(y - gain.rgb * x, slot + 1 + (outline ? 64 : 0)) : 0;
+    if ((flags & 65536) && all(p < int2(map_size))) fit_input[p] = active ? float4(x, slot + 1) : 0;
     if (index == 0 && all(group.xy < (map_size + 7) / 8)) tiles[group.xy] = tile_slot < slot_count ? tile_slot + 1 : 0;
     // Diagnostics: screen pixels in the map at this call (the GPU's view: were this frame's screens drawn before it?).
     uint screen_pixels = WaveActiveCountBits(slot < slot_count && all(p < int2(map_size)));

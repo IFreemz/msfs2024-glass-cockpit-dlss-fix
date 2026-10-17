@@ -82,7 +82,7 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
 // ring_size: descriptor sets in flight, one per upscaler call. With DLSS Frame Generation the sim calls the upscaler up to
 // three times per frame, and the GPU can be several frames behind the CPU (more so with the game in the background): a set
 // must not be rewritten while the GPU may still read it.
-constexpr unsigned slot_count = 32, ring_size = 32, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 11; // + depth (t34)
+constexpr unsigned slot_count = 32, ring_size = 32, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 12; // + depth (t34), capture (u11)
 constexpr unsigned bounds_cells = 64; // stable screen edges: cells per side of each screen texture's grid
 std::filesystem::path addon_directory;
 ID3D12Device* main_device = nullptr;
@@ -679,6 +679,7 @@ struct Map {
     std::atomic<uint64_t> largest_output{0}, largest_output_present{0};
     // Temporal anti-aliasing history (output size, two slices per view), made on first use. Under composite_mutex.
     ComPtr<ID3D12Resource> history, history_uv;
+    ComPtr<ID3D12Resource> fit_input; // screen capture: what the brightness match read per render pixel (made on first capture)
     std::vector<ComPtr<ID3D12Resource>> retired; // replaced history the GPU may still be reading
     UINT history_w = 0, history_h = 0;
     std::array<uint32_t, 8> history_parity{}, history_frames{};
@@ -1269,16 +1270,17 @@ bool on_draw_indexed(api::command_list* list, uint32_t count, uint32_t instances
 // ---------------------------------------------------------------------------------------------------------------
 // Composite after DLSS.
 bool create_composite(DeviceState& d) {
-    D3D12_DESCRIPTOR_RANGE ranges[4]{
+    D3D12_DESCRIPTOR_RANGE ranges[5]{
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, uav_base, 0, 0, 0},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, uav_base},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 6, 5, 0, uav_base + 4}, // u4 is the root UAV (fit sums)
-        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, uav_base, 0, uav_base + 10}}; // t34: the upscaler's depth input
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, uav_base, 0, uav_base + 10}, // t34: the upscaler's depth input
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 11, 0, uav_base + 11}}; // u11: screen capture (what the brightness match reads)
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = {0, 0, 22};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable = {4, ranges};
+    params[1].DescriptorTable = {5, ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[2].Descriptor = {4, 0};
     D3D12_STATIC_SAMPLER_DESC sampler{D3D12_FILTER_ANISOTROPIC, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -1791,7 +1793,7 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
                         box[0] = std::min(box[0], x); box[1] = std::min(box[1], y); box[2] = std::max(box[2], x); box[3] = std::max(box[3], y); ++box[4];
                     }
                 } else for (int i = 0; i < 3; ++i) {
-                    const float v = std::clamp(std::isfinite(c[i]) ? c[i] * scale : 0.0f, 0.0f, 1.0f);
+                    const float v = std::clamp(std::isfinite(c[i]) ? c[i] * (image.name == "fit-input" ? 1.0f : scale) : 0.0f, 0.0f, 1.0f);
                     out[i] = uint8_t(std::lround((v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1 / 2.4f) - 0.055f) * 255));
                 }
                 out[3] = 255;
@@ -2089,7 +2091,19 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         capture = {{}, {}, u.name, render_w, render_h, out_w, out_h, layer, jitter_x, jitter_y, -1, false};
         capture_copy(d.native, native, colour, 0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, in_format, "1-sim-raw-frame", capture);
         capture_copy(d.native, native, output, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out_format, "2-upscaler-output", capture);
-        capture_copy(d.native, native, map->texture.Get(), layer /* one mip: subresource = layer */, map_resting, glass::map_format, "map", capture);
+        if (!map->fit_input) {
+            D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, render_w, render_h, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0},
+                D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+            if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&map->fit_input))))
+                map->fit_input = nullptr;
+        }
+        constants.flags |= map->fit_input ? 65536u : 0u;
+        native->SetComputeRoot32BitConstants(0, 22, &constants, 0);
+    }
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC fit_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D};
+        d.native->CreateUnorderedAccessView(capturing ? map->fit_input.Get() : nullptr, nullptr, &fit_view, at(uav_base + 11));
     }
     const UINT timed = measuring.load(std::memory_order_relaxed) && d.timestamps && d.timed_calls < max_timed_calls ? ++d.timed_calls : 0;
     if (timed) native->EndQuery(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2);
@@ -2103,6 +2117,8 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, map_resting);
         if (stats.repeated_calls++ == 0) log("milestone repeated %s call for the same frame (frame generation): the fix is drawn again on it", u.name);
     }
+    // The map as this call uses it (a repeated call's screens are only back after the copy above).
+    if (capturing) capture_copy(d.native, native, map->texture.Get(), layer /* one mip: subresource = layer */, map_resting, glass::map_format, "map", capture);
     if (!d.accumulators_zeroed) {
         native->SetPipelineState(d.passes[0].Get());
         native->Dispatch(1, 1, 1);
@@ -2202,6 +2218,8 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     }
     if (capturing) {
         capture_copy(d.native, native, output, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out_format, "3-after-fix", capture);
+        if (map->fit_input && render_w <= map->fit_input->GetDesc().Width && render_h <= map->fit_input->GetDesc().Height)
+            capture_copy(d.native, native, map->fit_input.Get(), 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, DXGI_FORMAT_R16G16B16A16_FLOAT, "fit-input", capture);
         // The colour match this frame used (the solve pass wrote it before the composite).
         D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
         D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slot_count * 3 * 16, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -2925,6 +2943,11 @@ extern "C" __declspec(dllexport) void GlassFixCostTick(ID3D12CommandQueue* queue
     static uint64_t frame = 0;
     cost_window = 4; cost_delay = 2; cost_spacing_ms = 0;
     measure_cost(queue, main_state, ++frame);
+}
+// Offline test host (no swapchain): 1 requests a screen capture (without presented frames), 0 stands in for a present.
+extern "C" __declspec(dllexport) void GlassFixCaptureTest(int request) {
+    if (request) { glass::request_capture(); capture_presents_left = 0; return; }
+    capture_flush(++present_count);
 }
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE) {
     enabled_before_unload = enabled.exchange(false);
