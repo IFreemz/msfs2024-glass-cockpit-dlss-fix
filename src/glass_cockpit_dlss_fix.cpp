@@ -1192,10 +1192,11 @@ void probe_screen_draw(api::command_list* list, const ListState& state, uint32_t
 } catch (...) {}
 
 // Screen probe (Ctrl+Shift+F12, 600 frames): draws with any other pipeline whose pixel shader reads a gauge-like texture
-// (GPU-written RGBA8 with mip maps, like every cockpit screen texture), to find screens drawn with another shader.
+// (GPU-written RGBA8 with mip maps, like every cockpit screen texture), to find screens drawn with another shader. Every
+// pass, not just the 3D scene's (the iFly 737 draws its MCP, CDU and radio digits over their screens in a later one).
 std::atomic<uint64_t> screen_probe_until{0};
 void screen_probe(api::command_list* list, const ListState& state, uint32_t count, uint32_t instances) noexcept try {
-    if (!state.device || !state.layout || state.target_count != 7) return; // only the 3D scene pass (like the screens)
+    if (!state.device || !state.layout || !state.target_count) return;
     std::vector<DeviceState::SrvRange> ranges;
     {
         std::shared_lock lock(state.device->layouts_mutex);
@@ -1231,7 +1232,7 @@ void screen_probe(api::command_list* list, const ListState& state, uint32_t coun
             static std::set<std::pair<uint64_t, ID3D12Resource*>> logged;
             {
                 std::lock_guard lock(logged_mutex);
-                if (logged.size() >= 64 || !logged.insert({state.pso, resource}).second) continue;
+                if (logged.size() >= 256 || !logged.insert({state.pso, resource}).second) continue;
             }
             bool slot = false;
             for (const auto& s : slot_resources) slot |= s.load() == resource;
