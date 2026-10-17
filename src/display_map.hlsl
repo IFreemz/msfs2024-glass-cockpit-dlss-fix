@@ -3,7 +3,7 @@
 // -D VR=1 for the VR display pipeline (its vertex shader routes each view to its own layer of the map), and with
 // -D SCREEN_T0=1 for the display shader variant that reads its screen from t0 (iniBuilds A340 main screens).
 // -D COLOUR=1 (screen capture only): writes the screen texture's colour at the moment the sim draws it instead.
-// -D BRIGHTNESS=1 (standard display shader only): also records how bright the sim draws this mesh (see below).
+// -D BRIGHTNESS=1 (standard display shader, flat and VR): also records how bright the sim draws this mesh (see below).
 #include "cockpit_vertex.hlsli"
 
 cbuffer RenderState : register(b1) { float4 render_state; };

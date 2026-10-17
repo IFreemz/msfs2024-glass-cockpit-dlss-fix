@@ -282,7 +282,7 @@ struct DisplayPipeline {
     ComPtr<ID3D12Device> device;
     bool vr = false;
     bool screen_t0 = false; // screen texture in t0 (display_ps_t0)
-    bool brightness = false; // the standard display shader: its map variant records each mesh's brightness (b2)
+    bool brightness = false; // the standard display shader (flat or VR): its map variant records each mesh's brightness (b2)
     std::array<std::atomic<ID3D12PipelineState*>, slot_count> variants{};
     std::array<std::atomic<bool>, slot_count> requested{};
     std::atomic<ID3D12PipelineState*> colour_variant{}; // screen capture: writes the screen's colour at draw time
@@ -318,6 +318,14 @@ const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shader
     SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
 #undef SLOT
 }};
+const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shaders_vr_brightness{{
+#define SLOT(n) {map_ps_vr_b_##n, sizeof(map_ps_vr_b_##n)},
+    SLOT(0) SLOT(1) SLOT(2) SLOT(3) SLOT(4) SLOT(5) SLOT(6) SLOT(7)
+    SLOT(8) SLOT(9) SLOT(10) SLOT(11) SLOT(12) SLOT(13) SLOT(14) SLOT(15)
+    SLOT(16) SLOT(17) SLOT(18) SLOT(19) SLOT(20) SLOT(21) SLOT(22) SLOT(23)
+    SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
+#undef SLOT
+}};
 const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shaders_vr{{
 #define SLOT(n) {map_ps_vr_##n, sizeof(map_ps_vr_##n)},
     SLOT(0) SLOT(1) SLOT(2) SLOT(3) SLOT(4) SLOT(5) SLOT(6) SLOT(7)
@@ -346,7 +354,8 @@ const std::pair<const unsigned char*, size_t>& map_shader(bool vr, bool screen_t
     return vr ? (screen_t0 ? map_shaders_vr_t0[slot] : map_shaders_vr[slot]) : screen_t0 ? map_shaders_t0[slot] : map_shaders[slot];
 }
 const std::pair<const unsigned char*, size_t>& map_shader(const DisplayPipeline& pipeline, unsigned slot) {
-    return pipeline.brightness ? map_shaders_brightness[slot] : map_shader(pipeline.vr, pipeline.screen_t0, slot);
+    if (pipeline.brightness) return pipeline.vr ? map_shaders_vr_brightness[slot] : map_shaders_brightness[slot];
+    return map_shader(pipeline.vr, pipeline.screen_t0, slot);
 }
 
 // Variant PSOs are compiled on a worker thread; draws are skipped (not stalled) until theirs is ready.
@@ -372,7 +381,7 @@ void worker() {
             // The pipeline's root signature doesn't give the pixel shader the per-instance data (b2): the plain map
             // shader instead (one brightness per screen texture, as before).
             LOG_ONCE("display pipeline without per-mesh brightness (hr=0x%lx): plain screen map used", hr);
-            const auto& plain = map_shader(false, false, slot);
+            const auto& plain = map_shader(pipeline->vr, false, slot);
             if (glass::clone_pipeline(pipeline->desc, {plain.first, plain.second}, clone))
                 hr = pipeline->device->CreateGraphicsPipelineState(&clone, IID_PPV_ARGS(&created));
         }
@@ -428,7 +437,7 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     copy->device = device;
     copy->vr = vr;
     copy->screen_t0 = screen_t0;
-    copy->brightness = !vr && !screen_t0 && ps == display_ps;
+    copy->brightness = !screen_t0 && (vr ? ps == vr_display_ps : ps == display_ps);
     std::lock_guard lock(pipelines_mutex);
     for (size_t i = 0; i < max_pipelines; ++i) if (!pipeline_keys[i].load()) {
         pipeline_values[i] = copy;
@@ -707,6 +716,9 @@ struct Map {
     bool initialised = false;
     std::atomic<uint32_t> views{0}; // layers drawn this frame and not yet composited (upscaler calls come in view order)
     std::atomic<uint64_t> recorded_present{0}; // present count when screens were last recorded into the map
+    // Diagnostics (VR): upscaler calls since the last present, to tell each call's view apart without the views count.
+    std::atomic<uint64_t> call_present{UINT64_MAX};
+    std::atomic<uint32_t> calls_this_present{0};
     // Largest upscaler output seen for this render size, and when: another mod (e.g. RenoDX's DLSS add-on) can run an
     // extra DLSS pass at the same render size before the sim's own upscale; the fix belongs on the real (largest) one.
     std::atomic<uint64_t> largest_output{0}, largest_output_present{0};
@@ -2242,6 +2254,16 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         if (area >= largest) { map->largest_output = area; map->largest_output_present = now; }
     }
     uint32_t pending = map->views.load();
+    uint32_t call_in_present = 0;
+    if (map->layers > 1) {
+        // Diagnostics (VR): which view this call is, counted from the last present, next to what the views count says.
+        const uint64_t now = present_count.load(std::memory_order_relaxed);
+        if (map->call_present.exchange(now) != now) map->calls_this_present = 0;
+        call_in_present = map->calls_this_present++;
+        static std::atomic<int> logged{0};
+        if (logged++ < 400) log("vr_call present=%llu call_in_present=%u pending=%u layers=%u recorded=%llu output=%p", now, call_in_present, pending,
+            map->layers, map->recorded_present.load(), output);
+    }
     do {
         // The sim records frames on several threads: the next frame's screens can be recorded before this frame's
         // upscaler call, which then finds the count used up although its screens are in the map (the GPU runs them in

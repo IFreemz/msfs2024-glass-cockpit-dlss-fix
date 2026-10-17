@@ -42,7 +42,7 @@ VrOutput main(Input input, uint instance : SV_InstanceID)
     output.uv = input.uv;
     output.tangent_frame0 = input.tangent;
     output.tangent_frame2 = float4(input.normal, 0);
-    output.instance = instance;
+    output.instance = 0; // as the game's VR shader: the instance index, not the eye (the eye is EYE_ID)
     output.eye = instance;
     output.layer = REFERENCE ? 0 : instance;
 #if REFERENCE

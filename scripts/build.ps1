@@ -39,6 +39,9 @@ try {
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D VR=1 -WX -O3 -Fh "map_ps_vr_$slot.h" -Vn "map_ps_vr_$slot" (Join-Path $root 'src\display_map.hlsl')
         if ($LASTEXITCODE) { throw "VR map shader $slot failed" }
         $headers += "map_ps_vr_$slot.h"
+        & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D VR=1 -D BRIGHTNESS=1 -WX -O3 -Fh "map_ps_vr_b_$slot.h" -Vn "map_ps_vr_b_$slot" (Join-Path $root 'src\display_map.hlsl')
+        if ($LASTEXITCODE) { throw "VR brightness map shader $slot failed" }
+        $headers += "map_ps_vr_b_$slot.h"
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D SCREEN_T0=1 -WX -O3 -Fh "map_ps_t0_$slot.h" -Vn "map_ps_t0_$slot" (Join-Path $root 'src\display_map.hlsl')
         if ($LASTEXITCODE) { throw "Screen-t0 map shader $slot failed" }
         $headers += "map_ps_t0_$slot.h"
