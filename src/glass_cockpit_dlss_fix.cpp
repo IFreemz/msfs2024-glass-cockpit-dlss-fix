@@ -130,6 +130,7 @@ std::atomic<int> glass_percent{100};
 // Bumped when the overlay is switched on: lists recorded while it was off have stale binding state.
 std::atomic<uint32_t> generation{1};
 FILE* logfile = nullptr;
+std::filesystem::path log_file_path; // the log this session writes (glass-cockpit-dlss-fix.log, or a fallback name)
 std::mutex log_mutex;
 void log(const char* format, ...) {
     std::lock_guard lock(log_mutex);
@@ -2039,7 +2040,8 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
         if (file.is_regular_file(error)) entries.emplace_back(folder.filename().string() + "/" + file.path().filename().string(), file.path());
     std::sort(entries.begin(), entries.end());
     const auto logs = folder.parent_path();
-    entries.emplace_back("glass-cockpit-dlss-fix.log", logs / L"glass-cockpit-dlss-fix.log");
+    entries.emplace_back(log_file_path.empty() ? std::string("glass-cockpit-dlss-fix.log") : log_file_path.filename().string(),
+        log_file_path.empty() ? logs / L"glass-cockpit-dlss-fix.log" : log_file_path);
     entries.emplace_back("glass-cockpit-dlss-fix.old.log", logs / L"glass-cockpit-dlss-fix.old.log");
     auto zip = folder; zip += L".zip";
     const bool zipped = write_zip(zip, entries);
@@ -3028,7 +3030,7 @@ Status status() {
     for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() && now <= slot_last_used[i] + 30) ++s.screens;
     s.render_w = last_render_w; s.render_h = last_render_h; s.out_w = last_out_w; s.out_h = last_out_h;
     s.problem = problem;
-    s.log_path = (addon_directory / L"glass-cockpit-dlss-fix.log").wstring();
+    s.log_path = (log_file_path.empty() ? addon_directory / L"glass-cockpit-dlss-fix.log" : log_file_path).wstring();
     { std::lock_guard lock(capture_mutex); s.capture = capture_message; }
     return s;
 }
@@ -3162,7 +3164,17 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     // Keep the previous session's log: after a crash people usually relaunch before sending it.
     const auto log_path = addon_directory / L"glass-cockpit-dlss-fix.log";
     std::filesystem::rename(log_path, addon_directory / L"glass-cockpit-dlss-fix.old.log", error);
-    logfile = _wfsopen(log_path.c_str(), L"w", _SH_DENYWR);
+    // Not inherited (N): the sim starts helper processes (e.g. FenixBootstrapper) that would keep the log open after it
+    // quits, and the next session could not open it.
+    logfile = _wfsopen(log_path.c_str(), L"wN", _SH_DENYWR);
+    log_file_path = log_path;
+    if (!logfile) {
+        // Something still holds the log (e.g. the previous session's process hasn't quite exited): log under another
+        // name rather than not at all.
+        log_file_path = addon_directory / (L"glass-cockpit-dlss-fix-" + std::to_wstring(GetCurrentProcessId()) + L".log");
+        logfile = _wfsopen(log_file_path.c_str(), L"wN", _SH_DENYWR);
+        if (logfile) log("the usual log file could not be opened (another process holds it): logging here instead");
+    }
     // The offline test runs with default settings unless asked to read the .ini (GLASS_FIXTURE_SETTINGS=1).
     wchar_t fixture_settings[8]{};
     if (!fixture || (GetEnvironmentVariableW(L"GLASS_FIXTURE_SETTINGS", fixture_settings, 8) && fixture_settings[0] == L'1')) load_settings();
