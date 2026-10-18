@@ -255,6 +255,8 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
   `renodx-dlss.addon64` installed, the sim can freeze when a Fenix aircraft loads. This happens with this fix removed
   too, so it's between RenoDX and the Fenix; if you get it, remove `renodx-dlss.addon64` (OptiScaler or OptiShade also
   offer Neural Rendering).
+- **REX Atmos:** reported by a user: with Atmos' **Overall Light** at 0, fixed screens flickered in daylight (not at
+  night). Setting it back to the default (16) stopped the flicker.
 - **Extra DLSS passes:** if a mod or the sim runs a second DLSS pass at the internal resolution, the fix stays on the
   sim's real upscale (the one with the largest output).
 - **Standalone DLSS Glass Cockpit Refresh** ([wesimglide.org](https://wesimglide.org/otherdata/tools/Standalone-DLSS-Glass-Cockpit-Refresh.html)):
@@ -344,6 +346,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Screen edges flicker or shimmer, or show a sliver of something that isn't there | Set **Edge trim** to 50 (`edge_trim=50`; up to 150 for aircraft with stronger edge problems) |
 | The log is called `glass-cockpit-dlss-fix-<number>.log` | Normal after flying some aircraft (e.g. Fenix): a helper program kept the usual log file open. Send the newest numbered log |
 | Screen text shimmers when the camera is still | Turn on **Flip jitter direction** (`jitter_positive=0`). If it's already on (the tab or status file says "Advanced settings changed"), turn it off again (in the tab: **Reset to defaults**) |
+| Screens flicker in daylight with REX Atmos installed | Set Atmos' **Overall Light** back to its default (16); at 0 it caused flicker (user report) |
 | Screens flicker in brightness (G-Sync / FreeSync monitor) | VRR flicker from a changing frame rate, most visible on dark screens. Turn on V-Sync, or cap the frame rate a few fps below your refresh rate |
 | Crash at startup | Remove the add-on or `dxgi.dll`, start once, put it back, then send both logs. With the standalone version (early beta), please report any crash, and use the add-on in the meantime |
 | Standalone: Ctrl+Shift+F6 clashes with another mod's hotkey (e.g. a DLSS 5 add-on) | Click the hotkey in the settings window and press a new combination, or set `settings_window=` under `[hotkeys]` in the `.ini` (e.g. `Ctrl+Alt+G`) |
