@@ -20,8 +20,9 @@ This builds both versions from the same source:
 
 The fix itself (`src\glass_cockpit_dlss_fix.cpp`) is compiled once and linked into both; they differ only in how they
 get loaded (`src\host.hpp`): `src\reshade_addon.cpp` and the overlay tab in `src\status_panel.cpp` for the add-on,
-`src\dxgi_proxy.cpp` for the standalone version. In both, the fix follows the sim through its own hooks on the
-Direct3D 12 runtime.
+`src\dxgi_proxy.cpp` and the settings window in `src\settings_window.cpp` for the standalone version. In both, the fix
+follows the sim through its own hooks on the Direct3D 12 runtime. (The 1.0.0 add-on release was built from the v1.0.0
+tag, which still uses ReShade's add-on events.)
 
 ## Offline test
 
@@ -44,6 +45,7 @@ ReShade, which loads the add-on.
 powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -Version <version in src\version.h>
 ```
 
-This creates `dist\glass-cockpit-dlss-fix.addon64` and `dist\dxgi.dll`, the two files attached to the release. The
+This creates `dist\glass-cockpit-dlss-fix.addon64` and `dist\glass-cockpit-dlss-fix-standalone.zip` (`dxgi.dll` with
+its `README.txt`, `LICENSE` and `NOTICE.md`), the files attached to the release. The
 GitHub Actions workflow (`.github/workflows/build.yml`) builds the same files on every push and keeps them as a build
 artifact.

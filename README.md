@@ -6,10 +6,10 @@ on a monitor and in VR.
 
 It comes in two versions with the same fix inside; pick one:
 
-- **ReShade add-on** (`glass-cockpit-dlss-fix.addon64`): for ReShade users. Status and settings in a tab of the ReShade
-  menu.
-- **Standalone** (`dxgi.dll`): no ReShade needed, one file next to the sim. Status and settings in a small window of
-  its own (**Ctrl+Shift+F6**).
+- **ReShade add-on** (`glass-cockpit-dlss-fix.addon64`), **recommended for now**: the proven version. Status and
+  settings in a tab of the ReShade menu.
+- **Standalone** (`dxgi.dll`), **early beta**: no ReShade needed, one file next to the sim. Status and settings in a
+  small window of its own (**Ctrl+Shift+F6**, changeable).
 
 ![Fenix A320 PFD in DLSS Performance: 8 s of stock DLSS smearing the altitude readout, then 8 s with the fix](docs/comparison.webp)
 
@@ -21,7 +21,8 @@ cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headse
 
 > Unofficial community mod. Not affiliated with Microsoft, Asobo, NVIDIA, AMD or any aircraft developer.
 > Please report problems (see [Troubleshooting](#troubleshooting)). After 1.0.0, updates will be small hotfixes only
-> for a while. The standalone version is the newer of the two: reports on how it works for you are especially welcome.
+> for a while. The standalone version is new and still an early beta: if anything goes wrong with it, especially a
+> crash, please report it, and use the add-on in the meantime.
 
 **About this project:** Glass Cockpit DLSS Fix is developed by IFreemz. It was first released here on 11 October 2026
 (v0.6.0), and every version since has been published from this repository. Official downloads: the
@@ -82,17 +83,17 @@ fixes turns green-tinted. Press it again to turn the tint off.
 **Update:** replace the `.addon64` file with the new one. **Uninstall:** delete `glass-cockpit-dlss-fix.addon64`
 (and the `glass-cockpit-dlss-fix.*` files next to it).
 
-### Standalone (no ReShade)
+### Standalone (no ReShade, early beta)
 
-1. Download `dxgi.dll` from the [latest release](../../releases/latest).
-2. Copy it into the game folder.
+1. Download `glass-cockpit-dlss-fix-standalone.zip` from the [latest release](../../releases/latest) and unzip it.
+2. Copy `dxgi.dll` from it into the game folder.
 3. Start the sim with DLSS or FSR selected and load a flight.
 
 If Windows asks whether to replace an existing `dxgi.dll` there, **don't**: another mod (usually ReShade or
 OptiScaler) is already using that name. See [Other mods](#other-mods).
 
 To check that it's working, press **Ctrl+Shift+F6** in the sim: the settings window opens and says "Working: fixing N
-screens". Or press **Ctrl+Shift+F11** in the cockpit: every screen it fixes turns green-tinted. Press it again to turn
+screens" (the hotkey can be changed in the window). Or press **Ctrl+Shift+F11** in the cockpit: every screen it fixes turns green-tinted. Press it again to turn
 the tint off. The file `glass-cockpit-dlss-fix-status.txt` next to the DLL also shows a checklist.
 
 **Switching from the add-on?** Delete `glass-cockpit-dlss-fix.addon64`. If you used ReShade only for the fix,
@@ -107,36 +108,38 @@ files next to it.
 The add-on has all settings in its tab in the ReShade menu (**Home**). The standalone version has the same settings in a
 small window of its own: press **Ctrl+Shift+F6** in the sim to open or close it (or click its X; hover over an
 option to see what it does). It's a separate window rather than a menu drawn into the game, so it doesn't get in the
-way of ReShade, OptiScaler or OptiShade menus. Both versions keep the settings in `glass-cockpit-dlss-fix.ini` next to
+way of ReShade, OptiScaler or OptiShade menus, and it never takes the keyboard or mouse from the sim. If Ctrl+Shift+F6
+clashes with another mod's hotkey, click it in the window and press a new combination (saved as
+`[hotkeys] settings_window` in the `.ini`). Both versions keep the settings in `glass-cockpit-dlss-fix.ini` next to
 the add-on or DLL, which lists every setting (the tables below say what each one does); you can also edit it with
 Notepad while the sim runs: saved changes apply within a second.
 
-| Setting (ReShade tab / `.ini`) | What it does |
+| Setting (tab or window / `.ini`) | What it does |
 |---|---|
 | Fix enabled / `enabled` (Ctrl+Shift+F9) | Fix on/off, for comparison |
 | Line smoothing / `line_smoothing` (0-50 %, default 35 %) | Smooths stair steps on thin slanted lines in the screens, like the upscaler did. 0 = sharpest, 50 = softest. In the tab, Ctrl+click to type a value. Tick **Extra** next to it (`extra_smoothing=1`) to go up to 100 % (blurs the whole screen; for screens with very jagged lines) |
 | Green tint (Ctrl+Shift+F11) | Tints every screen the fix covers (for checking, not remembered) |
 
-Under **Troubleshooting → Advanced** in the tab, `[advanced]` and `jitter_positive` in the `.ini` (only change these if
+Under **Troubleshooting → Advanced** in the tab (the **Advanced** section of the standalone window), `[advanced]` and `jitter_positive` in the `.ini` (only change these if
 asked to in a bug report; "Reset to defaults" in the tab puts them back):
 
-| Setting (ReShade tab / `.ini`) | What it does |
+| Setting (tab or window / `.ini`) | What it does |
 |---|---|
 | Flip jitter direction / `jitter_positive=0` | Only needed if the screen text shimmers when the camera is still |
 | Glass layer / `glass_strength` (0-100 %, default 100 %) | How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens. Lower values can help if quickly changing numbers leave a milky trail |
 
-Under **Troubleshooting → Experimental fixes** in the tab, `[experimental]` in the `.ini` (**all off by default except
+Under **Troubleshooting → Experimental fixes** in the tab (**Experimental fixes** in the standalone window), `[experimental]` in the `.ini` (**all off by default except
 UV seam fix, Full-size sampling, Stable screen edges and Occlusion check**; for problems that only some aircraft have,
 "Reset experimental fixes" in the tab puts them all back to
 default):
 
-| Setting (ReShade tab / `.ini`) | What it does |
+| Setting (tab or window / `.ini`) | What it does |
 |---|---|
 | Full-size sampling / `full_size_sampling` (on) | Reads the screens only from their full-size picture, with more samples where a screen is small on your monitor. Off: also from the smaller copies the GPU keeps for distant screens, which can shimmer when you zoom out. **Ctrl+Shift+F7** switches it in the sim |
 | Stable screen edges / `stable_edges` (on) | Keeps the pixels along each screen's edge from shimmering: where a screen ends is learnt over a few frames instead of judged anew every frame. Turn it off if a screen's edge looks cut off or too wide |
 | Occlusion check / `occlusion_check` (on) | Leaves the sim's own picture wherever something sits in front of a screen (a sidestick, a hand, the yoke), using the sim's depth buffer. Off: a screen can be drawn over things in front of it, e.g. the A380 EFB over the sidestick |
 | Calm glass at symbols / `calm_glass` (off) | Right next to symbols and digits, draws the glass effects (dirt, glare, reflections) without their finest detail, which can shimmer there. On some screens it can add shimmer instead, so it's off by default |
-| Dark screen fix / `dark_screen_fix` (off) | Keeps very dark screens fixed in strong sunlight (e.g. the F/A-18E Super Hornet). Off by default since 0.8.3, because it can also let the fix draw over a screen whose picture it can't redraw |
+| Dark screen fix / `dark_screen_fix` (off) | Keeps very dark screens fixed in strong sunlight (e.g. the F/A-18E Super Hornet). Off by default because it can also let the fix draw over a screen whose picture it can't redraw |
 | UV seam fix / `seam_fix` (on) | Removes thin dashed lines where a screen's picture meets a part of the same screen that uses another area of its image (FSS E-Jets: the line between the picture and its bezel band), and keeps those edges smooth on low DLSS modes. If a screen edge looks worse with it on, turn it off and please report the aircraft |
 | Soft-edged line smoothing / `soft_smoothing` (off) | Line smoothing weighted towards each pixel's centre over a wider area: smoother screens with less shimmer while the view moves. Plain Line smoothing works well on most aircraft; this is an alternative if screens still shimmer while you move your head. A matter of taste; needs Line smoothing above 0 |
 | Temporal anti-aliasing / `temporal_aa` (off) | Smooths screen text and lines over several frames, like the sim's own TAA, without the trails (the history is dropped wherever a screen's picture changes). Plain Line smoothing works well on most aircraft; this is an alternative if you want sharper text that still doesn't stair-step, with Line smoothing at 0-20. Uses about 100 MB more video memory at 4K. Not together with Soft-edged line smoothing |
@@ -148,8 +151,6 @@ default):
 
 The tab and the status file say "Experimental fixes changed" while any of them is on.
 
-ReShade presets and effects keep working as usual on top of the fix.
-
 ## Before you report a problem: what to try
 
 Most visual problems on a particular aircraft can be fixed with a setting. Please try the ones below before opening an
@@ -157,20 +158,14 @@ issue: it's quicker for you, and if none of them helps, your report tells me exa
 
 ### How to try a setting
 
-1. In the cockpit, open the ReShade menu (**Home** key) and go to the **Glass Cockpit DLSS Fix** tab.
-2. Open **Troubleshooting → Experimental fixes** (or **Advanced**). Hover over any option to see what it does.
+1. In the cockpit, open the ReShade menu (**Home** key) and go to the **Glass Cockpit DLSS Fix** tab, or with the
+   standalone version press **Ctrl+Shift+F6** for its settings window.
+2. Open **Experimental fixes** (or **Advanced**). Hover over any option to see what it does.
 3. Change one thing at a time and look at the problem screen for a few seconds. Changes take effect immediately and
    are remembered between sessions.
 4. To compare with stock DLSS/FSR, toggle the whole fix with **Ctrl+Shift+F9**. **Ctrl+Shift+F11** tints every screen
    the fix covers green, so you can see which screens it handles.
 5. Made it worse? **Reset experimental fixes** (or **Reset to defaults** under Advanced) puts everything back.
-
-With the standalone version, change the same settings in `glass-cockpit-dlss-fix.ini` (their names are in the
-[Settings](#settings) tables) with Notepad while the sim runs: saved changes apply within a second. To put everything
-back, delete the `.ini`; the next start writes a fresh one.
-
-The tab and the status file show "Experimental fixes changed" while any of them differs from the default, so you can
-always see that something was changed.
 
 ### Which setting for which problem
 
@@ -192,52 +187,6 @@ always see that something was changed.
 
 If a screen is never fixed at all (no green tint), settings won't help: see [What to send with a bug report](#what-to-send-with-a-bug-report).
 
-### The options in detail
-
-**Edge trim** (0-400, off by default). Leaves a thin band at the outer edge of every screen to the sim's own picture.
-The fix redraws each screen exactly up to where it ends; on some aircraft that edge moves a little with the camera
-jitter every frame and flickers, or shows a sliver of the frame next to it. Edge trim hands that band back to DLSS/FSR,
-which draws it smoothly. **50 calms most flickering or shimmering edges**; go up to 150 for aircraft with stronger
-edge problems. The values are hundredths of a render pixel (100 = one pixel at the sim's internal resolution). Side
-effect: within that band, DLSS/FSR's trails come back, so keep it as low as works.
-
-**Stable screen edges** (on by default). Learns over a few frames where each screen ends, instead of judging it anew
-every frame, so the pixels along the edges don't shimmer. Untick it if a screen's edge looks cut off or a little too
-wide.
-
-**Occlusion check** (on by default). Uses the sim's depth buffer to find anything sitting in front of a screen (a
-sidestick, a yoke, your hands in VR, an EFB arm) and leaves those pixels to the sim's own picture, so the fix never
-draws a screen over them. If something in front of a screen still gets painted over, please report it with a capture.
-
-**Full-size sampling** (on by default, Ctrl+Shift+F7 to toggle). Reads the screen pictures only at full size, with
-more samples where a screen is small on your monitor. Off, the fix also uses the smaller copies the GPU keeps for
-distant screens, like the sim does, which can shimmer when you zoom out or lean back.
-
-**Calm glass at symbols** (off by default). Right next to digits, symbols and lines, the glass effects (dirt, glare,
-reflections) are drawn without their finest detail. That detail comes from the upscaler's picture and can shimmer
-along the edges of symbols, especially in sun glare. Try it if digits sparkle or shimmer while the rest of the screen
-is fine. Side effect: on some screens it can add shimmer instead, and something drawn over a screen (a highlight, a
-cursor) can look a little softer; untick it again if so.
-
-Plain **Line smoothing** (on the main tab) works well on most aircraft. The next two options are alternatives that
-solve slightly different problems; try them only if Line smoothing alone doesn't look right to you.
-
-**Soft-edged line smoothing** (off by default). A different flavour of Line smoothing: weighted towards each pixel's
-centre over a wider area. Try it if screens still shimmer while you move your head. Screens look smoother with less
-shimmer while the view moves, at the cost of slightly softer text. A matter of taste; it needs Line smoothing above 0.
-
-**Temporal anti-aliasing** (off by default). Smooths screen text and lines over several frames, like the sim's own TAA,
-but without the trails: the history is thrown away wherever a screen's picture changes. Try it with Line smoothing at
-0-20 if you want the sharpest text that still doesn't stair-step. Uses about 100 MB more video memory at 4K. It and
-Soft-edged line smoothing are alternatives: ticking one unticks the other.
-
-**Glass layer** (Advanced, 0-100 %, default 100 %). How much of the sim's glass effects (dirt, glare, reflections,
-shadows) is kept on fixed screens. 100 % looks the most like the sim; lower values give cleaner, flatter screens and
-can help if quickly changing numbers leave a milky trail or digits shimmer in the sun. At 0 % the screens are drawn
-with no glass effects at all.
-
-The older options (UV seam fix, Dark screen fix, Detail clamp, Edge fade, Angle softening, Edge stretcher, Flip jitter
-direction) are described in the [Settings](#settings) tables above.
 
 ## Compatibility
 
@@ -249,18 +198,18 @@ version gets into the sim differently, so please report how it works for you.
 | Aircraft | Status |
 |---|---|
 | Fenix A320 family | Tested |
-| iFly 737 MAX 8 | Tested (1.0.0 or newer covers every screen: CDUs, radio panels, transponder, ADF, MCP digits and both EFB tablets) |
+| iFly 737 MAX 8 | Tested (every screen: CDUs, radio panels, transponder, ADF, MCP digits and both EFB tablets) |
 | iniBuilds A220 | Tested |
 | iniBuilds A330 | Tested |
-| iniBuilds A340 | Tested (0.7.2 or newer; in VR 0.7.3 or newer) |
+| iniBuilds A340 | Tested |
 | iniBuilds A350 | Tested |
-| iniBuilds A380 | Tested (1.0.0 or newer: the EFB stays fixed when only part of it is in view, and screens are no longer drawn over the sidestick) |
+| iniBuilds A380 | Tested |
 | PMDG 737 | Tested by the community (also in VR) |
 | PMDG 777 | Tested by the community (also in VR) |
-| FlightFX C750 | Tested by the community (0.7.6 or newer) |
+| FlightFX C750 | Tested by the community |
 | Default DA62 | Tested |
 | Default Cessna Longitude | Tested by the community (in VR) |
-| FSS E-Jets (ERJ-170/175/190/195) | Tested (0.8.3 or newer removes the dashed line at the screens' edges) |
+| FSS E-Jets (ERJ-170/175/190/195) | Tested |
 | Default F/A-18E Super Hornet | Tested (if its dark screens drop out of the fix in strong sun, turn on Dark screen fix, see [Settings](#settings)) |
 
 Other glass cockpits should work too. If some screens of an aircraft don't turn green with Ctrl+Shift+F11, please
@@ -285,9 +234,9 @@ Other headsets and runtimes should work the same; reports welcome.
 |---|---|
 | NVIDIA RTX, DLSS Super Resolution | Tested, including DLSS Frame Generation up to 6x Multi Frame Generation |
 | NVIDIA, FSR | Tested |
-| AMD, FSR | Tested by the community on an RX 6800 XT and an RX 7800 XT (0.7.6 or newer runs much lighter on AMD and Intel) |
+| AMD, FSR | Tested by the community on an RX 6800 XT and an RX 7800 XT |
 | Intel, FSR | Untested, reports welcome |
-| Any GPU, upscaler chosen in OptiScaler | Tested on NVIDIA with DLSS, FSR 2/3 and XeSS, and by the community on an AMD RX 9070 XT with DLSS selected and FSR 4 underneath (0.8.0 or newer), see [Other mods](#other-mods) |
+| Any GPU, upscaler chosen in OptiScaler | Tested on NVIDIA with DLSS, FSR 2/3 and XeSS, and by the community on an AMD RX 9070 XT with DLSS selected and FSR 4 underneath, see [Other mods](#other-mods) |
 
 ### Game versions
 
@@ -306,8 +255,8 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
   `renodx-dlss.addon64` installed, the sim can freeze when a Fenix aircraft loads. This happens with this fix removed
   too, so it's between RenoDX and the Fenix; if you get it, remove `renodx-dlss.addon64` (OptiScaler or OptiShade also
   offer Neural Rendering).
-- **Extra DLSS passes:** if a mod or the sim runs a second DLSS pass at the internal resolution, 0.8.3 or newer keeps
-  the fix on the sim's real upscale (the one with the largest output).
+- **Extra DLSS passes:** if a mod or the sim runs a second DLSS pass at the internal resolution, the fix stays on the
+  sim's real upscale (the one with the largest output).
 - **Standalone DLSS Glass Cockpit Refresh** ([wesimglide.org](https://wesimglide.org/otherdata/tools/Standalone-DLSS-Glass-Cockpit-Refresh.html)):
   a third-party package of this add-on with ReShade built in, by WeSimGlide. For problems with it, follow the support
   steps on its page. Don't use it together with either version of this fix (the fix would run twice).
@@ -319,19 +268,16 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
   - **RenoDX MFG unlock add-on:** tested, works together with this fix.
   - **[RTX40MFG-Unlock](https://github.com/dashdogy/RTX40MFG-Unlock) by dashdogy:** tested with v1.4.2 (installed as
     `winmm.dll` next to an ASI loader's `version.dll`; `version.dll` alone works too), so it can stay as it is with
-    either version. It redirects DLSS, and 0.7.5 or newer follows that redirect; older versions log "could not hook
-    DLSS evaluate". Its Backspace menu doesn't show up when ReShade is loaded, with or without this fix, so set the
+    either version (the fix follows its DLSS redirect). Its Backspace menu doesn't show up when ReShade is loaded, with or without this fix, so set the
     multiplier in the sim's frame generation setting or in its `RTXMFG-Universal.json`.
-- **OptiScaler:** works with any upscaler selected in OptiScaler (DLSS, FSR 2/3/4, XeSS; 0.8.0 or newer for anything
-  but DLSS), including OptiScaler's DLSS 5 Neural Rendering. On AMD and Intel GPUs this also lets you select DLSS in
-  the sim and have OptiScaler run FSR or XeSS (0.8.0 or newer; tested on NVIDIA, and by the community on an AMD RX 9070 XT
-  with FSR 4). If ReShade says "There were errors loading some add-ons", update to 0.7.4 or newer. OptiScaler is
-  usually installed as `dxgi.dll`:
+- **OptiScaler:** works with any upscaler selected in OptiScaler (DLSS, FSR 2/3/4, XeSS), including OptiScaler's
+  DLSS 5 Neural Rendering. On AMD and Intel GPUs this also lets you select DLSS in the sim and have OptiScaler run FSR
+  or XeSS (tested on NVIDIA, and by the community on an AMD RX 9070 XT with FSR 4). OptiScaler is usually installed as
+  `dxgi.dll`:
   - with the add-on, load ReShade through an ASI loader or through OptiScaler's `LoadReshade` option instead;
   - with the standalone version, rename OptiScaler's `dxgi.dll` to another name it supports (e.g. `winmm.dll` or
     `version.dll`) and keep the fix as `dxgi.dll`.
-- **DLSS Enabler:** built on OptiScaler, so it should work the same way (0.8.0 or newer). Not tested yet, reports
-  welcome.
+- **DLSS Enabler:** built on OptiScaler, so it should work the same way. Not tested yet, reports welcome.
 - **Standalone version through an ASI loader instead of as `dxgi.dll`:** don't. An ASI loader usually loads the DLL
   after the sim has set up its graphics, and then the fix can't see what it needs: screens will most likely stay
   unfixed (the log says so).
@@ -339,10 +285,10 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
 ## Troubleshooting
 
 First look at what the fix reports about itself: the add-on's **Glass Cockpit DLSS Fix** tab in the ReShade menu
-(**Home**), or with the standalone version `glass-cockpit-dlss-fix-status.txt` next to the DLL (updated every 10 seconds
-while the sim runs). Both show what works and what doesn't (GPU, upscaler running, cockpit shader found, screens
+(**Home**), or with the standalone version its settings window (**Ctrl+Shift+F6**) and
+`glass-cockpit-dlss-fix-status.txt` next to the DLL (updated every 10 seconds while the sim runs). Both show what works and what doesn't (GPU, upscaler running, cockpit shader found, screens
 recorded, fix drawn), explain any problem in plain words and give a report for bug reports (the tab's **Copy report**
-button, the end of the status file). The tab also has an **Open log folder** button.
+button in the tab or window, the end of the status file). Both also have an **Open log folder** button.
 
 For something you can *see* on fixed screens (flickering edges, shimmer, lines, blur, things drawn over), first try
 the settings in [Before you report a problem: what to try](#before-you-report-a-problem-what-to-try).
@@ -388,21 +334,19 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Standalone: no `glass-cockpit-dlss-fix.log` appears | The DLL isn't loaded. Check that it is named exactly `dxgi.dll` and is in the same folder as `FlightSimulator2024.exe` (Windows may hide the `.dll` extension: it must not be `dxgi.dll.dll`) |
 | Standalone: log says the device was not seen, or "loaded after the sim created its graphics device" | The DLL was loaded too late, usually because it was loaded as `.asi` or another mod renamed it. Install it as `dxgi.dll` |
 | Nothing changes, no green tint | Check that DLSS or FSR is selected (add-on: that ReShade is the *full add-on support* build and the file is next to the ReShade DLL). Then read the tab or status file, and the log. |
-| Picture freezes or turns black with Frame Generation on (fine when alt-tabbed) | Update to 0.8.1 or newer (0.8.0 only) |
 | Sim freezes when a Fenix aircraft loads, with RenoDX's DLSS add-on installed | Remove `renodx-dlss.addon64`; see [Other mods](#other-mods) |
 | "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
 | Screen lines look jagged / too soft | Adjust Line smoothing |
-| Dashed light line along the edge of a screen's picture (e.g. FSS E-Jets) | Update to 0.8.3 or newer and keep **UV seam fix** on (`seam_fix=1`). If a line remains, try **Detail clamp** (can add some flicker on DLSS Balanced/Performance) |
+| Dashed light line along the edge of a screen's picture (e.g. FSS E-Jets) | Keep **UV seam fix** on (`seam_fix=1`). If a line remains, try **Detail clamp** (can add some flicker on DLSS Balanced/Performance) |
 | Dark screens drop out of the fix (green tint goes away) in strong sun | Turn on **Dark screen fix** (`dark_screen_fix=1`) |
-| Fixed screens shimmer with Frame Generation on (steady with it off) | Update to 1.0.0 or newer |
-| Screens change colour for a moment while the camera or aircraft moves (most often with Frame Generation) | Update to 0.8.3 or newer (1.0.0 or newer in VR) |
 | A screen is drawn over something in front of it (a sidestick, a hand, the yoke) | Make sure **Occlusion check** is on (`occlusion_check=1`, the default) |
 | Screen edges flicker or shimmer, or show a sliver of something that isn't there | Set **Edge trim** to 50 (`edge_trim=50`; up to 150 for aircraft with stronger edge problems) |
-| No log after flying a Fenix aircraft, or the log is called `glass-cockpit-dlss-fix-<number>.log` | Fixed in 1.0.0: a helper program the sim starts with some aircraft (e.g. Fenix) kept the log file open after the sim quit, so the next session couldn't write one. 1.0.0 logs under a numbered name when that happens; send that file |
+| The log is called `glass-cockpit-dlss-fix-<number>.log` | Normal after flying some aircraft (e.g. Fenix): a helper program kept the usual log file open. Send the newest numbered log |
 | Screen text shimmers when the camera is still | Turn on **Flip jitter direction** (`jitter_positive=0`). If it's already on (the tab or status file says "Advanced settings changed"), turn it off again (in the tab: **Reset to defaults**) |
 | Screens flicker in brightness (G-Sync / FreeSync monitor) | VRR flicker from a changing frame rate, most visible on dark screens. Turn on V-Sync, or cap the frame rate a few fps below your refresh rate |
-| Crash at startup | Remove the add-on or `dxgi.dll`, start once, put it back, then send both logs |
+| Crash at startup | Remove the add-on or `dxgi.dll`, start once, put it back, then send both logs. With the standalone version (early beta), please report any crash, and use the add-on in the meantime |
+| Standalone: Ctrl+Shift+F6 clashes with another mod's hotkey (e.g. a DLSS 5 add-on) | Click the hotkey in the settings window and press a new combination, or set `settings_window=` under `[hotkeys]` in the `.ini` (e.g. `Ctrl+Alt+G`) |
 
 ## How the fix works
 
@@ -426,12 +370,12 @@ In VR the sim draws every view (both eyes, plus the sharp centre views with fove
 upscales them one by one; the fix records each view separately and learns from the sim which upscale belongs to which
 view.
 
-To see what the sim draws, the fix hooks the few Direct3D 12 functions it needs: device and pipeline creation, root
-signatures, views, the command list calls that bind pipelines, descriptor tables and render targets, the draws, and the
-swapchain's present. Everything else goes straight to Windows. The two versions differ only in how the fix gets into
-the sim: ReShade loads the add-on and tells it about the sim's graphics device and swapchain; the standalone version is
-loaded by Windows as the sim's `dxgi.dll` (it passes every call on to Windows' own `dxgi.dll`) and sees the device being
-created.
+To see what the sim draws, the ReShade add-on (1.0.0) uses ReShade's add-on events. The standalone version hooks the
+few Direct3D 12 functions it needs itself: device and pipeline creation, root signatures, views, the command list calls
+that bind pipelines, descriptor tables and render targets, the draws, and the swapchain's present; everything else goes
+straight to Windows. It is loaded by Windows as the sim's `dxgi.dll` (it passes every call on to Windows' own
+`dxgi.dll`) and sees the device being created. The source in this repository already builds both versions on the
+standalone's hooks; the add-on will move to them once the standalone has had more testing.
 
 It works at any resolution and in any quality mode, and costs one extra draw per screen plus a few small GPU passes:
 no measurable FPS difference with the fix on or off in testing.
@@ -443,7 +387,7 @@ no measurable FPS difference with the fix on or off in testing.
   stretcher under Experimental fixes can help on some aircraft).
 - Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) is left to the upscaler by
   the Occlusion check (on by default); with it off, the screen is drawn over it.
-- Standalone: no in-game menu. Settings are in the `.ini` file, status in the status file.
+- Standalone (early beta): not yet tested in VR. Its settings window opens on the desktop, not in the headset.
 - Sim updates that change the cockpit display shader stop the fix (the sim then just looks like stock DLSS/FSR)
   until it is updated.
 
