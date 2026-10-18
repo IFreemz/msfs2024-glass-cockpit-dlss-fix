@@ -553,6 +553,14 @@ bool tap(int2 p, out float4 value)
 // Texture coordinates at `location` continued from map pixel q (value m) along the steps to its neighbours on the
 // same side of any UV seam (the smaller step of each pair; a step longer than `limit` crosses a seam and is no step at
 // all, e.g. from a bezel band pointing at one texel into the picture next to it), and the per-output-pixel gradients.
+// Texture step from render pixel q (map value m) to its neighbour in direction dir on the same screen; long when there is
+// none (another screen or nothing there).
+float outer_step(int2 q, float4 m, int2 dir)
+{
+    float4 n = load_map(q + dir);
+    return map_slot(n) == map_slot(m) ? length(n.xy - m.xy) : 1e3;
+}
+
 void continue_from(int2 q, float4 m, float2 location, float limit, out float2 uv, out float2 dx, out float2 dy)
 {
     float4 r = load_map(q + int2(1, 0)), l = load_map(q - int2(1, 0)), down = load_map(q + int2(0, 1)), up = load_map(q - int2(0, 1));
@@ -792,7 +800,20 @@ void composite(uint3 id : SV_DispatchThreadID)
         {
             float lab = length(b.xy - a.xy), lcd = length(d.xy - c.xy), lac = length(c.xy - a.xy), lbd = length(d.xy - b.xy);
             float jump = max(max(lab, lcd), max(lac, lbd)), step = min(min(lab, lcd), min(lac, lbd));
-            if (jump > 0.02 && jump > 4 * step)
+            // A screen whose texture is squeezed along one axis has long steps along it everywhere, and that's no seam
+            // (the C152's BendixKing radio digits: 7 times the texture per pixel vertically as horizontally, so every
+            // pixel looked like a seam and the digits shimmered). A seam is a step much longer than the regular steps
+            // around in both directions (the shortest one each way, also from the render pixels beyond).
+            bool seam = jump > 0.02 && jump > 4 * step;
+            if (seam)
+            {
+                float run_x = min(min(min(lab, lcd), min(outer_step(cell, a, int2(-1, 0)), outer_step(cell + int2(1, 0), b, int2(1, 0)))),
+                                  min(outer_step(cell + int2(0, 1), c, int2(-1, 0)), outer_step(cell + int2(1, 1), d, int2(1, 0))));
+                float run_y = min(min(min(lac, lbd), min(outer_step(cell, a, int2(0, -1)), outer_step(cell + int2(0, 1), c, int2(0, 1)))),
+                                  min(outer_step(cell + int2(1, 0), b, int2(0, -1)), outer_step(cell + int2(1, 1), d, int2(0, 1))));
+                seam = jump > 4 * max(run_x, run_y);
+            }
+            if (seam)
             {
                 // Two sides: the taps near the nearest one in the texture, and the rest. Each side continues its own
                 // nearest tap; the two samples are blended by how much of this pixel each side covers (bilinear
