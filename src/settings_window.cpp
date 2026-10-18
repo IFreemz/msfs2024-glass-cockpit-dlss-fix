@@ -4,6 +4,9 @@
 // their menus there and take the sim's keyboard and mouse while they are open, and a second one would compete with them.
 // The window is drawn on the CPU with GDI+ on its own thread: no Direct3D, no rendering or input hooks, nothing for other
 // mods to attach to, and no work at all while it's closed. It repaints only when something changes.
+// It never takes the keyboard focus from the sim (WS_EX_NOACTIVATE): clicks still work, but the sim stays the active
+// window. When another window of its own process took the focus, the sim stopped taking camera and mouse input, also
+// after getting the focus back.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -12,6 +15,7 @@
 #include <algorithm>
 namespace Gdiplus { using std::min; using std::max; }
 #include <gdiplus.h>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -26,9 +30,8 @@ namespace {
 HMODULE self = nullptr;
 std::atomic<bool> thread_started{false};
 std::atomic<HWND> window{nullptr};
-HWND previous_foreground = nullptr; // given the focus back when the window closes
 constexpr UINT toggle_message = WM_APP + 1;
-constexpr UINT_PTR refresh_timer = 1, capture_release_timer = 2, open_timer = 3;
+constexpr UINT_PTR refresh_timer = 1, capture_release_timer = 2, capture_poll_timer = 3;
 constexpr int client_w = 800, client_h = 768; // DIPs
 
 // Colours (dark theme).
@@ -95,7 +98,7 @@ const wchar_t* const tip_enabled = L"Turns the fix on and off, e.g. to compare w
 const wchar_t* const tip_smoothing = L"Smooths stair steps and shimmer on thin lines, like DLSS did. 0 = sharpest, 35 = default, 50 = like DLSS.";
 const wchar_t* const tip_extra = L"Lets Line smoothing go up to 100 % for stubborn shimmer (e.g. in VR). Above 50 the whole screen picture gets softer than with DLSS alone.";
 const wchar_t* const tip_tint = L"Tints every fixed screen green: shows which screens the fix covers (also Ctrl+Shift+F11).";
-const wchar_t* const tip_key = L"The key combination that opens and closes this window. Click, then press the new combination (Esc cancels). "
+const wchar_t* const tip_key = L"The key combination that opens and closes this window. Click, then press the new combination (click again to cancel). The sim sees those keys too. "
     L"Change it if it clashes with another mod's hotkey.";
 const wchar_t* const tip_advanced = L"Settings only needed for troubleshooting: only change these if asked to in a bug report.";
 const wchar_t* const tip_jitter = L"Only needed if the screen text shimmers while the camera is still.";
@@ -453,6 +456,7 @@ void copy_to_clipboard(HWND owner, const std::string& text) {
 }
 void stop_capturing(HWND hwnd, bool wait_for_release) {
     capturing = false;
+    KillTimer(hwnd, capture_poll_timer);
     // The new combination is still held: the hotkey stays paused until it's let go, or it would close the window at once.
     if (wait_for_release) SetTimer(hwnd, capture_release_timer, 50, nullptr);
     else glass::settings_window_capturing = false;
@@ -461,9 +465,11 @@ void click(HWND hwnd, Id id) {
     switch (id) {
     case id_advanced: advanced_open = !advanced_open; break;
     case id_key:
-        capturing = !capturing;
-        glass::settings_window_capturing = capturing;
+        if (capturing) { stop_capturing(hwnd, false); break; }
+        capturing = true;
+        glass::settings_window_capturing = true;
         help_note.clear();
+        SetTimer(hwnd, capture_poll_timer, 15, nullptr); // the keys go to the sim: they're read from the keyboard's state
         break;
     case id_reset_advanced: glass::set_jitter_positive(true); glass::set_glass_strength(100); break;
     case id_reset_experimental: glass::set_experimental({}); break;
@@ -495,9 +501,9 @@ void key_pressed(HWND hwnd, UINT vk) {
     if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LSHIFT || vk == VK_RSHIFT || vk == VK_LCONTROL || vk == VK_RCONTROL ||
         vk == VK_LMENU || vk == VK_RMENU || vk == VK_LWIN || vk == VK_RWIN) return; // waiting for the key itself
     uint32_t key = vk & 0xFF;
-    if (GetKeyState(VK_CONTROL) & 0x8000) key |= glass::key_ctrl;
-    if (GetKeyState(VK_SHIFT) & 0x8000) key |= glass::key_shift;
-    if (GetKeyState(VK_MENU) & 0x8000) key |= glass::key_alt;
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) key |= glass::key_ctrl;
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) key |= glass::key_shift;
+    if (GetAsyncKeyState(VK_MENU) & 0x8000) key |= glass::key_alt;
     const std::string name = glass::hotkey_name(key);
     if (name.find('?') != std::string::npos || glass::parse_hotkey(name) != key) {
         help_note = L"That key can't be used for the hotkey: try an F key, a letter or a number with Ctrl, Shift or Alt.";
@@ -513,11 +519,8 @@ void key_pressed(HWND hwnd, UINT vk) {
 
 void show(HWND hwnd, bool visible) {
     if (visible) {
-        const HWND foreground = GetForegroundWindow();
-        if (foreground != hwnd) previous_foreground = foreground;
         read_status();
-        ShowWindow(hwnd, SW_SHOWNORMAL);
-        SetForegroundWindow(hwnd);
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE); // the sim keeps the focus
         SetTimer(hwnd, refresh_timer, 500, nullptr);
         InvalidateRect(hwnd, nullptr, FALSE);
     } else {
@@ -526,7 +529,6 @@ void show(HWND hwnd, bool visible) {
         dragging = pressed = hover = id_none;
         help_note.clear();
         ShowWindow(hwnd, SW_HIDE);
-        if (previous_foreground && IsWindow(previous_foreground)) SetForegroundWindow(previous_foreground); // back to the sim
     }
 }
 
@@ -542,21 +544,26 @@ std::string shown_state() {
 
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
     switch (message) {
-    case toggle_message:
-        // Opened only once the hotkey's keys are let go: the sim saw them go down, and must see them come up too, or it
-        // keeps treating Ctrl/Shift as held after the window closes (camera and mouse then do other things).
-        if (IsWindowVisible(hwnd)) show(hwnd, false);
-        else SetTimer(hwnd, open_timer, 20, nullptr);
-        return 0;
+    case toggle_message: show(hwnd, !IsWindowVisible(hwnd)); return 0;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE; // clicks never take the focus from the sim
     case WM_TIMER:
         if (w == refresh_timer) {
             const auto before = shown_state();
             read_status();
             if (shown_state() != before) InvalidateRect(hwnd, nullptr, FALSE);
-        } else if (w == open_timer) {
-            const uint32_t key = status.settings_window_key ? status.settings_window_key : glass::default_settings_window_key;
-            const bool held = (GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_MENU) | GetAsyncKeyState(int(key & 0xFF))) & 0x8000;
-            if (!held) { KillTimer(hwnd, open_timer); show(hwnd, true); }
+        } else if (w == capture_poll_timer) {
+            // Recording a new hotkey: the first key pressed since the last check (besides the modifiers and the mouse).
+            static std::array<bool, 256> was_down{};
+            static bool primed = false;
+            if (!capturing) { primed = false; return 0; }
+            for (int vk = 0x08; vk < 0xFF; ++vk) {
+                const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                const bool fresh = primed && down && !was_down[size_t(vk)];
+                was_down[size_t(vk)] = down;
+                if (fresh) { key_pressed(hwnd, UINT(vk)); InvalidateRect(hwnd, nullptr, FALSE); if (!capturing) break; }
+            }
+            primed = capturing; // the keys held when recording started don't count
+            if (!capturing) primed = false;
         } else if (w == capture_release_timer) {
             const uint32_t key = status.settings_window_key;
             if (!(GetAsyncKeyState(int(key & 0xFF)) & 0x8000)) { KillTimer(hwnd, capture_release_timer); glass::settings_window_capturing = false; }
@@ -638,11 +645,6 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
             return TRUE;
         }
         break;
-    case WM_KEYDOWN: case WM_SYSKEYDOWN:
-        if (capturing) { key_pressed(hwnd, UINT(w)); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-        if (w == VK_ESCAPE) { show(hwnd, false); return 0; }
-        break;
-    case WM_SYSCHAR: if (capturing) return 0; break; // no beep for Alt+key while recording
     case WM_DPICHANGED: {
         dpi = HIWORD(w);
         create_fonts();
@@ -652,7 +654,6 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
-    case WM_ACTIVATE: if (LOWORD(w) == WA_INACTIVE && capturing) { stop_capturing(hwnd, false); InvalidateRect(hwnd, nullptr, FALSE); } break;
     case WM_CLOSE: show(hwnd, false); return 0; // only hidden: the hotkey opens it again
     default: break;
     }
@@ -681,7 +682,7 @@ DWORD WINAPI window_thread(void*) {
     if (const HMODULE shcore = LoadLibraryW(L"shcore.dll"))
         if (const auto get = reinterpret_cast<GetDpiForMonitorFn>(GetProcAddress(shcore, "GetDpiForMonitor"))) get(monitor, 0, &monitor_dpi_x, &monitor_dpi_y);
     dpi = monitor_dpi_x;
-    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, ex_style = WS_EX_TOPMOST; // fixed size: only the close button
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, ex_style = WS_EX_TOPMOST | WS_EX_NOACTIVATE; // fixed size; never takes the focus
     RECT frame{0, 0, scale(client_w), scale(client_h)};
     AdjustWindowRectExForDpi(&frame, style, FALSE, ex_style, dpi);
     const int w = frame.right - frame.left, h = frame.bottom - frame.top;
@@ -696,8 +697,7 @@ DWORD WINAPI window_thread(void*) {
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(make_icon(GetSystemMetricsForDpi(SM_CXICON, dpi))));
     window = hwnd;
     glass::write_log("settings window opened");
-    read_status();
-    SetTimer(hwnd, open_timer, 20, nullptr); // shown once the hotkey is let go (see toggle_message)
+    show(hwnd, true);
 
     MSG message;
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -708,6 +708,10 @@ DWORD WINAPI window_thread(void*) {
 }
 
 void toggle() {
+    // A second press within 300 ms is taken as a double press, not as "close it again".
+    static std::atomic<uint64_t> last{0};
+    const uint64_t now = GetTickCount64();
+    if (now - last.exchange(now) < 300) return;
     if (const HWND hwnd = window.load()) { PostMessageW(hwnd, toggle_message, 0, 0); return; }
     if (thread_started.exchange(true)) return; // being created
     if (const HANDLE thread = CreateThread(nullptr, 0, window_thread, nullptr, 0, nullptr)) CloseHandle(thread);

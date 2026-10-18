@@ -105,7 +105,7 @@ files next to it.
 ## Settings
 
 The add-on has all settings in its tab in the ReShade menu (**Home**). The standalone version has the same settings in a
-small window of its own: press **Ctrl+Shift+F6** in the sim to open or close it (Esc closes it too; hover over an
+small window of its own: press **Ctrl+Shift+F6** in the sim to open or close it (or click its X; hover over an
 option to see what it does). It's a separate window rather than a menu drawn into the game, so it doesn't get in the
 way of ReShade, OptiScaler or OptiShade menus. Both versions keep the settings in `glass-cockpit-dlss-fix.ini` next to
 the add-on or DLL, which lists every setting (the tables below say what each one does); you can also edit it with
