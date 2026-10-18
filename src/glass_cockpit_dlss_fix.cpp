@@ -244,7 +244,8 @@ std::wstring file_company(const wchar_t* path) {
 
 // Logs DLSS/Streamline/ReShade-related modules once each, with version and path (helps spot missing DLSS or conflicts).
 // Any other module loaded more than a minute after start is logged too: tools that attach to the running sim (e.g.
-// GlassOut) show up there.
+// GlassOut) show up there. Those by name and path only: their files are never opened (the FSLabs A32X's protected
+// interface DLL unloads itself when another module reads its file, and the sim crashed loading the aircraft).
 void scan_modules() {
     static std::set<std::wstring> seen, all;
     static int late = 0;
@@ -262,7 +263,7 @@ void scan_modules() {
             name == L"dxgi.dll" || name == L"version.dll" || name == L"nvapi64.dll";
         if (!relevant && new_module && settled && late < 64) {
             ++late;
-            log("module loaded later: %ls version=%s company=\"%ls\" path=%ls", name.c_str(), file_version(path).c_str(), file_company(path).c_str(), path);
+            log("module loaded later: %ls path=%ls", name.c_str(), path);
         }
         if (!relevant || !seen.insert(name).second) continue;
         const auto version = file_version(path);
