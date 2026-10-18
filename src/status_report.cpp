@@ -2,6 +2,7 @@
 // settings in effect and a report to paste into bug reports. Rewritten by the fix every 10 s while it changes.
 #include "status.hpp"
 #include "version.h"
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <string>
@@ -26,7 +27,68 @@ std::string check_row(Check state, const char* label, const std::string& detail)
 }
 }
 
+namespace {
+// Keys a hotkey can use, by name (virtual-key codes).
+struct KeyName { const char* name; uint32_t vk; };
+constexpr KeyName key_names[] = {
+    {"Insert", 0x2D}, {"Delete", 0x2E}, {"Home", 0x24}, {"End", 0x23}, {"PageUp", 0x21}, {"PageDown", 0x22},
+    {"Pause", 0x13}, {"ScrollLock", 0x91}, {"Space", 0x20},
+};
+}
+
 namespace glass {
+std::string hotkey_name(uint32_t key) {
+    std::string text;
+    if (key & key_ctrl) text += "Ctrl+";
+    if (key & key_shift) text += "Shift+";
+    if (key & key_alt) text += "Alt+";
+    const uint32_t vk = key & 0xFF;
+    if (vk >= 0x70 && vk <= 0x87) return text + "F" + std::to_string(vk - 0x70 + 1);
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return text + char(vk);
+    if (vk >= 0x60 && vk <= 0x69) return text + "Num" + std::to_string(vk - 0x60);
+    for (const auto& k : key_names) if (k.vk == vk) return text + k.name;
+    return text + "?";
+}
+uint32_t parse_hotkey(const std::string& text) {
+    uint32_t mods = 0;
+    size_t start = 0;
+    std::string key;
+    for (;;) {
+        const size_t plus = text.find('+', start);
+        std::string part = text.substr(start, plus == std::string::npos ? std::string::npos : plus - start);
+        while (!part.empty() && part.front() == ' ') part.erase(part.begin());
+        while (!part.empty() && part.back() == ' ') part.pop_back();
+        for (auto& c : part) c = char(toupper(static_cast<unsigned char>(c)));
+        if (plus == std::string::npos) { key = part; break; }
+        if (part == "CTRL" || part == "CONTROL") mods |= key_ctrl;
+        else if (part == "SHIFT") mods |= key_shift;
+        else if (part == "ALT") mods |= key_alt;
+        else return 0;
+        start = plus + 1;
+    }
+    if (key.size() == 1 && ((key[0] >= 'A' && key[0] <= 'Z') || (key[0] >= '0' && key[0] <= '9'))) return mods | uint32_t(key[0]);
+    if (key.size() >= 2 && key[0] == 'F' && key.find_first_not_of("0123456789", 1) == std::string::npos) {
+        const int n = std::stoi(key.substr(1));
+        if (n >= 1 && n <= 24) return mods | uint32_t(0x70 + n - 1);
+    }
+    if (key.size() == 4 && key.rfind("NUM", 0) == 0 && key[3] >= '0' && key[3] <= '9') return mods | uint32_t(0x60 + key[3] - '0');
+    for (const auto& k : key_names) {
+        std::string name = k.name;
+        for (auto& c : name) c = char(toupper(static_cast<unsigned char>(c)));
+        if (name == key) return mods | k.vk;
+    }
+    return 0;
+}
+const char* hotkey_problem(uint32_t key) {
+    const uint32_t vk = key & 0xFF, mods = key & (key_ctrl | key_shift | key_alt);
+    if (!vk) return "not a key";
+    if (mods == (key_ctrl | key_shift) && vk >= 0x76 && vk <= 0x7B) return "Ctrl+Shift+F7 to F12 are the fix's own hotkeys";
+    if (mods == key_alt && vk == 0x73) return "Alt+F4 closes the sim";
+    const bool alone_ok = (vk >= 0x7C && vk <= 0x87) || vk == 0x13 || vk == 0x91; // F13-F24, Pause, Scroll Lock
+    if (!mods && !alone_ok) return "add Ctrl, Shift or Alt, so it doesn't fire while you type or fly";
+    return nullptr;
+}
+
 std::string status_summary(const Status& s) {
     if (s.active) return format("Working: fixing %u screen%s (%s %ux%u -> %ux%u)", s.screens, s.screens == 1 ? "" : "s", s.upscaler, s.render_w, s.render_h, s.out_w, s.out_h);
     if (!s.enabled) return "Off (Ctrl+Shift+F9 to turn on)";
@@ -71,7 +133,7 @@ std::string status_text(const Status& s) {
     text += "\nFor bug reports, attach glass-cockpit-dlss-fix.log and glass-cockpit-dlss-fix.old.log from this folder, and the report below.\n\n";
     text += status_report(s);
     // About (GPL-3.0 section 7(b) notice, see NOTICE.md).
-    text += format("\n%s %s by %s - GPL-3.0 (see NOTICE.md) - %s\nOfficial downloads: GitHub releases only.\n", GLASS_NAME, GLASS_VERSION_STRING, GLASS_AUTHOR,
+    text += format("\n%s %s by %s - GPL-3.0 (see NOTICE.md) - %s\nOfficial downloads: GitHub releases and flightsim.to only.\n", GLASS_NAME, GLASS_VERSION_STRING, GLASS_AUTHOR,
         GLASS_WEBSITE);
     return text;
 }

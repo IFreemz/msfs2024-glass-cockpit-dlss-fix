@@ -133,6 +133,8 @@ std::atomic<bool> duplicate_fix{false};
 }
 // Standalone: opens and closes the settings window (settings_window.cpp); null in the add-on, which has its ReShade tab.
 void (*glass::settings_window_hotkey)() = nullptr;
+std::atomic<bool> glass::settings_window_capturing{false};
+std::atomic<uint32_t> settings_window_key{glass::default_settings_window_key};
 namespace {
 // The process is exiting (DLL_PROCESS_DETACH): the hooks pass everything straight through from then on, since the
 // fix's own state is being torn down while other modules may still release Direct3D objects.
@@ -3140,6 +3142,12 @@ void load_settings() {
     mip0_only = GetPrivateProfileIntW(L"experimental", L"full_size_sampling", 1, settings_path().c_str()) != 0;
     calm_glass = GetPrivateProfileIntW(L"experimental", L"calm_glass", 0, settings_path().c_str()) != 0;
     occlusion_check = GetPrivateProfileIntW(L"experimental", L"occlusion_check", 1, settings_path().c_str()) != 0;
+    {
+        wchar_t key[64]{};
+        GetPrivateProfileStringW(L"hotkeys", L"settings_window", L"", key, 64, settings_path().c_str());
+        const uint32_t parsed = glass::parse_hotkey(utf8(key));
+        settings_window_key = parsed && !glass::hotkey_problem(parsed) ? parsed : glass::default_settings_window_key;
+    }
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
@@ -3165,6 +3173,8 @@ void save_settings() {
     WritePrivateProfileStringW(L"experimental", L"full_size_sampling", mip0_only.load() ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"calm_glass", std::to_wstring(calm_glass.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"occlusion_check", std::to_wstring(occlusion_check.load()).c_str(), settings_path().c_str());
+    const auto key = glass::hotkey_name(settings_window_key);
+    WritePrivateProfileStringW(L"hotkeys", L"settings_window", std::wstring(key.begin(), key.end()).c_str(), settings_path().c_str());
 }
 // The settings in effect, for the log (at start and when the file is re-read).
 std::string settings_text() {
@@ -3346,7 +3356,7 @@ void write_settings_file() {
         file << "; " GLASS_NAME " settings. Saved changes apply while the sim runs (within a second). The ReShade add-on\n"
                 "; also has them in its tab in the ReShade overlay. What each setting does: " GLASS_WEBSITE "#settings\n"
                 "; Hotkeys in the sim: Ctrl+Shift+F9 fix on/off, Ctrl+Shift+F11 green tint on every fixed screen,\n"
-                "; Ctrl+Shift+F8 capture the screens for a bug report, Ctrl+Shift+F6 settings window (standalone).\n"
+                "; Ctrl+Shift+F8 capture the screens for a bug report. Standalone: settings window with [hotkeys] settings_window (Ctrl+Shift+F6).\n"
                 "; What the fix is doing: glass-cockpit-dlss-fix-status.txt.\n"
                 "\n";
     }
@@ -3379,7 +3389,7 @@ void reload_settings() {
 
 // Hotkeys (Ctrl+Shift+...), polled about 30 times a second while one of the sim's windows has the focus.
 void poll_hotkeys() {
-    constexpr std::array<int, 7> keys{VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12};
+    constexpr std::array<int, 6> keys{VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12};
     static std::array<bool, keys.size()> was_down{};
     DWORD process = 0;
     if (const HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &process);
@@ -3387,8 +3397,7 @@ void poll_hotkeys() {
     for (size_t i = 0; i < keys.size(); ++i) {
         const bool down = chord && (GetAsyncKeyState(keys[i]) & 0x8000);
         if (down && !was_down[i]) {
-            if (keys[i] == VK_F6) { if (glass::settings_window_hotkey) glass::settings_window_hotkey(); }
-            else if (keys[i] == VK_F7) {
+            if (keys[i] == VK_F7) {
                 change_settings([] { mip0_only = !mip0_only; });
                 log("setting full_size_sampling=%d (Ctrl+Shift+F7)", int(mip0_only.load()));
             }
@@ -3403,6 +3412,16 @@ void poll_hotkeys() {
         }
         was_down[i] = down;
     }
+    // The settings window's hotkey (standalone; changeable): exactly its modifiers, so Ctrl+Shift+F6 doesn't also fire
+    // a plain Shift+F6. Not while the window is recording a new hotkey.
+    static bool window_key_was_down = false;
+    const uint32_t key = settings_window_key.load();
+    const auto held = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    const bool window_key_down = process == GetCurrentProcessId() && !glass::settings_window_capturing.load() &&
+        held(VK_CONTROL) == ((key & glass::key_ctrl) != 0) && held(VK_SHIFT) == ((key & glass::key_shift) != 0) &&
+        held(VK_MENU) == ((key & glass::key_alt) != 0) && held(int(key & 0xFF));
+    if (window_key_down && !window_key_was_down && glass::settings_window_hotkey) glass::settings_window_hotkey();
+    window_key_was_down = window_key_down;
 }
 
 // Loaded after the sim created its device (e.g. by an ASI loader rather than as dxgi.dll): D3D12 hands back an
@@ -3911,7 +3930,7 @@ bool start(void* self_module, void* reshade_module) noexcept try {
     }
     log("module path=%ls fixture=%d %s", module, fixture_host, settings_text().c_str());
     log("hotkeys: %sCtrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint, Ctrl+Shift+F8 capture, Ctrl+Shift+F10 pixel probe, Ctrl+Shift+F7 full-size sampling; settings in %ls",
-        reshade_addon ? "" : "Ctrl+Shift+F6 settings window, ", settings_path().c_str());
+        reshade_addon ? "" : (glass::hotkey_name(settings_window_key) + " settings window, ").c_str(), settings_path().c_str());
     if (!reshade_addon && _wcsicmp(std::filesystem::path(module).filename().c_str(), L"dxgi.dll") != 0)
         log("note loaded as %ls rather than as dxgi.dll", std::filesystem::path(module).filename().c_str());
     std::thread(worker).detach();
@@ -3952,6 +3971,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.addon = reshade_addon;
+    s.settings_window_key = settings_window_key;
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
     s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing, stable_edges, int(mip0_only.load()), calm_glass, edge_trim_percent, occlusion_check}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
@@ -4037,6 +4057,11 @@ void set_experimental(const Experimental& e) {
     });
     log("setting seam_fix=%d full_size_sampling=%d stable_edges=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d", seam_fix.load(), int(mip0_only.load()), stable_edges.load(),
         dark_screen_fix.load(), detail_clamp_percent.load(), edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
+}
+void set_settings_window_key(uint32_t key) {
+    if (!key || hotkey_problem(key)) return;
+    change_settings([&] { settings_window_key = key; });
+    log("setting settings_window hotkey=%s", hotkey_name(key).c_str());
 }
 void set_glass_strength(int percent) {
     change_settings([&] { glass_percent = std::clamp(percent, 0, 100); });

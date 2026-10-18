@@ -20,6 +20,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     return TRUE;
 }
 
+// Opens or closes the settings window, as its hotkey does (offline checks of the window).
+extern "C" __declspec(dllexport) void GlassFixSettingsWindow() { if (glass::settings_window_hotkey) glass::settings_window_hotkey(); }
+
 namespace {
 HMODULE system_dxgi() {
     static const HMODULE module = [] {
