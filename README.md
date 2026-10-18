@@ -198,6 +198,7 @@ version gets into the sim differently, so please report how it works for you.
 | Aircraft | Status |
 |---|---|
 | Fenix A320 family | Tested |
+| FSLabs A321neo | Tested (1.0.1 or newer: 1.0.0 crashed the sim while loading it) |
 | iFly 737 MAX 8 | Tested (every screen: CDUs, radio panels, transponder, ADF, MCP digits and both EFB tablets) |
 | iniBuilds A220 | Tested |
 | iniBuilds A330 | Tested |
@@ -208,6 +209,8 @@ version gets into the sim differently, so please report how it works for you.
 | PMDG 777 | Tested by the community (also in VR) |
 | FlightFX C750 | Tested by the community |
 | Default DA62 | Tested |
+| Default Cessna 152 (BendixKing radios) | Tested |
+| A2A Comanche 250 (radio displays) | Tested |
 | Default Cessna Longitude | Tested by the community (in VR) |
 | FSS E-Jets (ERJ-170/175/190/195) | Tested |
 | Default F/A-18E Super Hornet | Tested (if its dark screens drop out of the fix in strong sun, turn on Dark screen fix, see [Settings](#settings)) |
@@ -336,6 +339,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Standalone: no `glass-cockpit-dlss-fix.log` appears | The DLL isn't loaded. Check that it is named exactly `dxgi.dll` and is in the same folder as `FlightSimulator2024.exe` (Windows may hide the `.dll` extension: it must not be `dxgi.dll.dll`) |
 | Standalone: log says the device was not seen, or "loaded after the sim created its graphics device" | The DLL was loaded too late, usually because it was loaded as `.asi` or another mod renamed it. Install it as `dxgi.dll` |
 | Nothing changes, no green tint | Check that DLSS or FSR is selected (add-on: that ReShade is the *full add-on support* build and the file is next to the ReShade DLL). Then read the tab or status file, and the log. |
+| Sim crashes while an FSLabs aircraft loads | Update to 1.0.1 or newer (1.0.0 only) |
 | Sim freezes when a Fenix aircraft loads, with RenoDX's DLSS add-on installed | Remove `renodx-dlss.addon64`; see [Other mods](#other-mods) |
 | "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Ctrl+Shift+F12** (writes a short diagnostic to the log), then send both logs and the aircraft name |
@@ -373,7 +377,7 @@ In VR the sim draws every view (both eyes, plus the sharp centre views with fove
 upscales them one by one; the fix records each view separately and learns from the sim which upscale belongs to which
 view.
 
-To see what the sim draws, the ReShade add-on (1.0.0) uses ReShade's add-on events. The standalone version hooks the
+To see what the sim draws, the ReShade add-on (1.0.x) uses ReShade's add-on events. The standalone version hooks the
 few Direct3D 12 functions it needs itself: device and pipeline creation, root signatures, views, the command list calls
 that bind pipelines, descriptor tables and render targets, the draws, and the swapchain's present; everything else goes
 straight to Windows. It is loaded by Windows as the sim's `dxgi.dll` (it passes every call on to Windows' own
