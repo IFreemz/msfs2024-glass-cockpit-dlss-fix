@@ -509,9 +509,16 @@ void solve(uint3 id : SV_DispatchThreadID)
     // with the upscaler (see below).
     if (pooled_variance <= 3e-6 && previous_a.w > 0) { params[slot * 3] = previous_a; return; }
     float3 a, b;
+    float fitted_gain = 0;
+    [unroll] for (uint c = 0; c < 3; ++c)
+        if (variance[c] > 1e-6) fitted_gain = max(fitted_gain, float(max(covariance[c] / variance[c], 0.0)));
     [unroll] for (uint c = 0; c < 3; ++c)
     {
         a[c] = variance[c] > 1e-6 ? float(max(covariance[c] / variance[c], 0.0)) : (mx[c] > 1e-4 ? float(my[c] / mx[c]) : 0);
+        // A channel the texture barely has (e.g. green on red digits): the scene's level over a texture level near zero
+        // is no gain (it's glare on the glass) and turned any trace of that channel bright (the A2A Comanche's red radio
+        // digits came out yellow at a green gain of 13000). At most twice the largest gain fitted on real contrast.
+        if (variance[c] <= 1e-6 && fitted_gain > 0) a[c] = min(a[c], 2 * fitted_gain);
         b[c] = float(my[c] - a[c] * mx[c]);
     }
     // Fit quality: how much of the scene's variation on the screen the screen texture explains (r squared, all
