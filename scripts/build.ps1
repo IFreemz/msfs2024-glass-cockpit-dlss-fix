@@ -83,7 +83,7 @@ try {
     # src\dxgi.def). /NOIMPLIB: an import library named dxgi.lib here would be linked into the test host and the add-on
     # instead of the SDK's.
     Remove-Item -LiteralPath 'dxgi.lib' -ErrorAction SilentlyContinue
-    & $compiler /nologo /LD $fix dxgi_proxy.obj settings_window.obj version.res /link /DEF:"$root\src\dxgi.def" /NOIMPLIB d3d12.lib version.lib user32.lib gdi32.lib shell32.lib ole32.lib windowscodecs.lib /OUT:dxgi.dll
+    & $compiler /nologo /LD $fix dxgi_proxy.obj settings_window.obj version.res /link /DEF:"$root\src\dxgi.def" /NOIMPLIB d3d12.lib version.lib user32.lib gdi32.lib shell32.lib ole32.lib windowscodecs.lib gdiplus.lib delayimp.lib /DELAYLOAD:gdiplus.dll /OUT:dxgi.dll
     if ($LASTEXITCODE) { throw 'dxgi.dll link failed' }
     # ReShade add-on.
     & $compiler /nologo /LD $fix reshade_addon.obj status_panel.obj version_addon.res /link /NOIMPLIB d3d12.lib dxgi.lib version.lib user32.lib shell32.lib ole32.lib windowscodecs.lib /OUT:glass-cockpit-dlss-fix.addon64

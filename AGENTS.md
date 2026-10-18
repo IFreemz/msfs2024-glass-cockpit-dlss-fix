@@ -25,8 +25,9 @@ Anything that contains or is built from 1.0.0 or later code (copied, modified, r
    where it comes from (for example "based on Glass Cockpit DLSS Fix by IFreemz").
 
 The only official downloads are this repository's
-[GitHub releases](https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix/releases). Unofficial builds handle their
-own support.
+[GitHub releases](https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix/releases) and the project's
+[flightsim.to page](https://flightsim.to/addon/116678/glass-cockpit-dlss-fix-no-more-dlss-ghosting-on-pfd-nd). Unofficial
+builds handle their own support.
 
 ## Requests (not licence conditions)
 

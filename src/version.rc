@@ -11,12 +11,6 @@
 #define GLASS_FILE_NAME "dxgi.dll"
 #endif
 
-#ifndef GLASS_RESHADE_ADDON
-// Visual styles for the standalone's settings window only (activated on its own thread, settings_window.cpp). Not
-// resource 1 or 2, which Windows would apply to the whole sim or to this DLL's loading.
-3 24 "settings_window.manifest"
-#endif
-
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION GLASS_VERSION_MAJOR, GLASS_VERSION_MINOR, GLASS_VERSION_PATCH, 0
 PRODUCTVERSION GLASS_VERSION_MAJOR, GLASS_VERSION_MINOR, GLASS_VERSION_PATCH, 0

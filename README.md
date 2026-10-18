@@ -25,7 +25,8 @@ cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headse
 
 **About this project:** Glass Cockpit DLSS Fix is developed by IFreemz. It was first released here on 11 October 2026
 (v0.6.0), and every version since has been published from this repository. Official downloads: the
-[GitHub releases](https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix/releases) (and [OptiShade](https://github.com/GamingWithGravy/OptiShade), which bundles
+[GitHub releases](https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix/releases) and the
+[flightsim.to page](https://flightsim.to/addon/116678/glass-cockpit-dlss-fix-no-more-dlss-ghosting-on-pfd-nd) (and [OptiShade](https://github.com/GamingWithGravy/OptiShade), which bundles
 the official add-on). Other packages, rebuilds or pages are unofficial; for those, please contact their authors.
 
 ## Contents
@@ -463,7 +464,7 @@ Versions up to 0.8.3 remain MIT. Third-party components are listed in [THIRD_PAR
 ## Official downloads and redistribution
 
 The only official downloads are the [GitHub releases](https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix/releases)
-(each release lists the SHA-256 checksums of its files). OptiShade bundles the official add-on with explicit permission (see [NOTICE.md](NOTICE.md)).
+(each release lists the SHA-256 checksums of its files) and the [flightsim.to page](https://flightsim.to/addon/116678/glass-cockpit-dlss-fix-no-more-dlss-ghosting-on-pfd-nd). OptiShade bundles the official add-on with explicit permission (see [NOTICE.md](NOTICE.md)).
 
 You may redistribute and modify the add-on under the GPL-3 terms. In short, for builds that contain 1.0.0 or later code:
 

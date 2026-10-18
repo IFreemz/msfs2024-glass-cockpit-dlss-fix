@@ -3,6 +3,7 @@
 // - ReShade add-on: glass-cockpit-dlss-fix.addon64, loaded by ReShade (reshade_addon.cpp), with a tab in its overlay.
 // From there on both work the same way: the fix follows the sim through its own hooks on the D3D12 runtime.
 #pragma once
+#include <atomic>
 
 struct IUnknown;
 struct ID3D12Device;
@@ -22,6 +23,8 @@ void hook_device_creation() noexcept;
 // settings_window_hotkey (null in the add-on, which has its tab in the ReShade overlay instead).
 void init_settings_window(void* self_module);
 extern void (*settings_window_hotkey)();
+// Set while the settings window records a new hotkey: the current one doesn't toggle the window meanwhile.
+extern std::atomic<bool> settings_window_capturing;
 void dxgi_factory_created(IUnknown* factory);
 
 // ReShade add-on: the devices ReShade reports (the add-on is loaded when the first one is created), and the swapchain

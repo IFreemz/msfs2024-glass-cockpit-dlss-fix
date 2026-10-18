@@ -26,6 +26,7 @@ struct Status {
     bool enabled = false, tint = false, jitter_positive = false, active = false, extra_smoothing = false;
     Experimental experimental;
     int line_smoothing = 0, glass_strength = 100;
+    uint32_t settings_window_key = 0; // standalone: the settings window's hotkey (hotkey_name)
     uint64_t dlss_calls = 0, dlss_upscales = 0, fsr_calls = 0, screen_draws = 0, recorded = 0, overlay_frames = 0, skipped = 0;
     unsigned screens = 0, render_w = 0, render_h = 0, out_w = 0, out_h = 0;
     const char* upscaler = "DLSS"; // the one the fix was last drawn after
@@ -44,6 +45,14 @@ void set_line_smoothing(int percent);
 void set_extra_smoothing(bool on);
 void set_glass_strength(int percent);
 void set_experimental(const Experimental& e);
+
+// Hotkeys: a virtual-key code plus modifier bits. Written in the .ini as e.g. "Ctrl+Shift+F6".
+constexpr uint32_t key_ctrl = 0x100, key_shift = 0x200, key_alt = 0x400, default_settings_window_key = key_ctrl | key_shift | 0x75; // VK_F6
+std::string hotkey_name(uint32_t key);
+uint32_t parse_hotkey(const std::string& text); // 0: not a key this understands
+// Why a hotkey can't be used (taken by the fix itself, closes the sim, needs a modifier), or null if it can.
+const char* hotkey_problem(uint32_t key);
+void set_settings_window_key(uint32_t key);
 
 // One line on what the fix is doing ("Working: fixing 4 screens ..."), and the report to paste into bug reports.
 std::string status_summary(const Status& s);
