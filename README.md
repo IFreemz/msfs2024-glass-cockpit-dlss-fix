@@ -262,9 +262,13 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
   night). Setting it back to the default (16) stopped the flicker.
 - **Extra DLSS passes:** if a mod or the sim runs a second DLSS pass at the internal resolution, the fix stays on the
   sim's real upscale (the one with the largest output).
-- **Standalone DLSS Glass Cockpit Refresh** ([wesimglide.org](https://wesimglide.org/otherdata/tools/Standalone-DLSS-Glass-Cockpit-Refresh.html)):
-  a third-party package of this add-on with ReShade built in, by WeSimGlide. For problems with it, follow the support
-  steps on its page. Don't use it together with either version of this fix (the fix would run twice).
+- **Standalone DLSS Glass Cockpit Refresh** ([wesimglide.org](https://wesimglide.org/otherdata/tools/Standalone-DLSS-Glass-Cockpit-Refresh.html),
+  [flightsim.to](https://flightsim.to/addon/116956/wsg-standalone-dlss-glass-cockpit-refresh-fix)): an unofficial
+  installer and settings app by WeSimGlide. From its version 1.0.2.10 it installs the official standalone `dxgi.dll`
+  from this page (checked against the release), keeps your `.ini` and backs up what it replaces, and its settings are
+  the ones in the `.ini`. Problems with installing or with the app go to WeSimGlide; problems with the fixed screens
+  come here. Older versions of it installed their own build instead: if you still have one of those, don't add either
+  version of this fix on top (the fix would run twice).
 - **[OptiShade](https://github.com/GamingWithGravy/OptiShade)** by Gravy: bundles the official, unmodified add-on (an OptiShade update with 1.0.0 is coming
   soon). Use one or the other, not both: with OptiShade, don't also install the `.addon64` or the `dxgi.dll` from here.
   Problems with OptiShade itself (installing, its presets and effects, updates) go to
