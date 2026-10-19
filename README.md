@@ -286,7 +286,9 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
   - with the add-on, load ReShade through an ASI loader or through OptiScaler's `LoadReshade` option instead;
   - with the standalone version, rename OptiScaler's `dxgi.dll` to another name it supports (e.g. `winmm.dll` or
     `version.dll`) and keep the fix as `dxgi.dll`.
-- **DLSS Enabler:** built on OptiScaler, so it should work the same way. Not tested yet, reports welcome.
+- **DLSS Enabler:** reported (4.9.0, installed as `version.dll`): with the standalone version the sim doesn't start;
+  removing DLSS Enabler's `version.dll` fixed it. For more than 2x Frame Generation on RTX 40 cards, dashdogy's
+  RTX40MFG-Unlock (above) works with both versions of this fix. With the add-on, not tested yet, reports welcome.
 - **Standalone version through an ASI loader instead of as `dxgi.dll`:** don't. An ASI loader usually loads the DLL
   after the sim has set up its graphics, and then the fix can't see what it needs: screens will most likely stay
   unfixed (the log says so).
