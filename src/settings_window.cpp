@@ -186,7 +186,7 @@ void set_value(Id id, int v) {
         case id_edge_stretch: e.edge_stretch = v; break;
         default: return;
         }
-        glass::set_experimental(e);
+        glass::set_experimental(e, &status.experimental);
     }
     read_status();
 }
@@ -472,7 +472,7 @@ void click(HWND hwnd, Id id) {
         SetTimer(hwnd, capture_poll_timer, 15, nullptr); // the keys go to the sim: they're read from the keyboard's state
         break;
     case id_reset_advanced: glass::set_jitter_positive(true); glass::set_glass_strength(100); break;
-    case id_reset_experimental: glass::set_experimental({}); break;
+    case id_reset_experimental: glass::set_experimental({}, nullptr); break;
     case id_capture: glass::request_capture(); break;
     case id_log_folder: {
         const std::wstring arguments = L"/select,\"" + status.log_path + L"\"";

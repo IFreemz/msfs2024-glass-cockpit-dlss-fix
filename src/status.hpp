@@ -44,7 +44,9 @@ void set_jitter_positive(bool on);
 void set_line_smoothing(int percent);
 void set_extra_smoothing(bool on);
 void set_glass_strength(int percent);
-void set_experimental(const Experimental& e);
+// edited_from: the settings the tab or window showed when this was changed (only what differs from it is applied);
+// null applies all (Reset).
+void set_experimental(const Experimental& e, const Experimental* edited_from);
 
 // Hotkeys: a virtual-key code plus modifier bits. Written in the .ini as e.g. "Ctrl+Shift+F6".
 constexpr uint32_t key_ctrl = 0x100, key_shift = 0x200, key_alt = 0x400, default_settings_window_key = key_ctrl | key_shift | 0x75; // VK_F6

@@ -3373,19 +3373,25 @@ bool settings_changed() { // under settings_mutex
     settings_written = data.ftLastWriteTime;
     return true;
 }
+void reload_settings_locked() { // under settings_mutex
+    if (!settings_changed()) return;
+    const bool was_enabled = enabled;
+    load_settings();
+    if (enabled && !was_enabled) ++generation; // lists recorded while it was off have stale binding state
+    log("settings reloaded: %s", settings_text().c_str());
+}
 template <class Change> void change_settings(Change&& change) {
     std::lock_guard lock(settings_mutex);
+    // The file may have been saved since the last look (by another settings app, or Notepad): take that in first, or
+    // saving the values in memory would undo it.
+    reload_settings_locked();
     change();
     save_settings();
     settings_changed();
 }
 void reload_settings() {
     std::lock_guard lock(settings_mutex);
-    if (!settings_changed()) return;
-    const bool was_enabled = enabled;
-    load_settings();
-    if (enabled && !was_enabled) ++generation; // lists recorded while it was off have stale binding state
-    log("settings reloaded: %s", settings_text().c_str());
+    reload_settings_locked();
 }
 
 // Hotkeys (Ctrl+Shift+...), polled about 30 times a second while one of the sim's windows has the focus.
@@ -4041,20 +4047,25 @@ void set_jitter_positive(bool on) {
     change_settings([&] { jitter_positive = on; });
     log("setting jitter_positive=%d", int(on));
 }
-void set_experimental(const Experimental& e) {
+void set_experimental(const Experimental& e, const Experimental* edited_from) {
     change_settings([&] {
-        detail_clamp_percent = std::clamp(e.detail_clamp, 0, 100); edge_fade_percent = std::clamp(e.edge_fade, 0, max_edge_fade);
-        angle_soften_percent = std::clamp(e.angle_softening, 0, 100); edge_stretch_percent = std::clamp(e.edge_stretch, 0, max_edge_stretch);
-        edge_trim_percent = std::clamp(e.edge_trim, 0, max_edge_trim);
-        dark_screen_fix = e.dark_screens ? 1 : 0;
-        seam_fix = e.seam_fix ? 1 : 0;
-        temporal_aa = e.temporal_aa ? 1 : 0;
-        soft_smoothing = e.soft_smoothing ? 1 : 0;
-        if (soft_smoothing) temporal_aa = 0; // one or the other
-        stable_edges = e.stable_edges ? 1 : 0;
-        mip0_only = e.full_size != 0;
-        calm_glass = e.calm_glass ? 1 : 0;
-        occlusion_check = e.occlusion_check ? 1 : 0;
+        // Only the fixes changed here: the others keep what the file says now (another settings app may have changed
+        // them since the tab or window last showed them). No snapshot (Reset): all of them.
+        const auto changed = [&](int Experimental::* field) { return !edited_from || e.*field != edited_from->*field; };
+        if (changed(&Experimental::detail_clamp)) detail_clamp_percent = std::clamp(e.detail_clamp, 0, 100);
+        if (changed(&Experimental::edge_fade)) edge_fade_percent = std::clamp(e.edge_fade, 0, max_edge_fade);
+        if (changed(&Experimental::angle_softening)) angle_soften_percent = std::clamp(e.angle_softening, 0, 100);
+        if (changed(&Experimental::edge_stretch)) edge_stretch_percent = std::clamp(e.edge_stretch, 0, max_edge_stretch);
+        if (changed(&Experimental::edge_trim)) edge_trim_percent = std::clamp(e.edge_trim, 0, max_edge_trim);
+        if (changed(&Experimental::dark_screens)) dark_screen_fix = e.dark_screens ? 1 : 0;
+        if (changed(&Experimental::seam_fix)) seam_fix = e.seam_fix ? 1 : 0;
+        if (changed(&Experimental::temporal_aa)) temporal_aa = e.temporal_aa ? 1 : 0;
+        if (changed(&Experimental::soft_smoothing)) soft_smoothing = e.soft_smoothing ? 1 : 0;
+        if (temporal_aa && soft_smoothing) { if (changed(&Experimental::temporal_aa)) soft_smoothing = 0; else temporal_aa = 0; } // one or the other
+        if (changed(&Experimental::stable_edges)) stable_edges = e.stable_edges ? 1 : 0;
+        if (changed(&Experimental::full_size)) mip0_only = e.full_size != 0;
+        if (changed(&Experimental::calm_glass)) calm_glass = e.calm_glass ? 1 : 0;
+        if (changed(&Experimental::occlusion_check)) occlusion_check = e.occlusion_check ? 1 : 0;
     });
     log("setting seam_fix=%d full_size_sampling=%d stable_edges=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d", seam_fix.load(), int(mip0_only.load()), stable_edges.load(),
         dark_screen_fix.load(), detail_clamp_percent.load(), edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
