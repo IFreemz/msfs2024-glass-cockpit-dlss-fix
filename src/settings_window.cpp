@@ -506,7 +506,7 @@ void key_pressed(HWND hwnd, UINT vk) {
     if (GetAsyncKeyState(VK_MENU) & 0x8000) key |= glass::key_alt;
     const std::string name = glass::hotkey_name(key);
     if (name.find('?') != std::string::npos || glass::parse_hotkey(name) != key) {
-        help_note = L"That key can't be used for the hotkey: try an F key, a letter or a number with Ctrl, Shift or Alt.";
+        help_note = L"That key can't be used for the hotkey: try another key with Ctrl, Shift or Alt.";
     } else if (const char* problem = glass::hotkey_problem(key)) {
         help_note = wide(name) + L" can't be used: " + wide(problem) + L".";
     } else {

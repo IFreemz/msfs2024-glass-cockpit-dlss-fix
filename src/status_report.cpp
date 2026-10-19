@@ -28,11 +28,16 @@ std::string check_row(Check state, const char* label, const std::string& detail)
 }
 
 namespace {
-// Keys a hotkey can use, by name (virtual-key codes).
+// Keys a hotkey can use, by name (virtual-key codes). The punctuation keys are named after the US layout; on other
+// layouts the same physical key prints another character but works the same.
 struct KeyName { const char* name; uint32_t vk; };
 constexpr KeyName key_names[] = {
     {"Insert", 0x2D}, {"Delete", 0x2E}, {"Home", 0x24}, {"End", 0x23}, {"PageUp", 0x21}, {"PageDown", 0x22},
-    {"Pause", 0x13}, {"ScrollLock", 0x91}, {"Space", 0x20},
+    {"Pause", 0x13}, {"ScrollLock", 0x91}, {"Space", 0x20}, {"Tab", 0x09}, {"Backspace", 0x08}, {"Enter", 0x0D},
+    {"Up", 0x26}, {"Down", 0x28}, {"Left", 0x25}, {"Right", 0x27},
+    {"Num*", 0x6A}, {"NumPlus", 0x6B}, {"Num-", 0x6D}, {"Num.", 0x6E}, {"Num/", 0x6F},
+    {";", 0xBA}, {"=", 0xBB}, {",", 0xBC}, {"-", 0xBD}, {".", 0xBE}, {"/", 0xBF}, {"`", 0xC0},
+    {"[", 0xDB}, {"\\", 0xDC}, {"]", 0xDD}, {"'", 0xDE}, {"<>", 0xE2},
 };
 }
 
@@ -84,6 +89,7 @@ const char* hotkey_problem(uint32_t key) {
     if (!vk) return "not a key";
     if (mods == (key_ctrl | key_shift) && vk >= 0x76 && vk <= 0x7B) return "Ctrl+Shift+F7 to F12 are the fix's own hotkeys";
     if (mods == key_alt && vk == 0x73) return "Alt+F4 closes the sim";
+    if (mods == key_alt && (vk == 0x09 || vk == 0x20 || vk == 0x0D)) return "Windows uses Alt+Tab, Alt+Space and Alt+Enter";
     const bool alone_ok = (vk >= 0x7C && vk <= 0x87) || vk == 0x13 || vk == 0x91; // F13-F24, Pause, Scroll Lock
     if (!mods && !alone_ok) return "add Ctrl, Shift or Alt, so it doesn't fire while you type or fly";
     return nullptr;
