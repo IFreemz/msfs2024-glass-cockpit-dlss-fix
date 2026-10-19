@@ -275,10 +275,16 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
   [OptiShade's issues](https://github.com/GamingWithGravy/OptiShade/issues); problems with the fixed screens come here.
 - **Multi Frame Generation unlocks for RTX 40:**
   - **RenoDX MFG unlock add-on:** tested, works together with this fix.
-  - **[RTX40MFG-Unlock](https://github.com/dashdogy/RTX40MFG-Unlock) by dashdogy:** tested with v1.4.2 (installed as
-    `winmm.dll` next to an ASI loader's `version.dll`; `version.dll` alone works too), so it can stay as it is with
-    either version (the fix follows its DLSS redirect). Its Backspace menu doesn't show up when ReShade is loaded, with or without this fix, so set the
-    multiplier in the sim's frame generation setting or in its `RTXMFG-Universal.json`.
+  - **[RTX40MFG-Unlock](https://github.com/dashdogy/RTX40MFG-Unlock) by dashdogy:** works with either version (the fix
+    follows its DLSS redirect).
+    - Tested with v1.6.0 and the standalone version on its own: `MFGUnlocker.dll` renamed to `winmm.dll` next to the
+      fix's `dxgi.dll`, nothing else needed; 3x Frame Generation with every screen fixed.
+    - Tested earlier with v1.4.2 and the add-on (as `winmm.dll` next to an ASI loader's `version.dll`; `version.dll`
+      alone works too). Its Backspace menu doesn't show up when ReShade is loaded, with or without this fix, so set the
+      multiplier in the sim's frame generation setting or in its `RTXMFG-Universal.json`.
+    - **With OptiScaler, don't install it as `winmm.dll`:** the sim crashed at startup (the crash was in
+      OptiScaler). Install it as an OptiScaler plugin instead, as its README describes (`MFGUnlocker.asi` in
+      `OptiScaler\plugins`, `LoadAsiPlugins = true` in `OptiScaler.ini`); OptiScaler's menu then controls it.
 - **OptiScaler:** works with any upscaler selected in OptiScaler (DLSS, FSR 2/3/4, XeSS), including OptiScaler's
   DLSS 5 Neural Rendering. On AMD and Intel GPUs this also lets you select DLSS in the sim and have OptiScaler run FSR
   or XeSS (tested on NVIDIA, and by the community on an AMD RX 9070 XT with FSR 4). OptiScaler is usually installed as
