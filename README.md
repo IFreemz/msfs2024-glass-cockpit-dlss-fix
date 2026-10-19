@@ -280,8 +280,8 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
     - Tested with v1.6.0 and the standalone version on its own: `MFGUnlocker.dll` renamed to `winmm.dll` next to the
       fix's `dxgi.dll`, nothing else needed; 3x Frame Generation with every screen fixed.
     - Tested earlier with v1.4.2 and the add-on (as `winmm.dll` next to an ASI loader's `version.dll`; `version.dll`
-      alone works too). Its Backspace menu doesn't show up when ReShade is loaded, with or without this fix, so set the
-      multiplier in the sim's frame generation setting or in its `RTXMFG-Universal.json`.
+      alone works too).
+    - Its Backspace menu didn't open in the sim in either test (with and without ReShade); it ran at 3x on its own.
     - **With OptiScaler, don't install it as `winmm.dll`:** the sim crashed at startup (the crash was in
       OptiScaler). Install it as an OptiScaler plugin instead, as its README describes (`MFGUnlocker.asi` in
       `OptiScaler\plugins`, `LoadAsiPlugins = true` in `OptiScaler.ini`); OptiScaler's menu then controls it.
