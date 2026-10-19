@@ -2,8 +2,8 @@
 #pragma once
 #define GLASS_VERSION_MAJOR 1
 #define GLASS_VERSION_MINOR 0
-#define GLASS_VERSION_PATCH 1
-#define GLASS_VERSION_STRING "1.0.1"
+#define GLASS_VERSION_PATCH 2
+#define GLASS_VERSION_STRING "1.0.2"
 #define GLASS_NAME "Glass Cockpit DLSS Fix"
 #define GLASS_AUTHOR "IFreemz"
 #define GLASS_WEBSITE "https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix"
