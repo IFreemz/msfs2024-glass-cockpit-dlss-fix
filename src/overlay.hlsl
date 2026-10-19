@@ -488,12 +488,20 @@ void solve(uint3 id : SV_DispatchThreadID)
     // The screen texture is read times each mesh's brightness relative to the slot's reference: when the reference
     // changed since the stored match was fitted, the match is rescaled to it (the same picture, no jump).
     float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4)), fitted = asfloat(edge_bounds.Load(brightness_fitted + slot * 4));
+    // The slot took another screen texture (the sim recycles them): its brightness match belongs to the old one, and
+    // this call's reference is still the old screen's brightest mesh (it follows a frame behind). With the ratio capped
+    // at 16x, a texture from a mesh much brighter than that (iniBuilds A380: 1 against 3600) was fitted 16x off and then
+    // rescaled by the full 3600x: the screen flashed ~200x too bright. The same for a reference change over 16x. Leave the
+    // screen to the upscaler for this call and start over on the next, with the new reference.
+    if ((bounds_reset & (1u << slot)) || (reference > 0 && fitted > 0 && (reference > 16 * fitted || 16 * reference < fitted)))
+    {
+        params[slot * 3] = 0;
+        edge_bounds.Store(brightness_fitted + slot * 4, 0);
+        return;
+    }
     if (reference > 0 && fitted > 0 && reference != fitted) previous_a.rgb *= reference / fitted;
     if (reference > 0) edge_bounds.Store(brightness_fitted + slot * 4, asuint(reference));
     if (flags & 1) previous_a.w = 0;
-    // The slot took another screen texture (the sim recycles them): its brightness match belongs to the old one. Start
-    // over, and leave the screen to the upscaler until the new one has enough samples (a wrong match would flash).
-    if (bounds_reset & (1u << slot)) previous_a.w = 0;
     double n = v[0];
     if (n < 64) { params[slot * 3] = previous_a; return; }
     // Per channel: scene = gain * screen + offset (least squares).
