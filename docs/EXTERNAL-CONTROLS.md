@@ -46,5 +46,5 @@ controller is attached, so native **Off** is effective; this is not an OR of two
 
 `tests/external_tint.cpp` uses real child processes and the production protocol implementation. It checks capability
 discovery, on/off in both directions, a second controller being refused, PID isolation, clean shutdown, forced
-termination, reconnect, and native controls after detachment. `scripts/build.ps1 -Test` builds it;
+termination, reconnect, and native controls after detachment, including a native click before the worker has observed controller exit. `scripts/build.ps1 -Test` builds it;
 `scripts/test.ps1` runs it. No MSFS installation is used.

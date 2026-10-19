@@ -94,6 +94,19 @@ try {
         New-Item -ItemType Directory -Path $unit -Force | Out-Null
         & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /Fe:"$unit\external_tint.exe" (Join-Path $root 'tests\external_tint.cpp')
         if ($LASTEXITCODE) { throw 'External tint test compilation failed' }
+        # Compile the production residual-compositing block against synthetic samples on the GPU.
+        $overlay = [IO.File]::ReadAllText((Join-Path $root 'src\overlay.hlsl'))
+        $begin = $overlay.IndexOf('    float3 smooth = 0, m1 = 0, m2 = 0, scene_low = 1e9, scene_high = -1e9;')
+        $last = '    float3 colour = content + glass;'
+        $end = $overlay.IndexOf($last, [Math]::Max(0, $begin))
+        if ($begin -lt 0 -or $end -lt $begin) { throw 'Could not locate production residual block for regression test' }
+        $block = $overlay.Substring($begin, $end + $last.Length - $begin).Replace('residual[q]', 'test_residual(q)')
+        $template = [IO.File]::ReadAllText((Join-Path $root 'tests\residual_guard.hlsl'))
+        [IO.File]::WriteAllText((Join-Path $unit 'residual_guard.hlsl'), $template.Replace('    // COMPOSITE_RESIDUAL_BLOCK', $block))
+        & $dxc -T cs_6_6 -HV 2021 -E main -WX -O3 -Fo "$unit\residual_guard.cso" "$unit\residual_guard.hlsl"
+        if ($LASTEXITCODE) { throw 'Residual regression shader compilation failed' }
+        & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /Fe:"$unit\residual_guard.exe" (Join-Path $root 'tests\residual_guard.cpp') /link d3d12.lib
+        if ($LASTEXITCODE) { throw 'Residual regression host compilation failed' }
         # Includes the real settings implementation, without starting the engine/hook worker.
         & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /I $build /I (Join-Path $minhook 'include') /I $reshadeInclude /I $imgui /Fe:"$unit\settings_merge.exe" (Join-Path $root 'tests\settings_merge.cpp') status_report.obj vtable_slots.obj buffer.obj hook.obj trampoline.obj hde64.obj /link d3d12.lib dxgi.lib version.lib user32.lib shell32.lib ole32.lib windowscodecs.lib
         if ($LASTEXITCODE) { throw 'Settings merge test compilation failed' }

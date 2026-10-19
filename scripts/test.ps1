@@ -3,6 +3,9 @@
 # Each writes overlay-*.png and glass-cockpit-dlss-fix.log in its folder.
 $ErrorActionPreference = 'Stop'
 $build = Join-Path (Split-Path $PSScriptRoot) 'build'
+# Synthetic residual regression executes the production compositing block on the GPU.
+& (Join-Path $build 'unit\residual_guard.exe') (Join-Path $build 'unit\residual_guard.cso')
+if ($LASTEXITCODE) { throw 'Residual compositing test failed' }
 # Unit tests never start the graphics engine or touch the simulator's installation.
 & (Join-Path $build 'unit\external_tint.exe')
 if ($LASTEXITCODE) { throw 'External tint protocol test failed' }

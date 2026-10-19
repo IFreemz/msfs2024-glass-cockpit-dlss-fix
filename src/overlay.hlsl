@@ -1064,8 +1064,9 @@ void composite(uint3 id : SV_DispatchThreadID)
         smooth += outline_sum * (extra / outline_weight); m2 += outline_m2 * (extra / outline_weight); smooth_weight += extra;
     }
     // A screen can first qualify during solve(), after fit() skipped its residuals. Until fresh
-    // non-outline samples exist, retain the valid upscaler image instead of dropping the glass layer.
-    if (count == 0) return;
+    // samples exist, retain the upscaler image. Include the outline fallback above: a small/high-contrast
+    // screen may have only outline samples, which still provide a usable glass estimate.
+    if (smooth_weight <= 1e-3) return;
     if (smooth_weight > 1e-3)
     {
         glass = smooth / smooth_weight;

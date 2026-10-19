@@ -8,7 +8,7 @@ The original defaults, licenses and notices are retained. Nothing here installs 
 ## First accepted dark screen under glare
 
 The fitting pass can skip a screen that only qualifies in the subsequent solve pass. The composite then has no fresh
-non-outline residual samples, but replaces the valid upscaler image using an inadequate glass estimate. The guard
+residual samples, but replaces the valid upscaler image using an inadequate glass estimate. The guard
 leaves the upscaler result for that frame and resumes correction once residual samples exist.
 
 Reproduction uses a mostly dark display, sparse light lines, strong spatial glare, and Dark screen fix enabled.
@@ -19,6 +19,12 @@ later scrolling frame. Test both desktop and stereo, with Dark screen fix off an
 |---|---:|---:|---:|
 | Desktop | 0.587132 | 0.587132 | 0.007674 |
 | Stereo | 0.586385 | 0.586385 | 0.007680 |
+
+Review follow-up: the guard uses **total usable weight after the outline fallback**, not a count of non-outline
+samples. Small/high-contrast displays can legitimately have only outline samples. A new GPU regression compiles the
+actual production residual-compositing block with synthetic empty, outline-only, regular and mixed samples. The
+original contribution fails the outline-only case (leaves the upscaler image); the corrected guard passes all four.
+Only texture inputs are substituted in that test; the fallback and guard logic are taken directly from the shader.
 
 Values are normalized interior error; the existing quality limit is 0.02. Those A/B measurements were made on an
 RTX 4090. This demonstrates one experimental-setting rendering regression, **not** a startup crash or a claim that
@@ -37,7 +43,9 @@ if another writer changes the file during the subsequent save; same-field edits 
 ## Green-tint control
 
 [External-controls protocol](EXTERNAL-CONTROLS.md). The unit test uses real child processes for on/off in both
-directions, controller crash/exit and reconnect. `--external-tint` uses the actual engine worker and rendered pixels
+directions, controller crash/exit and reconnect, including a native on-click after owner exit but before the next
+poll (with the previous external state both off and on). The original contribution fails that ordering; clearing
+stale attachment in the native setter preserves the new request. `--external-tint` uses the actual engine worker and rendered pixels
 to check on/off/detach in desktop and stereo. Normal operation still needs no external controller.
 
 ## Commands
@@ -52,7 +60,7 @@ python -B tests/motion_quality.py
 
 Verified locally on 2026-10-18: both variants compiled and every standalone check below passed on an RTX 4090.
 
-The build compiles the standalone DLL and ReShade add-on. The tests run two unit suites, four normal/copied-vtable
+The build compiles the standalone DLL and ReShade add-on. The tests run two unit suites, a four-case GPU residual regression, four normal/copied-vtable
 Present/Present1 startup probes, the existing 16 graphics scenarios and capture check, two tint-rendering scenarios,
 and four dark-glare scenarios. The optional Python check asserts 13 motion, occlusion, brightness, history and
 texture-replacement measurements with finite values and quality limits.

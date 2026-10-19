@@ -88,6 +88,16 @@ int wmain(int argc, wchar_t** argv) try {
         check(server.poll(server.set(true)), "Native toggle after detach");
         check(!server.poll(server.set(false)), "Native reset after detach");
     }
-    std::puts("External tint: capability, bidirectional control, isolation, single owner, clean exit, crash and reconnect PASS");
+    for (bool crash : {false, true}) for (bool was_on : {false, true}) {
+        child controller(argv[0], pid); check(controller.reply() == 'R', "Race controller attach");
+        controller.send(was_on ? '1' : '0'); check(controller.reply() == (was_on ? '1' : '0'), "Race initial state");
+        check(server.poll(!was_on) == was_on, "Race attachment was not observed");
+        controller.stop(crash);
+        // A native click arrives after owner exit but BEFORE the next housekeeping poll.
+        check(server.poll(server.set(true)), "Native on before detach poll was lost");
+        check(server.poll(true), "Native on did not survive a later poll");
+        check(!server.poll(server.set(false)), "Native off after exit race");
+    }
+    std::puts("External tint: capability, bidirectional control, isolation, single owner, clean exit, crash, reconnect and native-click/exit race PASS");
     return 0;
 } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }

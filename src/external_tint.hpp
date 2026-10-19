@@ -55,6 +55,10 @@ public:
         handle state(owner_alive() ? OpenEventW(EVENT_MODIFY_STATE, FALSE, name(process_, L"On").c_str()) : nullptr);
         if (state.value) {
             if (on ? SetEvent(state.value) : ResetEvent(state.value)) attached_ = true;
+        } else {
+            // A native edit may arrive after owner exit, before poll notices it. This local intent
+            // supersedes the old attachment; the next poll must not clear the new native value.
+            attached_ = false;
         }
         return on;
     }
