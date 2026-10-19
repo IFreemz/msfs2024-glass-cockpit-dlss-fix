@@ -1,3 +1,10 @@
+> **Unofficial contribution branch (siglr), not a release.** Based on **Glass Cockpit DLSS Fix by IFreemz**
+> (https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix).
+> This branch proposes a first-recognition glare fix, merging pending external settings edits, and
+> [external green-tint preview control](docs/EXTERNAL-CONTROLS.md). Builds identify themselves as
+> `1.0.1-siglr-review`; use the upstream releases for ordinary installation. GPL-3.0-only and `NOTICE.md` apply.
+> [Reproduction, validation and follow-up review notes](docs/CONTRIBUTION-VALIDATION.md).
+
 # Glass Cockpit DLSS Fix for MSFS 2024 (DLSS, FSR and VR)
 
 Removes **upscaler ghosting and smearing from glass cockpit displays** in Microsoft Flight Simulator 2024: speed and

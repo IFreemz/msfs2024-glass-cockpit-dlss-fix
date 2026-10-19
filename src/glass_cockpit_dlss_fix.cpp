@@ -55,6 +55,7 @@
 #include "pipeline_clone.hpp"
 #include "overlay_shaders.h"
 #include "host.hpp"
+#include "external_tint.hpp"
 #include "status.hpp"
 #include "version.h"
 
@@ -128,6 +129,8 @@ bool reshade_addon = false;
 const char* edition() { return reshade_addon ? "ReShade add-on" : "standalone"; }
 
 std::atomic<bool> enabled{true}, jitter_positive{true}, tint{false};
+std::mutex tint_mutex;
+glass::external_tint::server tint_control;
 // Standalone: the ReShade add-on build of this fix is loaded as well. It does the work, this copy stays off.
 std::atomic<bool> duplicate_fix{false};
 }
@@ -3373,19 +3376,24 @@ bool settings_changed() { // under settings_mutex
     settings_written = data.ftLastWriteTime;
     return true;
 }
+void reload_settings_locked() { // under settings_mutex, also before a local write
+    if (!settings_changed()) return;
+    const bool was_enabled = enabled;
+    load_settings();
+    if (enabled && !was_enabled) ++generation; // lists recorded while it was off have stale binding state
+    log("settings reloaded: %s", settings_text().c_str());
+}
 template <class Change> void change_settings(Change&& change) {
     std::lock_guard lock(settings_mutex);
+    // An external editor may have saved since the last one-second poll. Merge that snapshot first.
+    reload_settings_locked();
     change();
     save_settings();
     settings_changed();
 }
 void reload_settings() {
     std::lock_guard lock(settings_mutex);
-    if (!settings_changed()) return;
-    const bool was_enabled = enabled;
-    load_settings();
-    if (enabled && !was_enabled) ++generation; // lists recorded while it was off have stale binding state
-    log("settings reloaded: %s", settings_text().c_str());
+    reload_settings_locked();
 }
 
 // Hotkeys (Ctrl+Shift+...), polled about 30 times a second while one of the sim's windows has the focus.
@@ -3544,6 +3552,7 @@ void housekeeping() {
     for (;;) {
         Sleep(33);
         const uint64_t now = GetTickCount64();
+        { std::lock_guard lock(tint_mutex); tint = tint_control.poll(tint.load()); }
         poll_hotkeys();
         // No presents for a second: keep the frame clock going (about 60 ticks a second).
         if (!fixture_host && now - last_present_tick.load() > 1000) { frame_tick(nullptr, nullptr); frame_tick(nullptr, nullptr); }
@@ -3987,12 +3996,17 @@ Status status() {
     return s;
 }
 void set_enabled(bool on) {
-    if (on == enabled) return;
-    if (on) ++generation;
-    change_settings([&] { enabled = on; });
+    change_settings([&] {
+        if (on && !enabled) ++generation;
+        enabled = on;
+    });
     log("setting overlay=%d", int(on));
 }
-void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
+void set_tint(bool on) {
+    std::lock_guard lock(tint_mutex);
+    tint = tint_control.set(on);
+    log("setting tint=%d", int(on));
+}
 void request_pixel_probe() {
     if (!main_state || pixel_probe_frame.load() != UINT64_MAX) return;
     { std::lock_guard lock(pixel_probe_pending_mutex); pixel_probe_pending.clear(); }
@@ -4041,20 +4055,27 @@ void set_jitter_positive(bool on) {
     change_settings([&] { jitter_positive = on; });
     log("setting jitter_positive=%d", int(on));
 }
-void set_experimental(const Experimental& e) {
+void set_experimental(const Experimental& e, const Experimental* previous) {
     change_settings([&] {
-        detail_clamp_percent = std::clamp(e.detail_clamp, 0, 100); edge_fade_percent = std::clamp(e.edge_fade, 0, max_edge_fade);
-        angle_soften_percent = std::clamp(e.angle_softening, 0, 100); edge_stretch_percent = std::clamp(e.edge_stretch, 0, max_edge_stretch);
-        edge_trim_percent = std::clamp(e.edge_trim, 0, max_edge_trim);
-        dark_screen_fix = e.dark_screens ? 1 : 0;
-        seam_fix = e.seam_fix ? 1 : 0;
-        temporal_aa = e.temporal_aa ? 1 : 0;
-        soft_smoothing = e.soft_smoothing ? 1 : 0;
-        if (soft_smoothing) temporal_aa = 0; // one or the other
-        stable_edges = e.stable_edges ? 1 : 0;
-        mip0_only = e.full_size != 0;
-        calm_glass = e.calm_glass ? 1 : 0;
-        occlusion_check = e.occlusion_check ? 1 : 0;
+        auto apply = [&](int Experimental::* field, auto& target, int maximum) {
+            if (!previous || e.*field != (*previous).*field) target = std::clamp(e.*field, 0, maximum);
+        };
+        apply(&Experimental::detail_clamp, detail_clamp_percent, 100);
+        apply(&Experimental::edge_fade, edge_fade_percent, max_edge_fade);
+        apply(&Experimental::angle_softening, angle_soften_percent, 100);
+        apply(&Experimental::edge_stretch, edge_stretch_percent, max_edge_stretch);
+        apply(&Experimental::edge_trim, edge_trim_percent, max_edge_trim);
+        apply(&Experimental::dark_screens, dark_screen_fix, 1);
+        apply(&Experimental::seam_fix, seam_fix, 1);
+        apply(&Experimental::temporal_aa, temporal_aa, 1);
+        apply(&Experimental::soft_smoothing, soft_smoothing, 1);
+        // The two modes are mutually exclusive; an explicitly enabled mode wins over pending file edits.
+        if (e.temporal_aa && previous && e.temporal_aa != previous->temporal_aa) soft_smoothing = 0;
+        if (soft_smoothing) temporal_aa = 0;
+        apply(&Experimental::stable_edges, stable_edges, 1);
+        apply(&Experimental::full_size, mip0_only, 1);
+        apply(&Experimental::calm_glass, calm_glass, 1);
+        apply(&Experimental::occlusion_check, occlusion_check, 1);
     });
     log("setting seam_fix=%d full_size_sampling=%d stable_edges=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d", seam_fix.load(), int(mip0_only.load()), stable_edges.load(),
         dark_screen_fix.load(), detail_clamp_percent.load(), edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());

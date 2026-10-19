@@ -3,6 +3,19 @@
 # Each writes overlay-*.png and glass-cockpit-dlss-fix.log in its folder.
 $ErrorActionPreference = 'Stop'
 $build = Join-Path (Split-Path $PSScriptRoot) 'build'
+# Unit tests never start the graphics engine or touch the simulator's installation.
+& (Join-Path $build 'unit\external_tint.exe')
+if ($LASTEXITCODE) { throw 'External tint protocol test failed' }
+$settingsDirectory = Join-Path $build ('unit\settings-' + [guid]::NewGuid().ToString('N'))
+& (Join-Path $build 'unit\settings_merge.exe') $settingsDirectory
+if ($LASTEXITCODE) { throw 'Settings merge test failed' }
+$resolvedSettings = [IO.Path]::GetFullPath($settingsDirectory)
+if (-not $resolvedSettings.StartsWith([IO.Path]::GetFullPath((Join-Path $build 'unit')) + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe test cleanup path' }
+Remove-Item -LiteralPath $resolvedSettings -Recurse -Force
+foreach ($mode in 'normal', 'clone', 'normal-present1', 'clone-present1') {
+    & (Join-Path $build 'startup\FlightSimulator2024.exe') (Join-Path $build 'startup\dxgi.dll') $mode
+    if ($LASTEXITCODE) { throw "Standalone startup probe failed: $mode" }
+}
 $cases = @(
     @{ Args = @(); Name = 'Offline test' }
     @{ Args = @('--fsr'); Name = 'Offline FSR test' }
@@ -32,6 +45,8 @@ $cases = @(
     # The screen capture tool writes its pictures (and what the brightness match read); the capture folders it makes are
     # removed afterwards.
     @{ Args = @('--motion', '--only', 'still-edges-on', '--capture'); Name = 'Offline screen capture test' }
+    @{ Args = @('--external-tint'); Name = 'Offline external tint rendering test' }
+    @{ Args = @('--external-tint', '--vr'); Name = 'Offline external tint VR rendering test' }
 )
 $hosts = @(@{ Folder = 'test'; Name = 'dxgi.dll' }, @{ Folder = 'test-addon'; Name = 'ReShade add-on' }) |
     Where-Object { Test-Path -LiteralPath (Join-Path $build "$($_.Folder)\FlightSimulator2024.exe") }
@@ -45,7 +60,31 @@ foreach ($testHost in $hosts) {
             & .\FlightSimulator2024.exe @arguments
             if ($LASTEXITCODE) { throw "$($case.Name) failed with the $($testHost.Name) ($LASTEXITCODE)" }
         }
-        Get-ChildItem -Filter 'glass-capture-*' | Remove-Item -Recurse -Force
+        # Dark, sparse display under strong glare: even the first accepted frame must keep its glass.
+        # The regular fixture runs with author defaults; these four checks also cover Dark screen fix ON.
+        $ini = Join-Path (Get-Location).Path 'glass-cockpit-dlss-fix.ini'
+        $previousIni = if (Test-Path -LiteralPath $ini) { [IO.File]::ReadAllBytes($ini) } else { $null }
+        $previousEnv = $env:GLASS_FIXTURE_SETTINGS
+        try {
+            $env:GLASS_FIXTURE_SETTINGS = '1'
+            foreach ($dark in 0, 1) {
+                [IO.File]::WriteAllText($ini, "[overlay]`nenabled=1`nline_smoothing=35`n[experimental]`ndark_screen_fix=$dark`n")
+                foreach ($view in @(@{ Args = @('--first-glare') }, @{ Args = @('--first-glare', '--vr') })) {
+                    $arguments = $view.Args
+                    & .\FlightSimulator2024.exe @arguments
+                    if ($LASTEXITCODE) { throw "First-recognition glare test failed (dark=$dark, $arguments)" }
+                }
+            }
+        } finally {
+            $env:GLASS_FIXTURE_SETTINGS = $previousEnv
+            if ($null -ne $previousIni) { [IO.File]::WriteAllBytes($ini, $previousIni) }
+            elseif (Test-Path -LiteralPath $ini) { Remove-Item -LiteralPath $ini }
+        }
+        $testRoot = [IO.Path]::GetFullPath((Get-Location).Path) + '\'
+        Get-ChildItem -Directory -Filter 'glass-capture-*' | ForEach-Object {
+            if (-not ([IO.Path]::GetFullPath($_.FullName).StartsWith($testRoot, [StringComparison]::OrdinalIgnoreCase))) { throw 'Unsafe capture cleanup path' }
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force
+        }
     } finally { Pop-Location }
 }
 if (-not ($hosts | Where-Object { $_.Folder -eq 'test-addon' })) { Write-Warning 'The ReShade add-on was not tested (no build\test-addon: see scripts\build.ps1 -ReShadeDll)' }

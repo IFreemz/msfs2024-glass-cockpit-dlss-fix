@@ -186,7 +186,7 @@ void set_value(Id id, int v) {
         case id_edge_stretch: e.edge_stretch = v; break;
         default: return;
         }
-        glass::set_experimental(e);
+        glass::set_experimental(e, &status.experimental);
     }
     read_status();
 }

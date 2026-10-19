@@ -18,6 +18,7 @@
 #include <wincodec.h>
 #include "../src/ngx_interface.hpp"
 #include "../src/ffx_interface.hpp"
+#include "../src/external_tint.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -500,6 +501,10 @@ int main(int argc, char** argv) {
             std::vector<std::array<float, 4>> level(768 * 768);
             for (UINT y = 0; y < 768; ++y) for (UINT x = 0; x < 768; ++x) {
                 auto p = pattern(x, (y + scroll + (second ? 384 : 0)) % 768);
+                if (wcsstr(GetCommandLineW(), L"--first-glare")) {
+                    const bool line = (x % 96 < 2 && (y + scroll) % 96 < 42) || ((y + scroll) % 96 < 2 && x % 96 < 42);
+                    p = line ? std::array<uint8_t, 4>{180, 180, 180, 255} : std::array<uint8_t, 4>{2, 2, 2, 255};
+                }
                 if (blank) p = {0, 0, 0, 255};
                 if (join && !second && y >= 764) p = {230, 230, 230, 255};
                 if (join && !second && y >= 700 && y < 764 && p[0] + p[1] + p[2] == 0) p = {90, 50, 25, 255}; // brown above the join
@@ -697,6 +702,7 @@ int main(int argc, char** argv) {
         auto set_material = [&](const Frame& f) {
             material[4] = f.glare ? std::array<float, 4>{0.25f, 0.3f, 0.15f, 0.8f} : std::array<float, 4>{};
             material[5] = {0, 0, f.dirt, f.shadow_u};
+            if (wcsstr(GetCommandLineW(), L"--first-glare")) { material[4] = {0.4f, 0.5f, 0.6f, 4.0f}; material[5] = {}; }
             upload(materials[0].Get(), material.data(), sizeof(material));
         };
         auto render_reference = [&](int camera, UINT eye) {
@@ -1205,13 +1211,38 @@ int main(int argc, char** argv) {
             set_temporal(0); set_smooth(0);
             return 0;
         }
+        const bool first_glare = wcsstr(GetCommandLineW(), L"--first-glare") != nullptr;
+        const bool external_tint_test = wcsstr(GetCommandLineW(), L"--external-tint") != nullptr;
+        glass::external_tint::handle tint_owner, tint_event;
+        if (external_tint_test) {
+            const auto ready_name = glass::external_tint::name(GetCurrentProcessId(), L"Ready");
+            glass::external_tint::handle ready;
+            for (unsigned i = 0; i < 200 && !ready.value; ++i) {
+                ready.value = OpenEventW(SYNCHRONIZE, FALSE, ready_name.c_str());
+                if (!ready.value) Sleep(10);
+            }
+            require(ready.value != nullptr, "external tint capability missing");
+            tint_owner.value = CreateMutexW(nullptr, TRUE, glass::external_tint::name(GetCurrentProcessId(), L"Owner").c_str());
+            tint_event.value = CreateEventW(nullptr, TRUE, FALSE, glass::external_tint::name(GetCurrentProcessId(), L"On").c_str());
+            require(tint_owner.value && tint_event.value, "external tint controller creation failed");
+        }
         for (const auto& f : frames) {
+            const bool tint_on = external_tint_test && !std::strcmp(f.name, "scroll_3");
+            if (external_tint_test) {
+                if (tint_on) SetEvent(tint_event.value);
+                else ResetEvent(tint_event.value);
+                if (!std::strcmp(f.name, "scroll_5")) {
+                    SetEvent(tint_event.value); Sleep(150); // observed ON before the controller detaches
+                    ReleaseMutex(tint_owner.value); CloseHandle(tint_owner.value); tint_owner.value = nullptr;
+                }
+                Sleep(150); // real housekeeping worker, not a test-only setter
+            }
             set_jitter(f.jitter_positive);
             if (!std::strcmp(f.name, "warmup2")) Sleep(1500); // let the background PSO compile finish
             set_material(f);
             static UINT current_scroll = 0;
             if (f.scroll != current_scroll) { upload_display(f.scroll); current_scroll = f.scroll; }
-            const int variant = f.camera == 1 ? 1 : (f.glare ? 2 : 0);
+            const int variant = first_glare ? 0 : f.camera == 1 ? 1 : (f.glare ? 2 : 0);
             std::array<std::vector<std::array<float, 4>>, 2> refs;
             for (UINT eye = 0; eye < views; ++eye) refs[eye] = render_reference(variant, eye);
             list->ClearRenderTargetView(rtv(0), black.Color, 0, nullptr);
@@ -1303,7 +1334,7 @@ int main(int argc, char** argv) {
             // Compare with the current reference; "ghost" = what the fake DLSS output alone would show.
             void* mapped = nullptr; check(out_rb.buffer->Map(0, nullptr, &mapped));
             uint64_t covered = 0, replaced = 0, stray = 0, interior = 0;
-            double error = 0, ghost = 0, max_error = 0;
+            double error = 0, ghost = 0, max_error = 0, tint_error = 0;
             std::vector<BYTE> png(size_t(output_w) * output_h * 4);
             for (UINT y = 0; y < output_h; ++y) for (UINT x = 0; x < output_w; ++x) {
                 const size_t i = size_t(y) * output_w + x;
@@ -1323,6 +1354,8 @@ int main(int argc, char** argv) {
                     double e = 0, g = 0;
                     for (int k = 0; k < 3; ++k) { e += std::abs(double(c[k]) - ref[i][k]); g += std::abs(double(before[k]) - ref[i][k]); }
                     error += e / 3; ghost += g / 3; max_error = std::max(max_error, e / 3);
+                    tint_error += (std::abs(double(c[0]) - ref[i][0] * 0.4) +
+                        std::abs(double(c[1]) - ref[i][1] - 0.02) + std::abs(double(c[2]) - ref[i][2] * 0.4)) / 3;
                 }
                 auto p = png.data() + i * 4;
                 for (int k = 0; k < 3; ++k) p[k] = BYTE(std::clamp(c[k], 0.0f, 1.0f) * 255);
@@ -1335,8 +1368,21 @@ int main(int argc, char** argv) {
             bool pass = true;
             if (f.check == Frame::quality) pass = interior > 10000 && mean < 0.02 && stray < covered / 50;
             if (f.check == Frame::untouched) pass = replaced == 0;
+            if (tint_on) pass = interior > 10000 && tint_error / interior < 0.02 && mean > 0.05;
+            if (external_tint_test && f.check == Frame::quality)
+                std::printf("external-tint %s requested=%d tint_error=%.6f %s\n", name.c_str(), int(tint_on), interior ? tint_error / interior : 0, pass ? "PASS" : "FAIL");
             std::printf("%-12s covered=%llu replaced=%llu stray=%llu error=%.4f (dlss_alone=%.4f) max=%.3f %s\n", name.c_str(), covered, replaced, stray,
                 mean, ghost_mean, max_error, f.check == Frame::info ? "(info)" : pass ? "PASS" : "FAIL");
+            // Warmup is normally informational, but newly recognised dark screens must not lose their glare.
+            if (first_glare && f.prefill == Frame::perfect && f.jitter_positive) {
+                pass &= interior > 10000 && mean < 0.02;
+                std::printf("first-glare %s error=%.6f %s\n", name.c_str(), mean, pass ? "PASS" : "FAIL");
+            }
+            if (first_glare && !std::strcmp(f.name, "scroll_5") &&
+                GetPrivateProfileIntW(L"experimental", L"dark_screen_fix", 0, (here / L"glass-cockpit-dlss-fix.ini").c_str())) {
+                pass &= replaced > 10000 && mean < ghost_mean; // not a blanket bypass of dark-screen correction
+                std::printf("first-glare resumed %s %s\n", name.c_str(), pass ? "PASS" : "FAIL");
+            }
             all_passed &= pass;
             previous_ref = ref;
           }

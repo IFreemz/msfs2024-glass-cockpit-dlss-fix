@@ -167,8 +167,9 @@ void draw(reshade::api::effect_runtime*) {
         changed |= ImGui::SliderInt("Edge stretcher", &e.edge_stretch, 0, 400, e.edge_stretch ? "%d" : "off", ImGuiSliderFlags_AlwaysClamp);
         ImGui::SetItemTooltip("Extends screens outwards over their frame, in hundredths of a render pixel (100 = 1 pixel),\n"
             "continuing their picture. For screens that don't quite reach their frame.");
-        if (ImGui::Button("Reset experimental fixes")) { e = {}; changed = true; }
-        if (changed) glass::set_experimental(e);
+        const bool reset = ImGui::Button("Reset experimental fixes");
+        if (reset) { e = {}; changed = true; }
+        if (changed) glass::set_experimental(e, reset ? nullptr : &s.experimental);
         ImGui::TreePop();
     }
 

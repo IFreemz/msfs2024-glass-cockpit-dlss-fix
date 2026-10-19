@@ -90,6 +90,18 @@ try {
     if ($LASTEXITCODE) { throw 'Add-on link failed' }
 
     if ($Test) {
+        $unit = Join-Path $build 'unit'
+        New-Item -ItemType Directory -Path $unit -Force | Out-Null
+        & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /Fe:"$unit\external_tint.exe" (Join-Path $root 'tests\external_tint.cpp')
+        if ($LASTEXITCODE) { throw 'External tint test compilation failed' }
+        # Includes the real settings implementation, without starting the engine/hook worker.
+        & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /I $build /I (Join-Path $minhook 'include') /I $reshadeInclude /I $imgui /Fe:"$unit\settings_merge.exe" (Join-Path $root 'tests\settings_merge.cpp') status_report.obj vtable_slots.obj buffer.obj hook.obj trampoline.obj hde64.obj /link d3d12.lib dxgi.lib version.lib user32.lib shell32.lib ole32.lib windowscodecs.lib
+        if ($LASTEXITCODE) { throw 'Settings merge test compilation failed' }
+        $startup = Join-Path $build 'startup'
+        New-Item -ItemType Directory -Path $startup -Force | Out-Null
+        & $compiler /nologo /std:c++20 /EHsc /MD /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /Fe:"$startup\FlightSimulator2024.exe" (Join-Path $root 'tests\startup.cpp') /link d3d12.lib dxgi.lib user32.lib
+        if ($LASTEXITCODE) { throw 'Startup probe compilation failed' }
+        Copy-Item -LiteralPath 'dxgi.dll' -Destination $startup -Force
         # Fake FlightSimulator2024.exe + fake _nvngx.dll + the fix as its dxgi.dll, with stand-in display shaders.
         $testHost = Join-Path $build 'test'
         # Recreated: an older build put the add-on and ReShade here, and the test host would load those instead.
