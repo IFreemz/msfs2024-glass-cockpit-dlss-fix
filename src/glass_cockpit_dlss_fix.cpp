@@ -1294,7 +1294,7 @@ void probe_screen_draw(api::command_list* list, const ListState& state, uint32_t
         hashes.first, hashes.second, resource, count, instances, state.in_pass, state.target_count, targets);
 } catch (...) {}
 
-// Screen probe (button in the Advanced section, 600 frames; costs a lot of CPU while it runs): draws with any other pipeline whose pixel shader reads a gauge-like texture
+// Screen probe (button in the Bug reports section, 600 frames; costs a lot of CPU while it runs): draws with any other pipeline whose pixel shader reads a gauge-like texture
 // (GPU-written RGBA8 with mip maps, like every cockpit screen texture), to find screens drawn with another shader. Every
 // pass, not just the 3D scene's (the iFly 737 draws its MCP, CDU and radio digits over their screens in a later one).
 std::atomic<uint64_t> screen_probe_until{0};
@@ -1359,7 +1359,7 @@ void screen_probe(api::command_list* list, const ListState& state, uint32_t coun
     }
 } catch (...) {}
 
-// Pixel probe (button in the Advanced section): for one frame, every draw is first drawn once more clipped to the
+// Pixel probe (button in the Bug reports section): for one frame, every draw is first drawn once more clipped to the
 // pixel in the middle of its render target, inside an occlusion query (before the game's own draw, so the depth test is
 // the same as for it). The draws that reach that pixel are logged with their shaders, render target and the cockpit-
 // screen textures their pixel shader can read: shows how whatever is in the middle of the view is drawn.
@@ -3047,9 +3047,8 @@ void on_present(api::effect_runtime* runtime) {
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
     pixel_probe_resolve(queue, present_count.load(std::memory_order_relaxed));
     pixel_probe_flush(present_count.load(std::memory_order_relaxed));
-    // Only these three: other add-ons use Ctrl+Shift+F-keys too (GSX opens its menu with Ctrl+Shift+F12), so the debug
-    // tools are buttons in the Advanced section instead.
-    if (chord && runtime->is_key_pressed(VK_F8)) glass::request_capture();
+    // Only these two: other add-ons use Ctrl+Shift+F-keys too (GSX opens its menu with Ctrl+Shift+F12), so the capture
+    // and the debug tools are buttons in the Bug reports section instead.
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
     if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
     static uint64_t next = 0;
