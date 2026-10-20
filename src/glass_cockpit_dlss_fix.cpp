@@ -516,7 +516,7 @@ std::array<DXGI_FORMAT, slot_count> slot_formats{};
 std::array<UINT, slot_count> slot_first_mip{}, slot_mip_count{};
 std::mutex view_mips_mutex;
 std::unordered_map<ID3D12Resource*, std::pair<UINT, UINT>> view_mips;
-// Full-size sampling (experimental section, on by default; Ctrl+Shift+F7 toggles it): screen textures are read at full
+// Full-size sampling (experimental section, on by default): screen textures are read at full
 // size only, their smaller mip levels flicker as the view moves. Off: the game's own mip levels, as before 0.8.4.
 std::atomic<bool> mip0_only{true};
 std::array<std::atomic<uint64_t>, slot_count> slot_last_used{};
@@ -1294,7 +1294,7 @@ void probe_screen_draw(api::command_list* list, const ListState& state, uint32_t
         hashes.first, hashes.second, resource, count, instances, state.in_pass, state.target_count, targets);
 } catch (...) {}
 
-// Screen probe (Ctrl+Shift+F12, 600 frames): draws with any other pipeline whose pixel shader reads a gauge-like texture
+// Screen probe (button in the Advanced section, 600 frames; costs a lot of CPU while it runs): draws with any other pipeline whose pixel shader reads a gauge-like texture
 // (GPU-written RGBA8 with mip maps, like every cockpit screen texture), to find screens drawn with another shader. Every
 // pass, not just the 3D scene's (the iFly 737 draws its MCP, CDU and radio digits over their screens in a later one).
 std::atomic<uint64_t> screen_probe_until{0};
@@ -1359,7 +1359,7 @@ void screen_probe(api::command_list* list, const ListState& state, uint32_t coun
     }
 } catch (...) {}
 
-// Pixel probe (Ctrl+Shift+F10 or the panel's button): for one frame, every draw is first drawn once more clipped to the
+// Pixel probe (button in the Advanced section): for one frame, every draw is first drawn once more clipped to the
 // pixel in the middle of its render target, inside an occlusion query (before the game's own draw, so the depth test is
 // the same as for it). The draws that reach that pixel are logged with their shaders, render target and the cockpit-
 // screen textures their pixel shader can read: shows how whatever is in the middle of the view is drawn.
@@ -3047,15 +3047,11 @@ void on_present(api::effect_runtime* runtime) {
     const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
     pixel_probe_resolve(queue, present_count.load(std::memory_order_relaxed));
     pixel_probe_flush(present_count.load(std::memory_order_relaxed));
+    // Only these three: other add-ons use Ctrl+Shift+F-keys too (GSX opens its menu with Ctrl+Shift+F12), so the debug
+    // tools are buttons in the Advanced section instead.
     if (chord && runtime->is_key_pressed(VK_F8)) glass::request_capture();
-    if (chord && runtime->is_key_pressed(VK_F10)) glass::request_pixel_probe();
-    if (chord && runtime->is_key_pressed(VK_F7)) { mip0_only = !mip0_only; save_settings(); log("setting full_size_sampling=%d (Ctrl+Shift+F7)", int(mip0_only.load())); }
     if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
     if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
-    if (chord && runtime->is_key_pressed(VK_F12)) {
-        screen_probe_until = present_count.load() + 600;
-        log("screen_probe started: looking for draws that read cockpit-screen-like textures with other shaders");
-    }
     static uint64_t next = 0;
     const auto now = GetTickCount64();
     if (now < next) return;
@@ -3152,6 +3148,10 @@ void set_enabled(bool on) {
     enabled = on; save_settings(); log("setting overlay=%d", int(on));
 }
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
+void request_screen_probe() {
+    screen_probe_until = present_count.load() + 600;
+    log("screen_probe started: looking for draws that read cockpit-screen-like textures with other shaders");
+}
 void request_pixel_probe() {
     if (!main_state || pixel_probe_frame.load() != UINT64_MAX) return;
     { std::lock_guard lock(pixel_probe_pending_mutex); pixel_probe_pending.clear(); }
