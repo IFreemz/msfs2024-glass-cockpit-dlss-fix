@@ -532,6 +532,9 @@ void key_pressed(HWND hwnd, UINT vk) {
 }
 
 HWND sim_window = nullptr; // the sim's window that had the focus when this window opened
+enum class TitleAction { none, close, move };
+TitleAction title_action = TitleAction::none; // the title bar's X or the title bar itself pressed (the mouse is captured)
+POINT move_offset{};                          // where in the window the title bar was grabbed
 void show(HWND hwnd, bool visible) {
     if (visible) {
         DWORD process = 0;
@@ -569,6 +572,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
     switch (message) {
     case toggle_message: show(hwnd, !IsWindowVisible(hwnd)); return 0;
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE; // clicks never take the focus from the sim
+    // The title bar is handled here rather than by Windows, whose own handling of a click on the X or a drag of the title
+    // bar can still make this window the active one: the sim then loses the focus, and its right-mouse-drag camera stops
+    // working until it restarts. The X hides the window when it's let go over it; dragging the title bar moves it.
+    case WM_NCLBUTTONDOWN:
+        if (w == HTCLOSE || w == HTCAPTION) {
+            POINT c; GetCursorPos(&c);
+            RECT r; GetWindowRect(hwnd, &r);
+            title_action = w == HTCLOSE ? TitleAction::close : TitleAction::move;
+            move_offset = {c.x - r.left, c.y - r.top};
+            SetCapture(hwnd);
+        }
+        return 0;
+    case WM_NCLBUTTONDBLCLK: case WM_NCRBUTTONDOWN: case WM_NCRBUTTONUP: return 0; // no system menu
+    case WM_CAPTURECHANGED: title_action = TitleAction::none; break;
     case WM_TIMER:
         if (w == refresh_timer) {
             const auto before = shown_state();
@@ -602,6 +619,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
     case WM_ERASEBKGND: return 1; // painted in full by WM_PAINT
     case WM_MOUSEMOVE: {
         const POINT p{short(LOWORD(l)), short(HIWORD(l))};
+        if (title_action == TitleAction::move) {
+            POINT c; GetCursorPos(&c);
+            SetWindowPos(hwnd, nullptr, c.x - move_offset.x, c.y - move_offset.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+        if (title_action != TitleAction::none) return 0;
         if (dragging != id_none) {
             if (const Widget* s = widget(dragging)) { drag_value = slider_value(*s, p.x); InvalidateRect(hwnd, nullptr, FALSE); }
             return 0;
@@ -631,6 +654,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_LBUTTONUP: {
+        if (title_action != TitleAction::none) {
+            const bool close = title_action == TitleAction::close;
+            POINT c; GetCursorPos(&c);
+            ReleaseCapture(); // resets title_action
+            if (close && SendMessageW(hwnd, WM_NCHITTEST, 0, MAKELPARAM(c.x, c.y)) == HTCLOSE) show(hwnd, false);
+            return 0;
+        }
         ReleaseCapture();
         const POINT p{short(LOWORD(l)), short(HIWORD(l))};
         if (dragging != id_none) {
