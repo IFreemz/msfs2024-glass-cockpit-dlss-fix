@@ -3307,12 +3307,27 @@ void frame_tick(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue) {
 // The swapchain the sim presents with (its queue is on the sim's device). Presents of other swapchains are not frames.
 std::mutex swapchains_mutex;
 IDXGISwapChain* main_swapchain = nullptr;
+HWND main_window = nullptr; // the window of the sim's swapchain (pop-out windows have their own), and its size
+uint64_t main_area = 0;
 ComPtr<ID3D12CommandQueue> main_queue;
 void install_present_hooks(IDXGISwapChain* swapchain);
 void swapchain_created(IUnknown* device, IUnknown* created) noexcept try {
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<IDXGISwapChain> swapchain;
     if (!device || !created || FAILED(device->QueryInterface(IID_PPV_ARGS(&queue))) || FAILED(created->QueryInterface(IID_PPV_ARGS(&swapchain)))) return;
+    // Pop-out windows (a screen or panel dragged out of the sim into a window of its own) get swapchains too: the frame
+    // clock and captures stay with the sim's main window (a new swapchain for it, e.g. after a resolution change,
+    // replaces the old one). Another window takes over only if it's larger (pop-outs are smaller than the main view).
+    DXGI_SWAP_CHAIN_DESC desc{};
+    swapchain->GetDesc(&desc);
+    const uint64_t area = uint64_t(desc.BufferDesc.Width) * desc.BufferDesc.Height;
+    {
+        std::lock_guard lock(swapchains_mutex);
+        if (main_window && desc.OutputWindow && desc.OutputWindow != main_window && area <= main_area) {
+            log("note swapchain %p %ux%u is for another window (e.g. a pop-out): not followed", created, desc.BufferDesc.Width, desc.BufferDesc.Height);
+            return;
+        }
+    }
     install_present_hooks(swapchain.Get());
     ComPtr<ID3D12Device> queue_device;
     if (FAILED(queue->GetDevice(IID_PPV_ARGS(&queue_device)))) return;
@@ -3329,9 +3344,8 @@ void swapchain_created(IUnknown* device, IUnknown* created) noexcept try {
         return;
     }
     if (!own_queue) log("note the sim's swapchain was created through another mod's wrapper: GPU cost and presented frames in captures are unavailable");
-    DXGI_SWAP_CHAIN_DESC desc{};
-    swapchain->GetDesc(&desc);
     std::lock_guard lock(swapchains_mutex);
+    if (desc.OutputWindow) main_window = desc.OutputWindow, main_area = area;
     main_swapchain = swapchain.Get();
     main_queue = own_queue ? queue : nullptr;
     log("swapchain %p %ux%u format=%u buffers=%u", swapchain.Get(), desc.BufferDesc.Width, desc.BufferDesc.Height, unsigned(desc.BufferDesc.Format), desc.BufferCount);
