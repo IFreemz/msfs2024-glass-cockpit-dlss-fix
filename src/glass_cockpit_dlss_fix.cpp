@@ -3038,6 +3038,20 @@ void capture_present(api::effect_runtime* runtime) {
 }
 
 void on_present(api::effect_runtime* runtime) {
+    // Pop-out windows (a screen or panel dragged out of the sim into a window of its own) get a ReShade runtime too:
+    // only the sim's main window counts as a frame (its presents run the frame clock and captures). Another window
+    // takes over only if it's larger (pop-outs are smaller than the main view). Runtimes without a window (VR) count
+    // as before.
+    static HWND main_window = nullptr;
+    static uint64_t main_area = 0;
+    if (const HWND window = static_cast<HWND>(runtime->get_hwnd())) {
+        uint32_t width = 0, height = 0;
+        runtime->get_screenshot_width_and_height(&width, &height);
+        const uint64_t area = uint64_t(width) * height;
+        if (window == main_window) main_area = area;
+        else if (!main_window || area > main_area) main_window = window, main_area = area;
+        else return;
+    }
     ++present_count;
     capture_present(runtime);
     capture_flush(present_count.load(std::memory_order_relaxed));
