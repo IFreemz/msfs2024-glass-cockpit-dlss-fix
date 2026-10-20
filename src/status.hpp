@@ -39,6 +39,7 @@ void set_enabled(bool on);
 void set_tint(bool on);
 void request_capture();
 void request_pixel_probe();
+void request_screen_probe();
 // Changed in the overlay tab; saved to the settings file.
 void set_jitter_positive(bool on);
 void set_line_smoothing(int percent);

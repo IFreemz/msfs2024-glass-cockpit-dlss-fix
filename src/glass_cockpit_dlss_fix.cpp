@@ -574,7 +574,7 @@ std::array<DXGI_FORMAT, slot_count> slot_formats{};
 std::array<UINT, slot_count> slot_first_mip{}, slot_mip_count{};
 std::mutex view_mips_mutex;
 std::unordered_map<ID3D12Resource*, std::pair<UINT, UINT>> view_mips;
-// Full-size sampling (experimental section, on by default; Ctrl+Shift+F7 toggles it): screen textures are read at full
+// Full-size sampling (experimental section, on by default): screen textures are read at full
 // size only, their smaller mip levels flicker as the view moves. Off: the game's own mip levels, as before 0.8.4.
 std::atomic<bool> mip0_only{true};
 std::array<std::atomic<uint64_t>, slot_count> slot_last_used{};
@@ -1510,7 +1510,7 @@ void probe_screen_draw(const ListState& state, uint32_t count, uint32_t instance
         hashes.first, hashes.second, resource, count, instances, state.in_pass, state.target_count, describe_targets(state).c_str());
 } catch (...) {}
 
-// Screen probe (Ctrl+Shift+F12, 600 frames): draws with any other pipeline whose pixel shader reads a gauge-like texture
+// Screen probe (button in the Advanced section, 600 frames; costs a lot of CPU while it runs): draws with any other pipeline whose pixel shader reads a gauge-like texture
 // (GPU-written RGBA8 with mip maps, like every cockpit screen texture), to find screens drawn with another shader. Every
 // pass, not just the 3D scene's (the iFly 737 draws its MCP, CDU and radio digits over their screens in a later one).
 std::atomic<uint64_t> screen_probe_until{0};
@@ -1564,7 +1564,7 @@ void screen_probe(const ListState& state, uint32_t count, uint32_t instances) no
     }
 } catch (...) {}
 
-// Pixel probe (Ctrl+Shift+F10 or the panel's button): for one frame, every draw is first drawn once more clipped to the
+// Pixel probe (button in the Advanced section): for one frame, every draw is first drawn once more clipped to the
 // pixel in the middle of its render target, inside an occlusion query (before the game's own draw, so the depth test is
 // the same as for it). The draws that reach that pixel are logged with their shaders, render target and the cockpit-
 // screen textures their pixel shader can read: shows how whatever is in the middle of the view is drawn.
@@ -3396,7 +3396,9 @@ void reload_settings() {
 
 // Hotkeys (Ctrl+Shift+...), polled about 30 times a second while one of the sim's windows has the focus.
 void poll_hotkeys() {
-    constexpr std::array<int, 6> keys{VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12};
+    // Only these three: other add-ons use Ctrl+Shift+F-keys too (GSX opens its menu with Ctrl+Shift+F12), so the
+    // debug tools are buttons in the Advanced section instead.
+    constexpr std::array<int, 3> keys{VK_F8, VK_F9, VK_F11};
     static std::array<bool, keys.size()> was_down{};
     DWORD process = 0;
     if (const HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &process);
@@ -3404,18 +3406,9 @@ void poll_hotkeys() {
     for (size_t i = 0; i < keys.size(); ++i) {
         const bool down = chord && (GetAsyncKeyState(keys[i]) & 0x8000);
         if (down && !was_down[i]) {
-            if (keys[i] == VK_F7) {
-                change_settings([] { mip0_only = !mip0_only; });
-                log("setting full_size_sampling=%d (Ctrl+Shift+F7)", int(mip0_only.load()));
-            }
-            else if (keys[i] == VK_F8) glass::request_capture();
+            if (keys[i] == VK_F8) glass::request_capture();
             else if (keys[i] == VK_F9) glass::set_enabled(!enabled);
-            else if (keys[i] == VK_F10) glass::request_pixel_probe();
-            else if (keys[i] == VK_F11) glass::set_tint(!tint);
-            else {
-                screen_probe_until = present_count.load() + 600;
-                log("screen_probe started: looking for draws that read cockpit-screen-like textures with other shaders");
-            }
+            else glass::set_tint(!tint);
         }
         was_down[i] = down;
     }
@@ -3936,7 +3929,7 @@ bool start(void* self_module, void* reshade_module) noexcept try {
         log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
     }
     log("module path=%ls fixture=%d %s", module, fixture_host, settings_text().c_str());
-    log("hotkeys: %sCtrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint, Ctrl+Shift+F8 capture, Ctrl+Shift+F10 pixel probe, Ctrl+Shift+F7 full-size sampling; settings in %ls",
+    log("hotkeys: %sCtrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint, Ctrl+Shift+F8 capture; settings in %ls",
         reshade_addon ? "" : (glass::hotkey_name(settings_window_key) + " settings window, ").c_str(), settings_path().c_str());
     if (!reshade_addon && _wcsicmp(std::filesystem::path(module).filename().c_str(), L"dxgi.dll") != 0)
         log("note loaded as %ls rather than as dxgi.dll", std::filesystem::path(module).filename().c_str());
@@ -3999,6 +3992,10 @@ void set_enabled(bool on) {
     log("setting overlay=%d", int(on));
 }
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
+void request_screen_probe() {
+    screen_probe_until = present_count.load() + 600;
+    log("screen_probe started: looking for draws that read cockpit-screen-like textures with other shaders");
+}
 void request_pixel_probe() {
     if (!main_state || pixel_probe_frame.load() != UINT64_MAX) return;
     { std::lock_guard lock(pixel_probe_pending_mutex); pixel_probe_pending.clear(); }

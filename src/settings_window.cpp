@@ -74,7 +74,7 @@ enum Id : int {
     id_none = 0, id_enabled, id_smoothing, id_extra, id_tint, id_key, id_advanced, id_jitter, id_glass, id_reset_advanced,
     id_occlusion, id_stable, id_full_size, id_seam, id_calm, id_dark, id_soft, id_temporal,
     id_edge_trim, id_detail_clamp, id_edge_fade, id_angle, id_edge_stretch, id_reset_experimental,
-    id_capture, id_log_folder, id_copy_report, id_settings_file, id_website, id_jason,
+    id_pixel_probe, id_screen_probe, id_capture, id_log_folder, id_copy_report, id_settings_file, id_website, id_jason,
 };
 enum class Kind { toggle, slider, button, header, link };
 struct Widget { Id id; Kind kind; RECT rect; RECT track{}; int max = 0; const wchar_t* tip = nullptr; };
@@ -107,7 +107,7 @@ const wchar_t* const tip_glass = L"How much of the sim's glass effects (dirt, gl
 const wchar_t* const tip_seam = L"Removes thin lines where a screen's picture meets a part of the same screen that points elsewhere in its texture "
     L"(e.g. the bezel band on the FSS E-Jets).";
 const wchar_t* const tip_full_size = L"Reads the screens only from their full-size picture, with more samples where a screen is small on your monitor "
-    L"(also Ctrl+Shift+F7). Off: also from the smaller copies the GPU keeps for distant screens, which can shimmer when you zoom out.";
+    L"Off: also from the smaller copies the GPU keeps for distant screens, which can shimmer when you zoom out.";
 const wchar_t* const tip_stable = L"Keeps the pixels along each screen's edge from shimmering: where a screen ends is learnt over a few frames. "
     L"Turn off if a screen's edge looks cut off or too wide.";
 const wchar_t* const tip_occlusion = L"Leaves the sim's own picture wherever something sits in front of a screen (a sidestick, a hand, the yoke). "
@@ -129,6 +129,10 @@ const wchar_t* const tip_angle = L"Draws screens seen at a steep angle softer, l
 const wchar_t* const tip_edge_stretch = L"Extends screens outwards over their frame, in hundredths of a render pixel. For screens that don't quite reach their frame.";
 const wchar_t* const tip_capture = L"Saves pictures of the screens and one .zip with the pictures and both logs, next to the log: attach that to a bug "
     L"report. Use it with the problem visible on screen (also Ctrl+Shift+F8).";
+const wchar_t* const tip_pixel_probe = L"Logs every draw that reaches the pixel in the middle of the view, with its shaders and textures: shows how "
+    L"something on a screen is drawn. Put it in the middle of the view first.";
+const wchar_t* const tip_screen_probe = L"For screens that are never fixed: look at them, press this, and keep looking for about 10 seconds. Writes a "
+    L"short diagnostic to the log. Lowers the frame rate while it runs.";
 const wchar_t* const tip_log = L"Opens the folder with glass-cockpit-dlss-fix.log, to attach to a bug report.";
 const wchar_t* const tip_report = L"Copies a short report of what the fix is doing, to paste into a bug report.";
 const wchar_t* const tip_settings = L"Opens glass-cockpit-dlss-fix.ini in Notepad, where all these settings are saved.";
@@ -345,7 +349,11 @@ void paint(HWND hwnd, HDC target) {
                 p.card_x = lx; p.card_w = lw; p.y = y + 32;
                 p.toggle(id_jitter, L"Flip jitter direction", nullptr, tip_jitter);
                 p.slider(id_glass, L"Glass layer", 100, L"%", tip_glass);
-                p.button(id_reset_advanced, L"Reset to defaults", lx + 16, p.y + 2, 150, 28, L"Puts the advanced settings back to their defaults.");
+                // Diagnostics for bug reports, beside Reset (no hotkeys: other add-ons use Ctrl+Shift+F-keys too).
+                const int bw3 = (lw - 32 - 16) / 3;
+                p.button(id_reset_advanced, L"Reset", lx + 16, p.y + 2, bw3, 28, L"Puts the advanced settings back to their defaults.");
+                p.button(id_pixel_probe, L"Pixel probe", lx + 16 + bw3 + 8, p.y + 2, bw3, 28, tip_pixel_probe);
+                p.button(id_screen_probe, L"Screen probe", lx + 16 + 2 * (bw3 + 8), p.y + 2, bw3, 28, tip_screen_probe);
             }
         }
 
@@ -474,6 +482,8 @@ void click(HWND hwnd, Id id) {
     case id_reset_advanced: glass::set_jitter_positive(true); glass::set_glass_strength(100); break;
     case id_reset_experimental: glass::set_experimental({}, nullptr); break;
     case id_capture: glass::request_capture(); break;
+    case id_pixel_probe: glass::request_pixel_probe(); help_note = L"Pixel probe done: the draws are in the log."; break;
+    case id_screen_probe: glass::request_screen_probe(); help_note = L"Screen probe running for about 10 seconds: keep the screens in view."; break;
     case id_log_folder: {
         const std::wstring arguments = L"/select,\"" + status.log_path + L"\"";
         ShellExecuteW(nullptr, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
