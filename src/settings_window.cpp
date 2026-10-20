@@ -32,7 +32,7 @@ std::atomic<bool> thread_started{false};
 std::atomic<HWND> window{nullptr};
 constexpr UINT toggle_message = WM_APP + 1;
 constexpr UINT_PTR refresh_timer = 1, capture_release_timer = 2, capture_poll_timer = 3;
-constexpr int client_w = 800, client_h = 768; // DIPs
+constexpr int client_w = 800, client_h = 734; // DIPs
 
 // Colours (dark theme).
 constexpr COLORREF background = RGB(23, 24, 27), card = RGB(34, 35, 39), card_border = RGB(46, 48, 54), row_hover = RGB(40, 42, 47);
@@ -71,7 +71,7 @@ glass::Status status;
 void read_status() { status = glass::status(); }
 
 enum Id : int {
-    id_none = 0, id_enabled, id_smoothing, id_extra, id_tint, id_key, id_advanced, id_jitter, id_glass, id_reset_advanced,
+    id_none = 0, id_enabled, id_smoothing, id_extra, id_tint, id_key, id_bug_reports, id_advanced, id_jitter, id_glass, id_reset_advanced,
     id_occlusion, id_stable, id_full_size, id_seam, id_calm, id_dark, id_soft, id_temporal,
     id_edge_trim, id_detail_clamp, id_edge_fade, id_angle, id_edge_stretch, id_reset_experimental,
     id_pixel_probe, id_screen_probe, id_capture, id_log_folder, id_copy_report, id_settings_file, id_website, id_jason,
@@ -90,11 +90,12 @@ const Widget* widget(Id id) {
 
 Id hover = id_none, pressed = id_none, dragging = id_none;
 int drag_value = 0;
-bool advanced_open = false, capturing = false;
+bool bug_reports_open = false, advanced_open = false, capturing = false; // one of the two sections open at a time
 std::wstring help_note; // a message about the hotkey, shown in the help panel until the mouse moves on
 
 const wchar_t* const default_help = L"Hover over an option to see what it does. Changes apply instantly and are saved to glass-cockpit-dlss-fix.ini.";
 const wchar_t* const tip_enabled = L"Turns the fix on and off, e.g. to compare with the sim's own picture (also Ctrl+Shift+F9).";
+const wchar_t* const tip_bug_reports = L"Tools for a bug report: pictures of the screens, the logs and a short report of what the fix is doing.";
 const wchar_t* const tip_smoothing = L"Smooths stair steps and shimmer on thin lines, like DLSS did. 0 = sharpest, 35 = default, 50 = like DLSS.";
 const wchar_t* const tip_extra = L"Lets Line smoothing go up to 100 % for stubborn shimmer (e.g. in VR). Above 50 the whole screen picture gets softer than with DLSS alone.";
 const wchar_t* const tip_tint = L"Tints every fixed screen green: shows which screens the fix covers (also Ctrl+Shift+F11).";
@@ -128,7 +129,7 @@ const wchar_t* const tip_edge_fade = L"Fades screen edges into the sim's own pic
 const wchar_t* const tip_angle = L"Draws screens seen at a steep angle softer, like the sim does. Screens seen straight on are unchanged.";
 const wchar_t* const tip_edge_stretch = L"Extends screens outwards over their frame, in hundredths of a render pixel. For screens that don't quite reach their frame.";
 const wchar_t* const tip_capture = L"Saves pictures of the screens and one .zip with the pictures and both logs, next to the log: attach that to a bug "
-    L"report. Use it with the problem visible on screen (also Ctrl+Shift+F8).";
+    L"report. Use it with the problem visible on screen.";
 const wchar_t* const tip_pixel_probe = L"Logs every draw that reaches the pixel in the middle of the view, with its shaders and textures: shows how "
     L"something on a screen is drawn. Put it in the middle of the view first.";
 const wchar_t* const tip_screen_probe = L"For screens that are never fixed: look at them, press this, and keep looking for about 10 seconds. Writes a "
@@ -317,44 +318,45 @@ void paint(HWND hwnd, HDC target) {
         p.button(id_key, capturing ? L"Press keys... (Esc cancels)" : wide(glass::hotkey_name(status.settings_window_key)).c_str(), lx + 186, y + 32, lw - 202, 30, tip_key, capturing);
         y += 32 + 36 + 6 + 8;
 
-        p.card_begin(lx, y, lw, 32 + 2 * 36 + 24, L"BUG REPORTS");
-        const int bw = (lw - 32 - 8) / 2;
-        p.button(id_capture, L"Capture screens", lx + 16, y + 32, bw, 30, tip_capture);
-        p.button(id_log_folder, L"Open log folder", lx + 16 + bw + 8, y + 32, bw, 30, tip_log);
-        p.button(id_copy_report, L"Copy report", lx + 16, y + 68, bw, 30, tip_report);
-        p.button(id_settings_file, L"Settings file", lx + 16 + bw + 8, y + 68, bw, 30, tip_settings);
-        text(scale(lx + 16), scale(y + 102), scale(lw - 32), scale(18), status.capture.empty() ? L"Ctrl+Shift+F8 captures too." : wide(status.capture),
-            small_font, muted);
-        y += 32 + 2 * 36 + 24 + 8;
-
-        // Advanced: collapsed until clicked.
-        const int advanced_h = advanced_open ? 32 + 3 * 32 + 10 : 36;
-        {
+        // Bug reports and Advanced: collapsed until clicked, one open at a time (so the window keeps its size).
+        const auto section = [&](Id id, bool open, int open_h, const wchar_t* title, const wchar_t* tip) {
             const Gdiplus::SolidBrush fill(gp(card));
             const Gdiplus::Pen border(gp(card_border), float(scale(1)));
-            rounded(g, fill, float(scale(lx)), float(scale(y)), float(scale(lw)), float(scale(advanced_h)), float(scale(10)), &border);
+            rounded(g, fill, float(scale(lx)), float(scale(y)), float(scale(lw)), float(scale(open ? open_h : 36)), float(scale(10)), &border);
             const RECT header{scale(lx), scale(y), scale(lx + lw), scale(y + 36)};
-            widgets.push_back({id_advanced, Kind::header, header, {}, 0, tip_advanced});
-            if (hover == id_advanced) {
+            widgets.push_back({id, Kind::header, header, {}, 0, tip});
+            if (hover == id) {
                 const Gdiplus::SolidBrush highlight(gp(row_hover));
                 rounded(g, highlight, float(scale(lx + 6)), float(scale(y + 4)), float(scale(lw - 12)), float(scale(28)), float(scale(6)));
             }
             // Chevron: right when closed, down when open.
             const Gdiplus::Pen chevron(gp(muted), float(scale(2)));
             const float cx = float(scale(lx + lw - 28)), cy = float(scale(y + 18)), c = float(scale(4));
-            if (advanced_open) { g.DrawLine(&chevron, cx - c, cy - c / 2, cx, cy + c / 2); g.DrawLine(&chevron, cx, cy + c / 2, cx + c, cy - c / 2); }
+            if (open) { g.DrawLine(&chevron, cx - c, cy - c / 2, cx, cy + c / 2); g.DrawLine(&chevron, cx, cy + c / 2, cx + c, cy - c / 2); }
             else { g.DrawLine(&chevron, cx - c / 2, cy - c, cx + c / 2, cy); g.DrawLine(&chevron, cx + c / 2, cy, cx - c / 2, cy + c); }
-            text(scale(lx + 16), scale(y), scale(lw - 60), scale(36), L"ADVANCED (TROUBLESHOOTING)", section_font, muted);
-            if (advanced_open) {
-                p.card_x = lx; p.card_w = lw; p.y = y + 32;
-                p.toggle(id_jitter, L"Flip jitter direction", nullptr, tip_jitter);
-                p.slider(id_glass, L"Glass layer", 100, L"%", tip_glass);
-                // Diagnostics for bug reports, beside Reset (no hotkeys: other add-ons use Ctrl+Shift+F-keys too).
-                const int bw3 = (lw - 32 - 16) / 3;
-                p.button(id_reset_advanced, L"Reset", lx + 16, p.y + 2, bw3, 28, L"Puts the advanced settings back to their defaults.");
-                p.button(id_pixel_probe, L"Pixel probe", lx + 16 + bw3 + 8, p.y + 2, bw3, 28, tip_pixel_probe);
-                p.button(id_screen_probe, L"Screen probe", lx + 16 + 2 * (bw3 + 8), p.y + 2, bw3, 28, tip_screen_probe);
-            }
+            text(scale(lx + 16), scale(y), scale(lw - 60), scale(36), title, section_font, muted);
+        };
+        constexpr int bug_reports_h = 32 + 3 * 36 + 24, advanced_h = 32 + 3 * 32 + 10;
+        section(id_bug_reports, bug_reports_open, bug_reports_h, L"BUG REPORTS", tip_bug_reports);
+        if (bug_reports_open) {
+            // No hotkeys for these: other add-ons use Ctrl+Shift+F-keys too (GSX opens its menu with Ctrl+Shift+F12).
+            const int bw = (lw - 32 - 8) / 2;
+            p.button(id_capture, L"Capture screens", lx + 16, y + 32, bw, 30, tip_capture);
+            p.button(id_log_folder, L"Open log folder", lx + 16 + bw + 8, y + 32, bw, 30, tip_log);
+            p.button(id_copy_report, L"Copy report", lx + 16, y + 68, bw, 30, tip_report);
+            p.button(id_settings_file, L"Settings file", lx + 16 + bw + 8, y + 68, bw, 30, tip_settings);
+            p.button(id_pixel_probe, L"Pixel probe", lx + 16, y + 104, bw, 30, tip_pixel_probe);
+            p.button(id_screen_probe, L"Screen probe", lx + 16 + bw + 8, y + 104, bw, 30, tip_screen_probe);
+            text(scale(lx + 16), scale(y + 138), scale(lw - 32), scale(18),
+                status.capture.empty() ? L"Attach the capture's .zip, or both logs, to the bug report." : wide(status.capture), small_font, muted);
+        }
+        y += (bug_reports_open ? bug_reports_h : 36) + 8;
+        section(id_advanced, advanced_open, advanced_h, L"ADVANCED (TROUBLESHOOTING)", tip_advanced);
+        if (advanced_open) {
+            p.card_x = lx; p.card_w = lw; p.y = y + 32;
+            p.toggle(id_jitter, L"Flip jitter direction", nullptr, tip_jitter);
+            p.slider(id_glass, L"Glass layer", 100, L"%", tip_glass);
+            p.button(id_reset_advanced, L"Reset to defaults", lx + 16, p.y + 2, 150, 28, L"Puts the advanced settings back to their defaults.");
         }
 
         // Right column: experimental fixes.
@@ -376,9 +378,10 @@ void paint(HWND hwnd, HDC target) {
         p.slider(id_edge_stretch, L"Edge stretcher", 400, L"", tip_edge_stretch);
         p.button(id_reset_experimental, L"Reset experimental fixes", rx + 16, p.y + 6, 200, 28, L"Puts all experimental fixes back to their defaults.");
 
-        // Help panel: what the option under the mouse does. Below both columns with Advanced open, so nothing moves when
-        // it opens or closes.
-        const int help_y = std::max(top + experimental_h, y + 32 + 3 * 32 + 10) + 10;
+        // Help panel: what the option under the mouse does. Below both columns with either section open, so nothing moves
+        // when one opens or closes.
+        const int sections_top = y - (bug_reports_open ? bug_reports_h : 36) - 8;
+        const int help_y = std::max(top + experimental_h, sections_top + std::max(bug_reports_h + 8 + 36, 36 + 8 + advanced_h)) + 10;
         {
             const Gdiplus::SolidBrush fill(gp(card));
             rounded(g, fill, float(scale(16)), float(scale(help_y)), float(scale(client_w - 32)), float(scale(58)), float(scale(10)));
@@ -471,7 +474,8 @@ void stop_capturing(HWND hwnd, bool wait_for_release) {
 }
 void click(HWND hwnd, Id id) {
     switch (id) {
-    case id_advanced: advanced_open = !advanced_open; break;
+    case id_bug_reports: bug_reports_open = !bug_reports_open; if (bug_reports_open) advanced_open = false; break;
+    case id_advanced: advanced_open = !advanced_open; if (advanced_open) bug_reports_open = false; break;
     case id_key:
         if (capturing) { stop_capturing(hwnd, false); break; }
         capturing = true;
@@ -527,8 +531,12 @@ void key_pressed(HWND hwnd, UINT vk) {
     }
 }
 
+HWND sim_window = nullptr; // the sim's window that had the focus when this window opened
 void show(HWND hwnd, bool visible) {
     if (visible) {
+        DWORD process = 0;
+        const HWND foreground = GetForegroundWindow();
+        if (foreground && foreground != hwnd && GetWindowThreadProcessId(foreground, &process) && process == GetCurrentProcessId()) sim_window = foreground;
         read_status();
         ShowWindow(hwnd, SW_SHOWNOACTIVATE); // the sim keeps the focus
         SetTimer(hwnd, refresh_timer, 500, nullptr);
@@ -538,7 +546,12 @@ void show(HWND hwnd, bool visible) {
         KillTimer(hwnd, refresh_timer);
         dragging = pressed = hover = id_none;
         help_note.clear();
+        // Closed with its X: clicking the title bar can still make this window the active one, and hiding it would then
+        // hand the focus to whatever window is next (not always the sim, whose camera then stops following the mouse).
+        const bool was_active = GetForegroundWindow() == hwnd;
+        ReleaseCapture();
         ShowWindow(hwnd, SW_HIDE);
+        if (sim_window && IsWindow(sim_window) && (was_active || !GetForegroundWindow())) SetForegroundWindow(sim_window);
     }
 }
 

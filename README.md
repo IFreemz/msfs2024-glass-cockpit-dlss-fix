@@ -321,8 +321,8 @@ the settings in [Before you report a problem: what to try](#before-you-report-a-
 
 | Problem | Send |
 |---|---|
-| The fix doesn't work at all, the tab or status file shows a problem, a screen is never fixed, a crash or freeze | **Both logs**: `glass-cockpit-dlss-fix.log` and `glass-cockpit-dlss-fix.old.log` (next to the add-on or DLL; button **Open log folder** in the tab). For screens that are never fixed, press **Screen probe** (under Advanced) while looking at them first |
-| Something you can see on fixed screens: wrong or changing colours, flicker, lines, jagged or blurry edges, trails | A **capture**: with the problem visible, press **Ctrl+Shift+F8** (or **Capture screens** in the tab), keep the screens in view for a few seconds, then attach the `glass-capture-....zip` that appears next to the logs. It already contains both logs |
+| The fix doesn't work at all, the tab or status file shows a problem, a screen is never fixed, a crash or freeze | **Both logs**: `glass-cockpit-dlss-fix.log` and `glass-cockpit-dlss-fix.old.log` (next to the add-on or DLL; **Open log folder** under Bug reports in the tab or the settings window). For screens that are never fixed, press **Screen probe** (under Bug reports) while looking at them first |
+| Something you can see on fixed screens: wrong or changing colours, flicker, lines, jagged or blurry edges, trails | A **capture**: with the problem visible, press **Capture screens** (under Bug reports in the tab or the settings window), keep the screens in view for a few seconds, then attach the `glass-capture-....zip` that appears next to the logs. It already contains both logs |
 
 Always mention which version you use (add-on or standalone), the aircraft, your DLSS/FSR mode, Frame Generation on/off
 and other mods (OptiScaler, ReShade, RenoDX, MFG unlocks, OptiShade...).
@@ -362,7 +362,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | A screen briefly flashes very bright and fades back over a second or so (seen on the iniBuilds A380 and Fenix) | Update to 1.0.2 or newer (1.0.0 and 1.0.1 only) |
 | Sim freezes when a Fenix aircraft loads, with RenoDX's DLSS add-on installed | Remove `renodx-dlss.addon64`; see [Other mods](#other-mods) |
 | "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
-| Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Screen probe** under Advanced (writes a short diagnostic to the log), then send both logs and the aircraft name |
+| Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Screen probe** under Bug reports (writes a short diagnostic to the log), then send both logs and the aircraft name |
 | Screen lines look jagged / too soft | Adjust Line smoothing |
 | Dashed light line along the edge of a screen's picture (e.g. FSS E-Jets) | Keep **UV seam fix** on (`seam_fix=1`). If a line remains, try **Detail clamp** (can add some flicker on DLSS Balanced/Performance) |
 | Dark screens drop out of the fix (green tint goes away) in strong sun | Turn on **Dark screen fix** (`dark_screen_fix=1`) |

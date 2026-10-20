@@ -80,6 +80,8 @@ void draw(reshade::api::effect_runtime*) {
 
     ImGui::SeparatorText("Troubleshooting");
     if (s.problem) ImGui::TextWrapped("%s", s.problem);
+    // Collapsed; no hotkeys for these: other add-ons use Ctrl+Shift+F-keys too (GSX opens its menu with Ctrl+Shift+F12).
+    if (ImGui::TreeNode("Bug reports")) {
     if (ImGui::Button("Open log folder")) {
         const std::wstring arguments = L"/select,\"" + s.log_path + L"\"";
         ShellExecuteW(nullptr, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
@@ -87,11 +89,27 @@ void draw(reshade::api::effect_runtime*) {
     ImGui::SameLine();
     if (ImGui::Button("Copy report")) ImGui::SetClipboardText(glass::status_report(s).c_str());
     ImGui::SameLine();
-    if (ImGui::Button("Capture screens  (Ctrl+Shift+F8)")) glass::request_capture();
+    if (ImGui::Button("Capture screens")) glass::request_capture();
     ImGui::SetItemTooltip("Saves 8 frames as sent to the monitor and 4 frames over about a third of a second as pictures next to the log: the sim's own frame, the upscaled frame before and\n"
         "after the fix, and the screen map. Use it with the problem visible on screen. Also saves one .zip with the pictures and both logs: attach that to a bug report.");
     if (!s.capture.empty()) ImGui::TextColored(grey, "%s", s.capture.c_str());
-    ImGui::TextColored(grey, "For bug reports, attach glass-cockpit-dlss-fix.log and .old.log from the log folder.");
+    if (ImGui::Button("Pixel probe")) glass::request_pixel_probe();
+    ImGui::SetItemTooltip("Logs every draw that reaches the pixel in the middle of the view (marked with a small cross while this section is open),\n"
+        "with its shaders and textures: shows how something on a screen is drawn. Put it in the middle of the view first.");
+    ImGui::SameLine();
+    if (ImGui::Button("Screen probe")) glass::request_screen_probe();
+    ImGui::SetItemTooltip("For screens that are never fixed: look at them, press this, and keep looking for about 10 seconds.\n"
+        "Writes a short diagnostic to the log. Lowers the frame rate while it runs.");
+    {
+        // The middle of the view, for aiming the pixel probe.
+        const ImVec2 size = ImGui::GetIO().DisplaySize, c{size.x * 0.5f, size.y * 0.5f};
+        auto* draw = ImGui::GetForegroundDrawList();
+        draw->AddLine({c.x - 14, c.y}, {c.x - 4, c.y}, IM_COL32(255, 60, 60, 255), 2); draw->AddLine({c.x + 4, c.y}, {c.x + 14, c.y}, IM_COL32(255, 60, 60, 255), 2);
+        draw->AddLine({c.x, c.y - 14}, {c.x, c.y - 4}, IM_COL32(255, 60, 60, 255), 2); draw->AddLine({c.x, c.y + 4}, {c.x, c.y + 14}, IM_COL32(255, 60, 60, 255), 2);
+    }
+    ImGui::TextColored(grey, "For bug reports, attach the capture's .zip, or glass-cockpit-dlss-fix.log and .old.log from the log folder.");
+    ImGui::TreePop();
+    }
 
     // Fixes for problems only some aircraft have; collapsed, and each can be undone with Reset to defaults.
     if (ImGui::TreeNode("Experimental fixes (for problems on some aircraft)")) {
@@ -173,21 +191,6 @@ void draw(reshade::api::effect_runtime*) {
         ImGui::SetItemTooltip("How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens.\n"
             "100 = all (default). Lower values can help if quickly changing numbers leave a milky trail.");
         if (ImGui::Button("Reset to defaults")) { glass::set_jitter_positive(true); glass::set_glass_strength(100); }
-        // Diagnostics for bug reports (no hotkeys: other add-ons use Ctrl+Shift+F-keys too).
-        if (ImGui::Button("Pixel probe")) glass::request_pixel_probe();
-        ImGui::SetItemTooltip("Logs every draw that reaches the pixel in the middle of the view (marked with a small cross while this section is open),\n"
-            "with its shaders and textures: shows how something on a screen is drawn. Put it in the middle of the view first.");
-        ImGui::SameLine();
-        if (ImGui::Button("Screen probe")) glass::request_screen_probe();
-        ImGui::SetItemTooltip("For screens that are never fixed: look at them, press this, and keep looking for about 10 seconds.\n"
-            "Writes a short diagnostic to the log. Lowers the frame rate while it runs.");
-        {
-            // The middle of the view, for aiming the pixel probe.
-            const ImVec2 size = ImGui::GetIO().DisplaySize, c{size.x * 0.5f, size.y * 0.5f};
-            auto* draw = ImGui::GetForegroundDrawList();
-            draw->AddLine({c.x - 14, c.y}, {c.x - 4, c.y}, IM_COL32(255, 60, 60, 255), 2); draw->AddLine({c.x + 4, c.y}, {c.x + 14, c.y}, IM_COL32(255, 60, 60, 255), 2);
-            draw->AddLine({c.x, c.y - 14}, {c.x, c.y - 4}, IM_COL32(255, 60, 60, 255), 2); draw->AddLine({c.x, c.y + 4}, {c.x, c.y + 14}, IM_COL32(255, 60, 60, 255), 2);
-        }
         ImGui::TreePop();
     }
     // About (GPL-3.0 section 7(b) notice, see NOTICE.md).

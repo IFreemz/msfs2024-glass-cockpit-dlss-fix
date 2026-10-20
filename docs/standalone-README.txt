@@ -22,7 +22,7 @@ Settings and hotkeys
 Ctrl+Shift+F6   settings window (the hotkey can be changed in the window)
 Ctrl+Shift+F9   fix on/off
 Ctrl+Shift+F11  green tint on every fixed screen
-Ctrl+Shift+F8   capture the screens for a bug report
+Bug reports (capture, logs) are in the settings window.
 Settings are saved in glass-cockpit-dlss-fix.ini next to dxgi.dll.
 
 Update: replace dxgi.dll (or version.dll / winmm.dll, if you renamed it) with the new one (your settings stay).

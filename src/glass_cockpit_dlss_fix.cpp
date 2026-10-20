@@ -16,7 +16,7 @@
 //    local range so that trails of old screen content are removed.
 // The draws, bindings and views it needs are followed with hooks on the D3D12 runtime's own functions (see "D3D12
 // hooks" below), the same in both builds: under ReShade they sit below ReShade's own wrappers.
-// Hotkeys: Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint (shows coverage), Ctrl+Shift+F8 capture. Everything else is
+// Hotkeys: Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint (shows coverage). Everything else is
 // in glass-cockpit-dlss-fix.ini next to the DLL, re-read while the sim runs (and in the overlay tab of the add-on).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -1510,7 +1510,7 @@ void probe_screen_draw(const ListState& state, uint32_t count, uint32_t instance
         hashes.first, hashes.second, resource, count, instances, state.in_pass, state.target_count, describe_targets(state).c_str());
 } catch (...) {}
 
-// Screen probe (button in the Advanced section, 600 frames; costs a lot of CPU while it runs): draws with any other pipeline whose pixel shader reads a gauge-like texture
+// Screen probe (button in the Bug reports section, 600 frames; costs a lot of CPU while it runs): draws with any other pipeline whose pixel shader reads a gauge-like texture
 // (GPU-written RGBA8 with mip maps, like every cockpit screen texture), to find screens drawn with another shader. Every
 // pass, not just the 3D scene's (the iFly 737 draws its MCP, CDU and radio digits over their screens in a later one).
 std::atomic<uint64_t> screen_probe_until{0};
@@ -1564,7 +1564,7 @@ void screen_probe(const ListState& state, uint32_t count, uint32_t instances) no
     }
 } catch (...) {}
 
-// Pixel probe (button in the Advanced section): for one frame, every draw is first drawn once more clipped to the
+// Pixel probe (button in the Bug reports section): for one frame, every draw is first drawn once more clipped to the
 // pixel in the middle of its render target, inside an occlusion query (before the game's own draw, so the depth test is
 // the same as for it). The draws that reach that pixel are logged with their shaders, render target and the cockpit-
 // screen textures their pixel shader can read: shows how whatever is in the middle of the view is drawn.
@@ -3356,8 +3356,8 @@ void write_settings_file() {
         std::ofstream file(path);
         file << "; " GLASS_NAME " settings. Saved changes apply while the sim runs (within a second). The ReShade add-on\n"
                 "; also has them in its tab in the ReShade overlay. What each setting does: " GLASS_WEBSITE "#settings\n"
-                "; Hotkeys in the sim: Ctrl+Shift+F9 fix on/off, Ctrl+Shift+F11 green tint on every fixed screen,\n"
-                "; Ctrl+Shift+F8 capture the screens for a bug report. Standalone: settings window with [hotkeys] settings_window (Ctrl+Shift+F6).\n"
+                "; Hotkeys in the sim: Ctrl+Shift+F9 fix on/off, Ctrl+Shift+F11 green tint on every fixed screen.\n"
+                "; Standalone: settings window with [hotkeys] settings_window (Ctrl+Shift+F6).\n"
                 "; What the fix is doing: glass-cockpit-dlss-fix-status.txt.\n"
                 "\n";
     }
@@ -3396,9 +3396,9 @@ void reload_settings() {
 
 // Hotkeys (Ctrl+Shift+...), polled about 30 times a second while one of the sim's windows has the focus.
 void poll_hotkeys() {
-    // Only these three: other add-ons use Ctrl+Shift+F-keys too (GSX opens its menu with Ctrl+Shift+F12), so the
-    // debug tools are buttons in the Advanced section instead.
-    constexpr std::array<int, 3> keys{VK_F8, VK_F9, VK_F11};
+    // Only these two: other add-ons use Ctrl+Shift+F-keys too (GSX opens its menu with Ctrl+Shift+F12), so the capture
+    // and the debug tools are buttons in the Bug reports section instead.
+    constexpr std::array<int, 2> keys{VK_F9, VK_F11};
     static std::array<bool, keys.size()> was_down{};
     DWORD process = 0;
     if (const HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &process);
@@ -3406,8 +3406,7 @@ void poll_hotkeys() {
     for (size_t i = 0; i < keys.size(); ++i) {
         const bool down = chord && (GetAsyncKeyState(keys[i]) & 0x8000);
         if (down && !was_down[i]) {
-            if (keys[i] == VK_F8) glass::request_capture();
-            else if (keys[i] == VK_F9) glass::set_enabled(!enabled);
+            if (keys[i] == VK_F9) glass::set_enabled(!enabled);
             else glass::set_tint(!tint);
         }
         was_down[i] = down;
@@ -3963,7 +3962,7 @@ bool start(void* self_module, void* reshade_module) noexcept try {
         log("reshade %s path=%ls", file_version(reshade_path).c_str(), reshade_path);
     }
     log("module path=%ls fixture=%d %s", module, fixture_host, settings_text().c_str());
-    log("hotkeys: %sCtrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint, Ctrl+Shift+F8 capture; settings in %ls",
+    log("hotkeys: %sCtrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint; settings in %ls",
         reshade_addon ? "" : (glass::hotkey_name(settings_window_key) + " settings window, ").c_str(), settings_path().c_str());
     if (!reshade_addon && _wcsicmp(std::filesystem::path(module).filename().c_str(), L"dxgi.dll") != 0)
         log("note loaded as %ls rather than as dxgi.dll", std::filesystem::path(module).filename().c_str());

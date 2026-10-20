@@ -87,7 +87,7 @@ uint32_t parse_hotkey(const std::string& text) {
 const char* hotkey_problem(uint32_t key) {
     const uint32_t vk = key & 0xFF, mods = key & (key_ctrl | key_shift | key_alt);
     if (!vk) return "not a key";
-    if (mods == (key_ctrl | key_shift) && (vk == 0x77 || vk == 0x78 || vk == 0x7A)) return "Ctrl+Shift+F8, F9 and F11 are the fix's own hotkeys";
+    if (mods == (key_ctrl | key_shift) && (vk == 0x78 || vk == 0x7A)) return "Ctrl+Shift+F9 and F11 are the fix's own hotkeys";
     if (mods == key_alt && vk == 0x73) return "Alt+F4 closes the sim";
     if (mods == key_alt && (vk == 0x09 || vk == 0x20 || vk == 0x0D)) return "Windows uses Alt+Tab, Alt+Space and Alt+Enter";
     const bool alone_ok = (vk >= 0x7C && vk <= 0x87) || vk == 0x13 || vk == 0x91; // F13-F24, Pause, Scroll Lock
@@ -131,7 +131,7 @@ std::string status_text(const Status& s) {
     if (s.problem) text += std::string("\nProblem: ") + s.problem + "\n";
     if (!(s.experimental == Experimental{})) text += "\nExperimental fixes changed in glass-cockpit-dlss-fix.ini ([experimental]).\n";
     if (!s.jitter_positive || s.glass_strength != 100) text += "\nAdvanced settings changed in glass-cockpit-dlss-fix.ini (jitter_positive, glass_strength).\n";
-    text += "\nHotkeys in the sim: Ctrl+Shift+F9 fix on/off, Ctrl+Shift+F11 green tint on every fixed screen, Ctrl+Shift+F8 capture the screens.\n"
+    text += "\nHotkeys in the sim: Ctrl+Shift+F9 fix on/off, Ctrl+Shift+F11 green tint on every fixed screen.\n"
             "Settings: glass-cockpit-dlss-fix.ini in this folder";
     text += s.addon ? ", or the Glass Cockpit DLSS Fix tab in the ReShade overlay.\n" : ".\n";
     if (!s.capture.empty()) text += "\nCapture: " + s.capture + "\n";
