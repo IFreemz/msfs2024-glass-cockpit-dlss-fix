@@ -1,10 +1,10 @@
-Glass Cockpit DLSS Fix - standalone version (early beta)
-=========================================================
+Glass Cockpit DLSS Fix - standalone version
+===========================================
 
 Removes DLSS and FSR ghosting from the glass cockpit screens in MSFS 2024. No ReShade needed.
 
-EARLY BETA: if anything goes wrong, especially a crash, please report it (link below) and use the ReShade add-on
-version in the meantime, which is the proven, more stable choice for now. Use one version, not both.
+If anything goes wrong, especially a crash, please report it (link below), and try the ReShade add-on version in
+the meantime: it has the same fix. Use one version, not both.
 
 Install
 -------

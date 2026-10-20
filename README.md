@@ -6,10 +6,10 @@ on a monitor and in VR.
 
 It comes in two versions with the same fix inside; pick one:
 
-- **ReShade add-on** (`glass-cockpit-dlss-fix.addon64`), **recommended for now**: the proven version. Status and
-  settings in a tab of the ReShade menu.
-- **Standalone** (`dxgi.dll`), **early beta**: no ReShade needed, one file next to the sim. Status and settings in a
-  small window of its own (**Ctrl+Shift+F6**, changeable).
+- **ReShade add-on** (`glass-cockpit-dlss-fix.addon64`): for when you use ReShade anyway. Status and settings in a tab
+  of the ReShade menu.
+- **Standalone** (`dxgi.dll`): no ReShade needed, one file next to the sim. Status and settings in a small window of
+  its own (**Ctrl+Shift+F6**, changeable).
 
 ![Fenix A320 PFD in DLSS Performance: 8 s of stock DLSS smearing the altitude readout, then 8 s with the fix](docs/comparison.webp)
 
@@ -21,8 +21,7 @@ cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headse
 
 > Unofficial community mod. Not affiliated with Microsoft, Asobo, NVIDIA, AMD or any aircraft developer.
 > Please report problems (see [Troubleshooting](#troubleshooting)). After 1.0.0, updates will be small hotfixes only
-> for a while. The standalone version is new and still an early beta: if anything goes wrong with it, especially a
-> crash, please report it, and use the add-on in the meantime.
+> for a while. If one version gives you trouble, please report it, and try the other one in the meantime.
 
 **About this project:** Glass Cockpit DLSS Fix is developed by IFreemz. It was first released here on 11 October 2026
 (v0.6.0), and every version since has been published from this repository. Official downloads: the
@@ -86,7 +85,7 @@ fixes turns green-tinted. Press it again to turn the tint off.
 **Update:** replace the `.addon64` file with the new one. **Uninstall:** delete `glass-cockpit-dlss-fix.addon64`
 (and the `glass-cockpit-dlss-fix.*` files next to it).
 
-### Standalone (no ReShade, early beta)
+### Standalone (no ReShade)
 
 For one-click install and updates of the standalone, see WeSimGlide's installer under [Other mods](#other-mods).
 
@@ -375,7 +374,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Screen text shimmers when the camera is still | Turn on **Flip jitter direction** (`jitter_positive=0`). If it's already on (the tab or status file says "Advanced settings changed"), turn it off again (in the tab: **Reset to defaults**) |
 | Screens flicker in daylight with REX Atmos installed | Set Atmos' **Overall Light** back to its default (16); at 0 it caused flicker (user report) |
 | Screens flicker in brightness (G-Sync / FreeSync monitor) | VRR flicker from a changing frame rate, most visible on dark screens. Turn on V-Sync, or cap the frame rate a few fps below your refresh rate |
-| Crash at startup | Remove the add-on or `dxgi.dll`, start once, put it back, then send both logs. With the standalone version (early beta), please report any crash, and use the add-on in the meantime |
+| Crash at startup | Remove the add-on or `dxgi.dll`, start once, put it back, then send both logs. Please report any crash, and try the other version in the meantime |
 | Standalone: Ctrl+Shift+F6 clashes with another mod's hotkey (e.g. a DLSS 5 add-on) | Click the hotkey in the settings window and press a new combination, or set `settings_window=` under `[hotkeys]` in the `.ini` (e.g. `Ctrl+Alt+G`) |
 
 ## How the fix works
@@ -417,7 +416,7 @@ no measurable FPS difference with the fix on or off in testing.
   stretcher under Experimental fixes can help on some aircraft).
 - Anything that passes in front of a screen after the cockpit is drawn (e.g. hands in VR) is left to the upscaler by
   the Occlusion check (on by default); with it off, the screen is drawn over it.
-- Standalone (early beta): not yet tested in VR. Its settings window opens on the desktop, not in the headset.
+- Standalone: not yet tested in VR. Its settings window opens on the desktop, not in the headset.
 - Sim updates that change the cockpit display shader stop the fix (the sim then just looks like stock DLSS/FSR)
   until it is updated.
 
