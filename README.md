@@ -362,6 +362,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Nothing changes, no green tint | Check that DLSS or FSR is selected (add-on: that ReShade is the *full add-on support* build and the file is next to the ReShade DLL). Then read the tab or status file, and the log. |
 | Sim crashes while an FSLabs aircraft loads | Update to 1.0.1 or newer (1.0.0 only) |
 | A screen briefly flashes very bright and fades back over a second or so (seen on the iniBuilds A380 and Fenix) | Update to 1.0.2 or newer (1.0.0 and 1.0.1 only) |
+| FPS drops sharply for 20-30 seconds when opening the GSX menu with Ctrl+Shift+F12 | Update to 1.0.3 or newer (older versions used Ctrl+Shift+F12 for a debug tool) |
 | Sim freezes when a Fenix aircraft loads, with RenoDX's DLSS add-on installed | Remove `renodx-dlss.addon64`; see [Other mods](#other-mods) |
 | "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Screen probe** under Bug reports (writes a short diagnostic to the log), then send both logs and the aircraft name |
