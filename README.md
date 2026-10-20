@@ -27,8 +27,8 @@ cockpits. See [Compatibility](#compatibility) for the tested aircraft, VR headse
 **About this project:** Glass Cockpit DLSS Fix is developed by IFreemz. It was first released here on 11 October 2026
 (v0.6.0), and every version since has been published from this repository. Official downloads: the
 [GitHub releases](https://github.com/IFreemz/msfs2024-glass-cockpit-dlss-fix/releases) and the
-[flightsim.to page](https://flightsim.to/addon/116678/glass-cockpit-dlss-fix-no-more-dlss-ghosting-on-pfd-nd) (and [OptiShade](https://github.com/GamingWithGravy/OptiShade), which bundles
-the official add-on). Other packages, rebuilds or pages are unofficial; for those, please contact their authors.
+[flightsim.to page](https://flightsim.to/addon/116678/glass-cockpit-dlss-fix-no-more-dlss-ghosting-on-pfd-nd). Other
+packages, rebuilds or pages are unofficial; for those, please contact their authors.
 
 ## Contents
 
@@ -66,6 +66,9 @@ The game folder is the one that contains `FlightSimulator2024.exe`:
 
 ### ReShade add-on
 
+Using [OptiShade](https://github.com/GamingWithGravy/OptiShade)? It already includes the add-on, see
+[Other mods](#other-mods).
+
 1. Install ReShade **with full add-on support** for MSFS 2024 (DirectX 10/11/12). You don't need any effects.
    In the ReShade setup, use **Browse...** and pick `FlightSimulator2024.exe` in the game folder.
    Microsoft Store / Xbox app: try `FlightSimulator2024.exe` first; if Windows refuses ("You don't have permission to
@@ -84,6 +87,8 @@ fixes turns green-tinted. Press it again to turn the tint off.
 (and the `glass-cockpit-dlss-fix.*` files next to it).
 
 ### Standalone (no ReShade, early beta)
+
+For one-click install and updates of the standalone, see WeSimGlide's installer under [Other mods](#other-mods).
 
 1. Download `glass-cockpit-dlss-fix-standalone.zip` from the [latest release](../../releases/latest) and unzip it.
 2. Copy `dxgi.dll` from it into the game folder.
