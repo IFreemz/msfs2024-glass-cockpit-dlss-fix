@@ -33,14 +33,16 @@ $cases = @(
     # removed afterwards.
     @{ Args = @('--motion', '--only', 'still-edges-on', '--capture'); Name = 'Offline screen capture test' }
 )
-$hosts = @(@{ Folder = 'test'; Name = 'dxgi.dll' }, @{ Folder = 'test-addon'; Name = 'ReShade add-on' }) |
+# The standalone as winmm.dll runs the first three cases: only how it is loaded differs.
+$hosts = @(@{ Folder = 'test'; Name = 'dxgi.dll' }, @{ Folder = 'test-winmm'; Name = 'standalone as winmm.dll'; Cases = 3 },
+    @{ Folder = 'test-addon'; Name = 'ReShade add-on' }) |
     Where-Object { Test-Path -LiteralPath (Join-Path $build "$($_.Folder)\FlightSimulator2024.exe") }
 if (-not $hosts) { throw 'No test host: build with scripts\build.ps1 -Test first' }
 foreach ($testHost in $hosts) {
     Write-Host "== $($testHost.Name) (build\$($testHost.Folder))"
     Push-Location (Join-Path $build $testHost.Folder)
     try {
-        foreach ($case in $cases) {
+        foreach ($case in $(if ($testHost.Cases) { $cases | Select-Object -First $testHost.Cases } else { $cases })) {
             $arguments = $case.Args
             & .\FlightSimulator2024.exe @arguments
             if ($LASTEXITCODE) { throw "$($case.Name) failed with the $($testHost.Name) ($LASTEXITCODE)" }

@@ -75,15 +75,19 @@ try {
     & $rc /nologo /D GLASS_RESHADE_ADDON /I (Join-Path $root 'src') /I (Join-Path $sdk.FullName 'um') /I (Join-Path $sdk.FullName 'shared') /fo version_addon.res (Join-Path $root 'src\version.rc')
     if ($LASTEXITCODE) { throw 'Add-on version resource failed' }
     # The fix is compiled once and linked into both versions; only how it gets loaded differs (src\host.hpp).
-    $sources = 'glass_cockpit_dlss_fix.cpp', 'status_report.cpp', 'vtable_slots.cpp', 'dxgi_proxy.cpp', 'settings_window.cpp', 'reshade_addon.cpp', 'status_panel.cpp' | ForEach-Object { Join-Path $root "src\$_" }
+    $sources = 'glass_cockpit_dlss_fix.cpp', 'status_report.cpp', 'vtable_slots.cpp', 'dxgi_proxy.cpp', 'proxy_exports.cpp', 'settings_window.cpp', 'reshade_addon.cpp', 'status_panel.cpp' | ForEach-Object { Join-Path $root "src\$_" }
     & $compiler /nologo /std:c++20 /EHsc /W4 /WX /MD /O2 /permissive- /c /I $build /I (Join-Path $minhook 'include') /I $reshadeInclude /I $imgui $sources
     if ($LASTEXITCODE) { throw 'Compilation failed' }
     $fix = 'glass_cockpit_dlss_fix.obj', 'status_report.obj', 'vtable_slots.obj', 'buffer.obj', 'hook.obj', 'trampoline.obj', 'hde64.obj'
+    # The standalone's pass-through exports of version.dll and winmm.dll (src\proxy_exports.asm), for installing it under
+    # those names.
+    & (Join-Path (Split-Path $compiler) 'ml64.exe') /nologo /c /Fo proxy_exports_asm.obj (Join-Path $root 'src\proxy_exports.asm')
+    if ($LASTEXITCODE) { throw 'Export stubs failed' }
     # Standalone. No dxgi.lib: this DLL is dxgi.dll and passes its exports through to the system's (src\dxgi_proxy.cpp,
     # src\dxgi.def). /NOIMPLIB: an import library named dxgi.lib here would be linked into the test host and the add-on
     # instead of the SDK's.
     Remove-Item -LiteralPath 'dxgi.lib' -ErrorAction SilentlyContinue
-    & $compiler /nologo /LD $fix dxgi_proxy.obj settings_window.obj version.res /link /DEF:"$root\src\dxgi.def" /NOIMPLIB d3d12.lib version.lib user32.lib gdi32.lib shell32.lib ole32.lib windowscodecs.lib gdiplus.lib delayimp.lib /DELAYLOAD:gdiplus.dll /OUT:dxgi.dll
+    & $compiler /nologo /LD $fix dxgi_proxy.obj proxy_exports.obj proxy_exports_asm.obj settings_window.obj version.res /link /DEF:"$root\src\dxgi.def" /NOIMPLIB d3d12.lib version.lib user32.lib gdi32.lib shell32.lib ole32.lib windowscodecs.lib gdiplus.lib delayimp.lib /DELAYLOAD:gdiplus.dll /DELAYLOAD:version.dll /OUT:dxgi.dll
     if ($LASTEXITCODE) { throw 'dxgi.dll link failed' }
     # ReShade add-on.
     & $compiler /nologo /LD $fix reshade_addon.obj status_panel.obj version_addon.res /link /NOIMPLIB d3d12.lib dxgi.lib version.lib user32.lib shell32.lib ole32.lib windowscodecs.lib /OUT:glass-cockpit-dlss-fix.addon64
@@ -136,6 +140,13 @@ try {
         if ($LASTEXITCODE) { throw 'Test host compilation failed' }
         # The test host imports dxgi.dll, so Windows loads the fix from its folder at start, as the sim does.
         Copy-Item -LiteralPath 'dxgi.dll' -Destination $testHost -Force
+        # The same test host with the standalone installed as winmm.dll instead (build\test-winmm): the host then uses the
+        # system's dxgi.dll and loads winmm.dll at start, as the sim does.
+        $winmmHost = Join-Path $build 'test-winmm'
+        if (Test-Path -LiteralPath $winmmHost) { Remove-Item -LiteralPath $winmmHost -Recurse -Force }
+        Copy-Item -LiteralPath $testHost -Destination $winmmHost -Recurse
+        Remove-Item -LiteralPath (Join-Path $winmmHost 'dxgi.dll')
+        Copy-Item -LiteralPath 'dxgi.dll' -Destination (Join-Path $winmmHost 'winmm.dll')
 
         # The same test host and stand-ins with ReShade and the add-on instead (the host loads ReShade64.asi when the
         # add-on is next to it). Needs a ReShade DLL with add-on support.

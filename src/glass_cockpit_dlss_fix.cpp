@@ -3438,8 +3438,8 @@ void find_late_device() {
         D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)); // goes through the device hook
     // What the sim set up before (its descriptor heaps, render target views) stays unknown, so screens most likely can't
     // be fixed; the device is still followed so that the log shows what does work.
-    log(main_device ? "WARNING loaded after the sim created its graphics device: the fix can't see what the sim set up before, so screens will most likely stay unfixed. Install the fix as dxgi.dll next to FlightSimulator2024.exe"
-                    : "WARNING loaded after the sim created its graphics device, which could not be found: install the fix as dxgi.dll next to FlightSimulator2024.exe");
+    log(main_device ? "WARNING loaded after the sim created its graphics device: the fix can't see what the sim set up before, so screens will most likely stay unfixed. Install the fix as dxgi.dll (or version.dll or winmm.dll) next to FlightSimulator2024.exe"
+                    : "WARNING loaded after the sim created its graphics device, which could not be found: install the fix as dxgi.dll (or version.dll or winmm.dll) next to FlightSimulator2024.exe");
 }
 
 std::mutex install_mutex;
@@ -3456,6 +3456,22 @@ void periodic_checks(uint64_t now) {
     if (!reshade_addon && !duplicate_fix && GetModuleHandleW(L"glass-cockpit-dlss-fix.addon64")) {
         duplicate_fix = true;
         log("WARNING the ReShade add-on version of this fix (glass-cockpit-dlss-fix.addon64) is installed too: this copy stays off. Remove one of them");
+    }
+    // A second copy of the standalone (under another of its names) stays off by itself (start); say so once.
+    static bool other_copy_logged = false;
+    if (!reshade_addon && !other_copy_logged) {
+        HMODULE self = nullptr, modules[1024];
+        DWORD bytes = 0;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&periodic_checks), &self);
+        if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes))
+            for (DWORD i = 0; i < std::min<DWORD>(bytes / sizeof(HMODULE), 1024); ++i) {
+                if (modules[i] == self || !GetProcAddress(modules[i], "GlassFixSettingsWindow")) continue;
+                wchar_t other[MAX_PATH]{};
+                GetModuleFileNameW(modules[i], other, MAX_PATH);
+                log("WARNING the standalone version of this fix is installed twice (also as %ls): only the first one loaded runs. Remove the other one", other);
+                other_copy_logged = true;
+                break;
+            }
     }
     {
         // DLSS calls that stop reaching the fix while the sim keeps drawing cockpit screens: DLSS turned off in the sim,
@@ -3562,11 +3578,13 @@ template <class T> bool hook_slot(void* object, size_t slot, void* detour, T& or
 // Device creation (d3d12.dll export).
 using CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
 CreateDevice original_create_device = nullptr;
+void hook_swapchain_creation();
 HRESULT WINAPI create_device_hook(IUnknown* adapter, D3D_FEATURE_LEVEL level, REFIID iid, void** device) {
     const HRESULT hr = original_create_device(adapter, level, iid, device);
     if (SUCCEEDED(hr) && device && *device) {
         ComPtr<ID3D12Device> created;
         if (SUCCEEDED(static_cast<IUnknown*>(*device)->QueryInterface(IID_PPV_ARGS(&created)))) device_created(created.Get());
+        hook_swapchain_creation();
     }
     return hr;
 }
@@ -3833,17 +3851,25 @@ HRESULT STDMETHODCALLTYPE present1_hook(IDXGISwapChain1* swapchain, UINT interva
     return hr;
 }
 std::mutex dxgi_hooks_mutex;
+std::atomic<bool> dxgi_hooks_installed{false};
 void install_dxgi_hooks(IUnknown* factory) {
     std::lock_guard lock(dxgi_hooks_mutex);
-    static bool installed = false;
     ComPtr<IDXGIFactory2> factory2;
-    if (installed || !factory || FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory2)))) return;
-    installed = true;
+    if (dxgi_hooks_installed || !factory || FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory2)))) return;
+    dxgi_hooks_installed = true;
     const bool hooked = hook_slot(factory2.Get(), factory_create_swapchain_slot(), reinterpret_cast<void*>(&create_swapchain_hook), original_create_swapchain) &&
         hook_slot(factory2.Get(), factory_create_swapchain_hwnd_slot(), reinterpret_cast<void*>(&create_swapchain_hwnd_hook), original_create_swapchain_hwnd) &&
         hook_slot(factory2.Get(), factory_create_swapchain_core_window_slot(), reinterpret_cast<void*>(&create_swapchain_core_window_hook), original_create_swapchain_core_window) &&
         hook_slot(factory2.Get(), factory_create_swapchain_composition_slot(), reinterpret_cast<void*>(&create_swapchain_composition_hook), original_create_swapchain_composition);
     log("dxgi swapchain hooks=%d", hooked);
+}
+// Standalone installed as version.dll or winmm.dll: the sim's DXGI factories aren't made through this DLL's exports, so
+// swapchain creation is hooked on a factory made here once the sim has its device (the hooks sit in the factory's
+// functions, which every factory shares). As dxgi.dll the sim's first factory has done that already.
+void hook_swapchain_creation() {
+    if (dxgi_hooks_installed.load()) return;
+    ComPtr<IDXGIFactory1> factory;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) install_dxgi_hooks(factory.Get());
 }
 void install_present_hooks(IDXGISwapChain* swapchain) {
     std::lock_guard lock(dxgi_hooks_mutex);
@@ -3869,6 +3895,14 @@ bool start(void* self_module, void* reshade_module) noexcept try {
     wchar_t executable[MAX_PATH]{};
     GetModuleFileNameW(nullptr, executable, MAX_PATH);
     if (_wcsicmp(std::filesystem::path(executable).filename().c_str(), L"FlightSimulator2024.exe") != 0) return false;
+    // The standalone installed twice (e.g. as dxgi.dll and as winmm.dll): only the copy loaded first runs, or the screens
+    // would be fixed twice and both copies would write the same log. The other one only passes its exports through.
+    if (!reshade_module) {
+        wchar_t marker_name[64]{};
+        swprintf(marker_name, 64, L"Local\\GlassCockpitDlssFixStandalone-%lu", GetCurrentProcessId());
+        const HANDLE marker = CreateEventW(nullptr, TRUE, FALSE, marker_name); // kept open for the process's life
+        if (marker && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(marker); return false; }
+    }
     if (const auto minhook = MH_Initialize(); minhook != MH_OK && minhook != MH_ERROR_ALREADY_INITIALIZED) return false;
     active = true;
     reshade_addon = reshade_module != nullptr;

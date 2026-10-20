@@ -95,7 +95,9 @@ For one-click install and updates of the standalone, see WeSimGlide's installer 
 3. Start the sim with DLSS or FSR selected and load a flight.
 
 If Windows asks whether to replace an existing `dxgi.dll` there, **don't**: another mod (usually ReShade or
-OptiScaler) is already using that name. See [Other mods](#other-mods).
+OptiScaler) is already using that name. Rename the fix's `dxgi.dll` to **`version.dll`** or **`winmm.dll`** instead
+(whichever isn't taken in the game folder): it works the same under those names. Install it only once, under one name.
+See also [Other mods](#other-mods).
 
 To check that it's working, press **Ctrl+Shift+F6** in the sim: the settings window opens and says "Working: fixing N
 screens" (the hotkey can be changed in the window). Or press **Ctrl+Shift+F11** in the cockpit: every screen it fixes turns green-tinted. Press it again to turn
@@ -105,8 +107,8 @@ the tint off. The file `glass-cockpit-dlss-fix-status.txt` next to the DLL also 
 uninstall ReShade too (its `dxgi.dll` is in the same folder). Your settings carry over: both versions use the same
 `glass-cockpit-dlss-fix.ini`.
 
-**Update:** replace `dxgi.dll` with the new one. **Uninstall:** delete `dxgi.dll` and the `glass-cockpit-dlss-fix.*`
-files next to it.
+**Update:** replace `dxgi.dll` (or `version.dll` / `winmm.dll`, if you renamed it) with the new one, under the same
+name. **Uninstall:** delete it and the `glass-cockpit-dlss-fix.*` files next to it.
 
 ## Settings
 
@@ -295,12 +297,12 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
   or XeSS (tested on NVIDIA, and by the community on an AMD RX 9070 XT with FSR 4). OptiScaler is usually installed as
   `dxgi.dll`:
   - with the add-on, load ReShade through an ASI loader or through OptiScaler's `LoadReshade` option instead;
-  - with the standalone version, rename OptiScaler's `dxgi.dll` to another name it supports (e.g. `winmm.dll` or
-    `version.dll`) and keep the fix as `dxgi.dll`.
+  - with the standalone version, keep OptiScaler as `dxgi.dll` and install the fix as `version.dll` or `winmm.dll`
+    (1.0.3 and newer), or rename OptiScaler's `dxgi.dll` to another name it supports and keep the fix as `dxgi.dll`.
 - **DLSS Enabler:** reported (4.9.0, installed as `version.dll`): with the standalone version the sim doesn't start;
   removing DLSS Enabler's `version.dll` fixed it. For more than 2x Frame Generation on RTX 40 cards, dashdogy's
   RTX40MFG-Unlock (above) works with both versions of this fix. With the add-on, not tested yet, reports welcome.
-- **Standalone version through an ASI loader instead of as `dxgi.dll`:** don't. An ASI loader usually loads the DLL
+- **Standalone version as an `.asi` through an ASI loader:** don't (as `dxgi.dll`, `version.dll` or `winmm.dll` is fine). An ASI loader usually loads the DLL
   after the sim has set up its graphics, and then the fix can't see what it needs: screens will most likely stay
   unfixed (the log says so).
 
@@ -354,7 +356,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 |---|---|
 | Add-on: no "Glass Cockpit DLSS Fix" tab in the ReShade menu | The add-on isn't loaded. If the ReShade menu has no **Add-ons** tab, reinstall ReShade with the *full add-on support* download. Check that the file is next to the ReShade DLL, and that **Settings → Add-on search path** in the ReShade menu points to that folder. |
 | Standalone: no `glass-cockpit-dlss-fix.log` appears | The DLL isn't loaded. Check that it is named exactly `dxgi.dll` and is in the same folder as `FlightSimulator2024.exe` (Windows may hide the `.dll` extension: it must not be `dxgi.dll.dll`) |
-| Standalone: log says the device was not seen, or "loaded after the sim created its graphics device" | The DLL was loaded too late, usually because it was loaded as `.asi` or another mod renamed it. Install it as `dxgi.dll` |
+| Standalone: log says the device was not seen, or "loaded after the sim created its graphics device" | The DLL was loaded too late, usually because it was loaded as `.asi` or another mod renamed it. Install it as `dxgi.dll` (or `version.dll` / `winmm.dll`) next to `FlightSimulator2024.exe` |
 | Nothing changes, no green tint | Check that DLSS or FSR is selected (add-on: that ReShade is the *full add-on support* build and the file is next to the ReShade DLL). Then read the tab or status file, and the log. |
 | Sim crashes while an FSLabs aircraft loads | Update to 1.0.1 or newer (1.0.0 only) |
 | A screen briefly flashes very bright and fades back over a second or so (seen on the iniBuilds A380 and Fenix) | Update to 1.0.2 or newer (1.0.0 and 1.0.1 only) |

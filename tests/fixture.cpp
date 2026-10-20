@@ -291,6 +291,13 @@ int main(int argc, char** argv) {
                 std::printf("upscaler: FSR answered with DLSS inside its dispatch (like OptiScaler)\n");
             }
         }
+        // build\test-winmm: the standalone installed as winmm.dll instead of dxgi.dll (the sim loads winmm.dll from its folder at
+        // start too); this host's dxgi.dll is then the system's.
+        const bool as_winmm = std::filesystem::exists(here / L"winmm.dll");
+        if (as_winmm) {
+            require(LoadLibraryW((here / L"winmm.dll").c_str()) != nullptr, "the fix (winmm.dll next to the test host) could not be loaded");
+            std::printf("the fix: standalone as winmm.dll\n");
+        }
         // build\test-addon: the fix as ReShade's add-on, loaded by a real ReShade when the device is created.
         const bool reshade = std::filesystem::exists(here / L"glass-cockpit-dlss-fix.addon64");
         if (reshade) {
@@ -310,7 +317,7 @@ int main(int argc, char** argv) {
             std::printf("early device created and released\n");
         }
         ComPtr<ID3D12Device> device; check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)));
-        const auto addon = reshade ? GetModuleHandleW(L"glass-cockpit-dlss-fix.addon64") : GetModuleHandleW((here / L"dxgi.dll").c_str());
+        const auto addon = reshade ? GetModuleHandleW(L"glass-cockpit-dlss-fix.addon64") : GetModuleHandleW((here / (as_winmm ? L"winmm.dll" : L"dxgi.dll")).c_str());
         require(addon != nullptr, reshade ? "the add-on was not loaded by ReShade" : "the fix (dxgi.dll next to the test host) was not loaded");
         const auto set_jitter = reinterpret_cast<void (*)(bool)>(GetProcAddress(addon, "GlassFixJitterPositive"));
         const auto evaluate = reinterpret_cast<NgxEvaluate>(GetProcAddress(GetModuleHandleW(L"_nvngx.dll"), "NVSDK_NGX_D3D12_EvaluateFeature"));
