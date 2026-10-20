@@ -289,6 +289,8 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
     - Tested earlier with v1.4.2 and the add-on (as `winmm.dll` next to an ASI loader's `version.dll`; `version.dll`
       alone works too).
     - Its Backspace menu didn't open in the sim in either test (with and without ReShade); it ran at 3x on its own.
+      With 1.0.3 and newer, install the fix as `version.dll` instead of `dxgi.dll` (next to the unlocker's
+      `winmm.dll`): the menu then works too (tested with v1.6.0).
     - **With OptiScaler, don't install it as `winmm.dll`:** the sim crashed at startup (the crash was in
       OptiScaler). Install it as an OptiScaler plugin instead, as its README describes (`MFGUnlocker.asi` in
       `OptiScaler\plugins`, `LoadAsiPlugins = true` in `OptiScaler.ini`); OptiScaler's menu then controls it.
