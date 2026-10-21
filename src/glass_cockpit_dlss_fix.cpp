@@ -2604,20 +2604,21 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     glass_view.Format = DXGI_FORMAT_R16G16_UNORM;
     d.native->CreateUnorderedAccessView(map->glass_history_uv.Get(), nullptr, &glass_view, at(uav_base + 9));
     // The upscaler's depth input for the occlusion check (a null view when the check is off or the input unusable: not at
-    // render size, multisampled, an array (VR), or a depth direction the display shader doesn't tell).
+    // render size, multisampled, an array, or a depth direction the display shader doesn't tell). In VR the sim calls the
+    // upscaler once per eye with that eye's depth, which matches the map layer of this call.
     ID3D12Resource* depth = nullptr;
     D3D12_SHADER_RESOURCE_VIEW_DESC depth_view{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     depth_view.Texture2D.MipLevels = 1;
     const int direction = depth_direction.load(std::memory_order_relaxed);
-    if (occlusion_check.load(std::memory_order_relaxed) && u.depth && map->layers == 1) {
+    if (occlusion_check.load(std::memory_order_relaxed) && u.depth) {
         const auto z = u.depth->GetDesc();
         const DXGI_FORMAT format = depth_srv_format(z.Format);
         const bool usable = direction && format != DXGI_FORMAT_UNKNOWN && z.Width == render_w && z.Height == render_h &&
             z.DepthOrArraySize == 1 && z.SampleDesc.Count == 1;
         if (usable) { depth = u.depth; depth_view.Format = format; }
-        static std::atomic<int> logged{0};
-        if (logged++ < 4) log("occlusion_check %s depth input %p %llux%u format=%u layers=%u samples=%u state=0x%x usable=%d direction=%d", u.name, u.depth,
-            z.Width, z.Height, unsigned(z.Format), unsigned(z.DepthOrArraySize), z.SampleDesc.Count, unsigned(u.depth_state), usable, direction);
+        static std::atomic<int> logged[2]{};
+        if (logged[map->layers > 1]++ < 4) log("occlusion_check %s depth input %p %llux%u format=%u layers=%u samples=%u state=0x%x usable=%d direction=%d vr=%d", u.name, u.depth,
+            z.Width, z.Height, unsigned(z.Format), unsigned(z.DepthOrArraySize), z.SampleDesc.Count, unsigned(u.depth_state), usable, direction, int(map->layers > 1));
     }
     d.native->CreateShaderResourceView(depth, &depth_view, at(uav_base + 10));
 
