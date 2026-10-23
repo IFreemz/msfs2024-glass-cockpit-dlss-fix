@@ -3643,6 +3643,7 @@ void STDMETHODCALLTYPE create_rtv_hook(ID3D12Device* device, ID3D12Resource* res
 }
 // The vtable of the fix's own command list, through which the list functions were hooked (install_d3d12_hooks).
 void** hooked_list_vtable = nullptr;
+void install_list_variants(ID3D12GraphicsCommandList* list) noexcept;
 // Diagnostics: whether a new command list runs the functions the fix hooked. A list class with its own functions (e.g.
 // another D3D12 runtime version) would never reach the hooks. Logged once per distinct vtable.
 void check_list_functions(ID3D12GraphicsCommandList* list, ID3D12Device* device, const char* created_by) {
@@ -3660,15 +3661,51 @@ void check_list_functions(ID3D12GraphicsCommandList* list, ID3D12Device* device,
     for (const auto& [name, slot] : slots) same += hooked_list_vtable && vtable[slot] == hooked_list_vtable[slot];
     log("command_list vtable=%p hooked_vtable=%p type=%d created_by=%s sim_device=%d hooked_functions=%d/4 vtable_%s", vtable, hooked_list_vtable,
         int(list->GetType()), created_by, int(device == main_device), same, describe_code(vtable).c_str());
+    install_list_variants(list); // a list class of its own (direct lists only)
     if (same == 4 || !hooked_list_vtable) return;
     for (const auto& [name, slot] : slots)
         if (vtable[slot] != hooked_list_vtable[slot])
             log("  %s differs: list's %s, hooked %s", name, describe_code(vtable[slot]).c_str(), describe_code(hooked_list_vtable[slot]).c_str());
 }
-void command_list_created(ID3D12Device* device, void** out, ID3D12PipelineState* initial, const char* created_by) {
+// Diagnostics: the interface the sim asked for, and for its first direct lists every command list version's vtable
+// (a version on another vtable may run other functions than the hooked ones). "hooked" = the function the fix hooked.
+std::string code_bytes(const void* address) {
+    uint8_t bytes[32]{};
+    if (!address || !read_bytes(address, bytes, sizeof(bytes))) return "unreadable";
+    std::string text;
+    char byte[3];
+    for (uint8_t b : bytes) snprintf(byte, sizeof(byte), "%02x", b), text += byte;
+    return text;
+}
+void probe_list_interfaces(IUnknown* object, ID3D12GraphicsCommandList* list, REFIID iid, const char* created_by) {
+    static const IID* const versions[]{&__uuidof(ID3D12GraphicsCommandList), &__uuidof(ID3D12GraphicsCommandList1), &__uuidof(ID3D12GraphicsCommandList2),
+        &__uuidof(ID3D12GraphicsCommandList3), &__uuidof(ID3D12GraphicsCommandList4), &__uuidof(ID3D12GraphicsCommandList5), &__uuidof(ID3D12GraphicsCommandList6),
+        &__uuidof(ID3D12GraphicsCommandList7), &__uuidof(ID3D12GraphicsCommandList8), &__uuidof(ID3D12GraphicsCommandList9), &__uuidof(ID3D12GraphicsCommandList10)};
+    static std::atomic<int> lists{0}, direct{0};
+    const int n = lists++;
+    if (n >= 16) return;
+    const auto type = list->GetType();
+    int requested = -1;
+    for (int v = 0; v < 11; ++v) if (iid == *versions[v]) requested = v;
+    log("command_list #%d type=%d created_by=%s requested=v%d out=%+td vtable=%p", n, int(type), created_by, requested,
+        reinterpret_cast<char*>(object) - reinterpret_cast<char*>(list), *reinterpret_cast<void***>(object));
+    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || direct++ >= 2 || !hooked_list_vtable) return;
+    const std::pair<const char*, size_t> slots[]{{"draw_indexed", list_draw_indexed_slot()}, {"set_pipeline_state", list_set_pipeline_state_slot()},
+        {"set_root_table", list_set_graphics_root_table_slot()}, {"set_render_targets", list_set_render_targets_slot()}};
+    for (int v = 0; v < 11; ++v) {
+        ComPtr<IUnknown> version;
+        if (FAILED(object->QueryInterface(*versions[v], reinterpret_cast<void**>(version.GetAddressOf())))) { log("  v%d not supported", v); continue; }
+        void** const vtable = *reinterpret_cast<void***>(version.Get());
+        std::string text;
+        for (const auto& [name, slot] : slots) text += std::string(" ") + name + "=" + (vtable[slot] == hooked_list_vtable[slot] ? "hooked" : code_bytes(vtable[slot]));
+        log("  v%d offset=%+td vtable=%p%s", v, reinterpret_cast<char*>(version.Get()) - reinterpret_cast<char*>(list), vtable, text.c_str());
+    }
+}
+void command_list_created(ID3D12Device* device, void** out, ID3D12PipelineState* initial, const char* created_by, REFIID iid) {
     if (passthrough() || !out || !*out) return;
     ComPtr<ID3D12GraphicsCommandList> list;
     if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list)))) {
+        probe_list_interfaces(static_cast<IUnknown*>(*out), list.Get(), iid, created_by);
         check_list_functions(list.Get(), device, created_by);
         list_created(list.Get(), device, initial);
     }
@@ -3676,12 +3713,12 @@ void command_list_created(ID3D12Device* device, void** out, ID3D12PipelineState*
 HRESULT STDMETHODCALLTYPE create_command_list_hook(ID3D12Device* device, UINT mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator,
     ID3D12PipelineState* initial, REFIID iid, void** out) {
     const HRESULT hr = original_create_command_list(device, mask, type, allocator, initial, iid, out);
-    if (SUCCEEDED(hr)) command_list_created(device, out, initial, "CreateCommandList");
+    if (SUCCEEDED(hr)) command_list_created(device, out, initial, "CreateCommandList", iid);
     return hr;
 }
 HRESULT STDMETHODCALLTYPE create_command_list1_hook(ID3D12Device4* device, UINT mask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID iid, void** out) {
     const HRESULT hr = original_create_command_list1(device, mask, type, flags, iid, out);
-    if (SUCCEEDED(hr)) command_list_created(device, out, nullptr, "CreateCommandList1"); // created closed: Reset comes before recording
+    if (SUCCEEDED(hr)) command_list_created(device, out, nullptr, "CreateCommandList1", iid); // created closed: Reset comes before recording
     return hr;
 }
 HRESULT STDMETHODCALLTYPE create_command_signature_hook(ID3D12Device* device, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root, REFIID iid,
@@ -3711,6 +3748,11 @@ using ListEndRenderPass = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList4*);
 using ListSetScissorRects = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RECT*);
 using ListExecuteIndirect = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64);
 ListReset original_reset = nullptr;
+// The offset of the fix's own list's ID3D12GraphicsCommandList4 interface from its ID3D12GraphicsCommandList one (0
+// unless the runtime gives them vtables of their own), and that list's vtables: the functions the main hooks went on.
+ptrdiff_t hooked_list4_offset = 0;
+void** hooked_list4_vtable = nullptr;
+ID3D12GraphicsCommandList* base_list(void* self, ptrdiff_t offset) { return reinterpret_cast<ID3D12GraphicsCommandList*>(static_cast<char*>(self) - offset); }
 ListClearState original_clear_state = nullptr;
 ListDraw original_draw = nullptr;
 ListDrawIndexed original_draw_indexed = nullptr;
@@ -3775,13 +3817,166 @@ void STDMETHODCALLTYPE set_scissor_rects_hook(ID3D12GraphicsCommandList* list, U
 }
 void STDMETHODCALLTYPE begin_render_pass_hook(ID3D12GraphicsCommandList4* list, UINT count, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* targets,
     const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth, D3D12_RENDER_PASS_FLAGS flags) {
-    if (!passthrough()) pass_begun(list, count, targets);
+    if (!passthrough()) pass_begun(base_list(list, hooked_list4_offset), count, targets);
     original_begin_render_pass(list, count, targets, depth, flags);
 }
 void STDMETHODCALLTYPE end_render_pass_hook(ID3D12GraphicsCommandList4* list) {
-    if (!passthrough()) pass_ended(list);
+    if (!passthrough()) pass_ended(base_list(list, hooked_list4_offset));
     original_end_render_pass(list);
 }
+
+// Command list functions reached through another interface version's vtable. Some D3D12 runtimes (Windows 11 26H1)
+// give a list's interfaces vtables of their own, with functions the hooks above never see: the sim's drawing then
+// bypasses the fix completely. Those functions are hooked as well (up to 4 per function). Their `this` is that
+// interface, moved back by its offset to the list's ID3D12GraphicsCommandList pointer for the fix's bookkeeping. The
+// runtime's function runs as an internal call: if it goes on into one of the main hooks, that one passes it through.
+constexpr int max_variants = 4;
+template <class F> struct Variants {
+    std::array<F, max_variants> original{};
+    std::array<ptrdiff_t, max_variants> offset{};
+    std::array<void*, max_variants> target{};
+    int count = 0;
+};
+Variants<ListReset> reset_variants;
+Variants<ListClearState> clear_state_variants;
+Variants<ListDraw> draw_variants;
+Variants<ListDrawIndexed> draw_indexed_variants;
+Variants<ListCopyTextureRegion> copy_texture_region_variants;
+Variants<ListSetPipelineState> set_pipeline_state_variants;
+Variants<ListSetRootSignature> set_root_signature_variants;
+Variants<ListSetRootTable> set_root_table_variants;
+Variants<ListSetRenderTargets> set_render_targets_variants;
+Variants<ListSetScissorRects> set_scissor_rects_variants;
+Variants<ListExecuteIndirect> execute_indirect_variants;
+Variants<ListBeginRenderPass> begin_render_pass_variants;
+Variants<ListEndRenderPass> end_render_pass_variants;
+template <int V> HRESULT STDMETHODCALLTYPE reset_variant(ID3D12GraphicsCommandList* self, ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial) {
+    HRESULT hr;
+    { Internal internal; hr = reset_variants.original[V](self, allocator, initial); }
+    if (SUCCEEDED(hr) && !passthrough()) list_reset(base_list(self, reset_variants.offset[V]), initial);
+    return hr;
+}
+template <int V> void STDMETHODCALLTYPE clear_state_variant(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pipeline) {
+    { Internal internal; clear_state_variants.original[V](self, pipeline); }
+    if (!passthrough()) pipeline_bound(base_list(self, clear_state_variants.offset[V]), pipeline);
+}
+template <int V> void STDMETHODCALLTYPE draw_variant(ID3D12GraphicsCommandList* self, UINT count, UINT instances, UINT first, UINT first_instance) {
+    if (!passthrough() && draw_recorded(base_list(self, draw_variants.offset[V]), {false, count, instances, first, first_instance, 0})) return;
+    { Internal internal; draw_variants.original[V](self, count, instances, first, first_instance); }
+}
+template <int V> void STDMETHODCALLTYPE draw_indexed_variant(ID3D12GraphicsCommandList* self, UINT count, UINT instances, UINT first, INT vertex, UINT first_instance) {
+    if (!passthrough() && draw_recorded(base_list(self, draw_indexed_variants.offset[V]), {true, count, instances, first, first_instance, vertex})) return;
+    { Internal internal; draw_indexed_variants.original[V](self, count, instances, first, vertex, first_instance); }
+}
+template <int V> void STDMETHODCALLTYPE execute_indirect_variant(ID3D12GraphicsCommandList* self, ID3D12CommandSignature* signature, UINT max_count,
+    ID3D12Resource* arguments, UINT64 arguments_offset, ID3D12Resource* count, UINT64 count_offset) {
+    if (!passthrough()) indirect_recorded(base_list(self, execute_indirect_variants.offset[V]), signature, max_count);
+    { Internal internal; execute_indirect_variants.original[V](self, signature, max_count, arguments, arguments_offset, count, count_offset); }
+}
+template <int V> void STDMETHODCALLTYPE copy_texture_region_variant(ID3D12GraphicsCommandList* self, const D3D12_TEXTURE_COPY_LOCATION* dest, UINT x, UINT y,
+    UINT z, const D3D12_TEXTURE_COPY_LOCATION* source, const D3D12_BOX* box) {
+    if (!passthrough() && dest && source && dest->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && source->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
+        texture_copied(source->pResource, dest->pResource, dest->SubresourceIndex);
+    { Internal internal; copy_texture_region_variants.original[V](self, dest, x, y, z, source, box); }
+}
+template <int V> void STDMETHODCALLTYPE set_pipeline_state_variant(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pipeline) {
+    { Internal internal; set_pipeline_state_variants.original[V](self, pipeline); }
+    if (!passthrough()) pipeline_bound(base_list(self, set_pipeline_state_variants.offset[V]), pipeline);
+}
+template <int V> void STDMETHODCALLTYPE set_root_signature_variant(ID3D12GraphicsCommandList* self, ID3D12RootSignature* root) {
+    { Internal internal; set_root_signature_variants.original[V](self, root); }
+    if (!passthrough()) root_signature_bound(base_list(self, set_root_signature_variants.offset[V]), root);
+}
+template <int V> void STDMETHODCALLTYPE set_root_table_variant(ID3D12GraphicsCommandList* self, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) {
+    { Internal internal; set_root_table_variants.original[V](self, index, table); }
+    if (!passthrough()) table_bound(base_list(self, set_root_table_variants.offset[V]), index, table);
+}
+template <int V> void STDMETHODCALLTYPE set_render_targets_variant(ID3D12GraphicsCommandList* self, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
+    BOOL single_range, const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
+    { Internal internal; set_render_targets_variants.original[V](self, count, targets, single_range, depth); }
+    if (!passthrough()) targets_bound(base_list(self, set_render_targets_variants.offset[V]), count, targets, single_range, depth);
+}
+template <int V> void STDMETHODCALLTYPE set_scissor_rects_variant(ID3D12GraphicsCommandList* self, UINT count, const D3D12_RECT* rects) {
+    { Internal internal; set_scissor_rects_variants.original[V](self, count, rects); }
+    if (!passthrough()) scissors_bound(base_list(self, set_scissor_rects_variants.offset[V]), count, rects);
+}
+template <int V> void STDMETHODCALLTYPE begin_render_pass_variant(ID3D12GraphicsCommandList4* self, UINT count, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* targets,
+    const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth, D3D12_RENDER_PASS_FLAGS flags) {
+    if (!passthrough()) pass_begun(base_list(self, begin_render_pass_variants.offset[V]), count, targets);
+    { Internal internal; begin_render_pass_variants.original[V](self, count, targets, depth, flags); }
+}
+template <int V> void STDMETHODCALLTYPE end_render_pass_variant(ID3D12GraphicsCommandList4* self) {
+    if (!passthrough()) pass_ended(base_list(self, end_render_pass_variants.offset[V]));
+    { Internal internal; end_render_pass_variants.original[V](self); }
+}
+#define VARIANT_DETOURS(name) std::array<void*, max_variants>{reinterpret_cast<void*>(&name<0>), reinterpret_cast<void*>(&name<1>), \
+    reinterpret_cast<void*>(&name<2>), reinterpret_cast<void*>(&name<3>)}
+
+std::mutex variants_mutex;
+std::atomic<int> variant_hooks{0};
+template <class F> void hook_variant(const char* name, Variants<F>& variants, const std::array<void*, max_variants>& detours, void* hooked, void* target,
+    ptrdiff_t offset) {
+    if (!target || target == hooked) return;
+    for (int i = 0; i < variants.count; ++i)
+        if (variants.target[i] == target) {
+            if (variants.offset[i] != offset) log("WARNING command list variant %s at %p seen with offsets %+td and %+td", name, target, variants.offset[i], offset);
+            return;
+        }
+    if (variants.count == max_variants) { log("WARNING command list variant %s: more than %d, %s not hooked", name, max_variants, describe_code(target).c_str()); return; }
+    const int i = variants.count;
+    variants.offset[i] = offset;
+    variants.target[i] = target;
+    void* trampoline = nullptr;
+    MH_STATUS status = MH_CreateHook(target, detours[i], &trampoline);
+    if (status == MH_OK) {
+        variants.original[i] = reinterpret_cast<F>(trampoline);
+        status = MH_EnableHook(target);
+    }
+    if (status == MH_OK) { ++variants.count; ++variant_hooks; }
+    log("command list variant %s #%d offset=%+td %s hooked=%d (status %d)", name, i, offset, describe_code(target).c_str(), int(status == MH_OK), int(status));
+}
+// Hooks the functions of every interface version of a direct command list that differ from the hooked ones.
+void install_list_variants(ID3D12GraphicsCommandList* list) noexcept try {
+    if (!hooked_list_vtable || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+    static const IID* const versions[]{&__uuidof(ID3D12GraphicsCommandList), &__uuidof(ID3D12GraphicsCommandList1), &__uuidof(ID3D12GraphicsCommandList2),
+        &__uuidof(ID3D12GraphicsCommandList3), &__uuidof(ID3D12GraphicsCommandList4), &__uuidof(ID3D12GraphicsCommandList5), &__uuidof(ID3D12GraphicsCommandList6),
+        &__uuidof(ID3D12GraphicsCommandList7), &__uuidof(ID3D12GraphicsCommandList8), &__uuidof(ID3D12GraphicsCommandList9), &__uuidof(ID3D12GraphicsCommandList10)};
+    std::lock_guard lock(variants_mutex);
+    for (int v = 0; v < 11; ++v) {
+        ComPtr<IUnknown> version;
+        if (FAILED(list->QueryInterface(*versions[v], reinterpret_cast<void**>(version.GetAddressOf())))) continue;
+        void** const vt = *reinterpret_cast<void***>(version.Get());
+        const ptrdiff_t offset = reinterpret_cast<char*>(version.Get()) - reinterpret_cast<char*>(list);
+        const auto entry = [&](size_t slot) { return vt[slot]; };
+        const auto hooked = [&](size_t slot) { return hooked_list_vtable[slot]; };
+        hook_variant("reset", reset_variants, VARIANT_DETOURS(reset_variant), hooked(list_reset_slot()), entry(list_reset_slot()), offset);
+        hook_variant("clear_state", clear_state_variants, VARIANT_DETOURS(clear_state_variant), hooked(list_clear_state_slot()), entry(list_clear_state_slot()), offset);
+        hook_variant("draw", draw_variants, VARIANT_DETOURS(draw_variant), hooked(list_draw_slot()), entry(list_draw_slot()), offset);
+        hook_variant("draw_indexed", draw_indexed_variants, VARIANT_DETOURS(draw_indexed_variant), hooked(list_draw_indexed_slot()), entry(list_draw_indexed_slot()), offset);
+        hook_variant("copy_texture_region", copy_texture_region_variants, VARIANT_DETOURS(copy_texture_region_variant), hooked(list_copy_texture_region_slot()),
+            entry(list_copy_texture_region_slot()), offset);
+        hook_variant("set_pipeline_state", set_pipeline_state_variants, VARIANT_DETOURS(set_pipeline_state_variant), hooked(list_set_pipeline_state_slot()),
+            entry(list_set_pipeline_state_slot()), offset);
+        hook_variant("set_root_signature", set_root_signature_variants, VARIANT_DETOURS(set_root_signature_variant), hooked(list_set_graphics_root_signature_slot()),
+            entry(list_set_graphics_root_signature_slot()), offset);
+        hook_variant("set_root_table", set_root_table_variants, VARIANT_DETOURS(set_root_table_variant), hooked(list_set_graphics_root_table_slot()),
+            entry(list_set_graphics_root_table_slot()), offset);
+        hook_variant("set_render_targets", set_render_targets_variants, VARIANT_DETOURS(set_render_targets_variant), hooked(list_set_render_targets_slot()),
+            entry(list_set_render_targets_slot()), offset);
+        if (original_set_scissor_rects)
+            hook_variant("set_scissor_rects", set_scissor_rects_variants, VARIANT_DETOURS(set_scissor_rects_variant), hooked(list_set_scissor_rects_slot()),
+                entry(list_set_scissor_rects_slot()), offset);
+        if (original_execute_indirect)
+            hook_variant("execute_indirect", execute_indirect_variants, VARIANT_DETOURS(execute_indirect_variant), hooked(list_execute_indirect_slot()),
+                entry(list_execute_indirect_slot()), offset);
+        if (v >= 4 && hooked_list4_vtable && original_begin_render_pass) {
+            hook_variant("begin_render_pass", begin_render_pass_variants, VARIANT_DETOURS(begin_render_pass_variant), hooked_list4_vtable[list_begin_render_pass_slot()],
+                entry(list_begin_render_pass_slot()), offset);
+            hook_variant("end_render_pass", end_render_pass_variants, VARIANT_DETOURS(end_render_pass_variant), hooked_list4_vtable[list_end_render_pass_slot()],
+                entry(list_end_render_pass_slot()), offset);
+        }
+    }
+} catch (...) {}
 
 // The runtime's functions are shared by all its devices and command lists, so they are hooked once, at the first device.
 void install_d3d12_hooks(ID3D12Device* device) {
@@ -3827,12 +4022,17 @@ void install_d3d12_hooks(ID3D12Device* device) {
             probes = probes && hook_slot(list.Get(), list_set_scissor_rects_slot(), reinterpret_cast<void*>(&set_scissor_rects_hook), original_set_scissor_rects) &&
                 hook_slot(list.Get(), list_execute_indirect_slot(), reinterpret_cast<void*>(&execute_indirect_hook), original_execute_indirect);
             ComPtr<ID3D12GraphicsCommandList4> list4;
-            if (SUCCEEDED(list.As(&list4)))
+            if (SUCCEEDED(list.As(&list4))) {
+                hooked_list4_vtable = *reinterpret_cast<void***>(list4.Get());
+                hooked_list4_offset = reinterpret_cast<char*>(list4.Get()) - reinterpret_cast<char*>(list.Get());
+            }
+            if (list4)
                 passes = hook_slot(list4.Get(), list_begin_render_pass_slot(), reinterpret_cast<void*>(&begin_render_pass_hook), original_begin_render_pass) &&
                     hook_slot(list4.Get(), list_end_render_pass_slot(), reinterpret_cast<void*>(&end_render_pass_hook), original_end_render_pass);
+            if (lists) install_list_variants(list.Get());
         }
     }
-    log("d3d12 hooks pipelines=%d device=%d command_lists=%d render_passes=%d pixel_probe=%d%s", pipelines, devices, lists, passes, probes,
+    log("d3d12 hooks pipelines=%d device=%d command_lists=%d render_passes=%d pixel_probe=%d variants=%d%s", pipelines, devices, lists, passes, probes, variant_hooks.load(),
         pipelines && devices && lists ? "" : " - ERROR the fix cannot follow the sim's drawing without these; send the log");
 }
 
