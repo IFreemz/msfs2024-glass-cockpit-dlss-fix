@@ -3641,20 +3641,47 @@ void STDMETHODCALLTYPE create_rtv_hook(ID3D12Device* device, ID3D12Resource* res
     std::unique_lock lock(rtv_mutex);
     rtv_resources[handle.ptr] = resource;
 }
-void command_list_created(ID3D12Device* device, void** out, ID3D12PipelineState* initial) {
+// The vtable of the fix's own command list, through which the list functions were hooked (install_d3d12_hooks).
+void** hooked_list_vtable = nullptr;
+// Diagnostics: whether a new command list runs the functions the fix hooked. A list class with its own functions (e.g.
+// another D3D12 runtime version) would never reach the hooks. Logged once per distinct vtable.
+void check_list_functions(ID3D12GraphicsCommandList* list, ID3D12Device* device, const char* created_by) {
+    void** const vtable = *reinterpret_cast<void***>(list);
+    {
+        static std::mutex mutex;
+        static std::vector<void**> seen;
+        std::lock_guard lock(mutex);
+        if (std::find(seen.begin(), seen.end(), vtable) != seen.end() || seen.size() >= 8) return;
+        seen.push_back(vtable);
+    }
+    const std::pair<const char*, size_t> slots[]{{"draw_indexed", list_draw_indexed_slot()}, {"set_pipeline_state", list_set_pipeline_state_slot()},
+        {"set_root_table", list_set_graphics_root_table_slot()}, {"set_render_targets", list_set_render_targets_slot()}};
+    int same = 0;
+    for (const auto& [name, slot] : slots) same += hooked_list_vtable && vtable[slot] == hooked_list_vtable[slot];
+    log("command_list vtable=%p hooked_vtable=%p type=%d created_by=%s sim_device=%d hooked_functions=%d/4 vtable_%s", vtable, hooked_list_vtable,
+        int(list->GetType()), created_by, int(device == main_device), same, describe_code(vtable).c_str());
+    if (same == 4 || !hooked_list_vtable) return;
+    for (const auto& [name, slot] : slots)
+        if (vtable[slot] != hooked_list_vtable[slot])
+            log("  %s differs: list's %s, hooked %s", name, describe_code(vtable[slot]).c_str(), describe_code(hooked_list_vtable[slot]).c_str());
+}
+void command_list_created(ID3D12Device* device, void** out, ID3D12PipelineState* initial, const char* created_by) {
     if (passthrough() || !out || !*out) return;
     ComPtr<ID3D12GraphicsCommandList> list;
-    if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list)))) list_created(list.Get(), device, initial);
+    if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list)))) {
+        check_list_functions(list.Get(), device, created_by);
+        list_created(list.Get(), device, initial);
+    }
 }
 HRESULT STDMETHODCALLTYPE create_command_list_hook(ID3D12Device* device, UINT mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator,
     ID3D12PipelineState* initial, REFIID iid, void** out) {
     const HRESULT hr = original_create_command_list(device, mask, type, allocator, initial, iid, out);
-    if (SUCCEEDED(hr)) command_list_created(device, out, initial);
+    if (SUCCEEDED(hr)) command_list_created(device, out, initial, "CreateCommandList");
     return hr;
 }
 HRESULT STDMETHODCALLTYPE create_command_list1_hook(ID3D12Device4* device, UINT mask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID iid, void** out) {
     const HRESULT hr = original_create_command_list1(device, mask, type, flags, iid, out);
-    if (SUCCEEDED(hr)) command_list_created(device, out, nullptr); // created closed: Reset comes before recording
+    if (SUCCEEDED(hr)) command_list_created(device, out, nullptr, "CreateCommandList1"); // created closed: Reset comes before recording
     return hr;
 }
 HRESULT STDMETHODCALLTYPE create_command_signature_hook(ID3D12Device* device, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root, REFIID iid,
@@ -3787,6 +3814,7 @@ void install_d3d12_hooks(ID3D12Device* device) {
         if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) &&
             SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)))) {
             list->Close();
+            hooked_list_vtable = *reinterpret_cast<void***>(list.Get());
             lists = hook_slot(list.Get(), list_reset_slot(), reinterpret_cast<void*>(&reset_hook), original_reset) &&
                 hook_slot(list.Get(), list_clear_state_slot(), reinterpret_cast<void*>(&clear_state_hook), original_clear_state) &&
                 hook_slot(list.Get(), list_draw_slot(), reinterpret_cast<void*>(&draw_hook), original_draw) &&
