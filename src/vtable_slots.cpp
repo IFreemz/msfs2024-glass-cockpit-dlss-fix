@@ -33,6 +33,9 @@ size_t list_end_render_pass_slot() { return offsetof(ID3D12GraphicsCommandList4V
 size_t list_set_scissor_rects_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, RSSetScissorRects) / sizeof(void*); }
 size_t list_execute_indirect_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, ExecuteIndirect) / sizeof(void*); }
 
+// Command queue: the lists the sim submits.
+size_t queue_execute_slot() { return offsetof(ID3D12CommandQueueVtbl, ExecuteCommandLists) / sizeof(void*); }
+
 // DXGI: swapchain creation and presents.
 size_t factory_create_swapchain_slot() { return offsetof(IDXGIFactory2Vtbl, CreateSwapChain) / sizeof(void*); }
 size_t factory_create_swapchain_hwnd_slot() { return offsetof(IDXGIFactory2Vtbl, CreateSwapChainForHwnd) / sizeof(void*); }

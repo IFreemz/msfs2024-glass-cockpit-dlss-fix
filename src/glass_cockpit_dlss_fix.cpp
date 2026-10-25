@@ -85,6 +85,7 @@ size_t list_begin_render_pass_slot();
 size_t list_end_render_pass_slot();
 size_t list_set_scissor_rects_slot();
 size_t list_execute_indirect_slot();
+size_t queue_execute_slot();
 size_t factory_create_swapchain_slot();
 size_t factory_create_swapchain_hwnd_slot();
 size_t factory_create_swapchain_core_window_slot();
@@ -3644,6 +3645,7 @@ void STDMETHODCALLTYPE create_rtv_hook(ID3D12Device* device, ID3D12Resource* res
 // The vtable of the fix's own command list, through which the list functions were hooked (install_d3d12_hooks).
 void** hooked_list_vtable = nullptr;
 void install_list_variants(ID3D12GraphicsCommandList* list) noexcept;
+void list_vtable_seen(ID3D12GraphicsCommandList* list, const char* where) noexcept;
 // Diagnostics: whether a new command list runs the functions the fix hooked. A list class with its own functions (e.g.
 // another D3D12 runtime version) would never reach the hooks. Logged once per distinct vtable.
 void check_list_functions(ID3D12GraphicsCommandList* list, ID3D12Device* device, const char* created_by) {
@@ -3767,7 +3769,7 @@ ListSetScissorRects original_set_scissor_rects = nullptr;
 ListExecuteIndirect original_execute_indirect = nullptr;
 HRESULT STDMETHODCALLTYPE reset_hook(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial) {
     const HRESULT hr = original_reset(list, allocator, initial);
-    if (SUCCEEDED(hr) && !passthrough()) list_reset(list, initial);
+    if (SUCCEEDED(hr) && !passthrough()) { list_vtable_seen(list, "Reset"); list_reset(list, initial); }
     return hr;
 }
 void STDMETHODCALLTYPE clear_state_hook(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline) {
@@ -3853,7 +3855,11 @@ Variants<ListEndRenderPass> end_render_pass_variants;
 template <int V> HRESULT STDMETHODCALLTYPE reset_variant(ID3D12GraphicsCommandList* self, ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial) {
     HRESULT hr;
     { Internal internal; hr = reset_variants.original[V](self, allocator, initial); }
-    if (SUCCEEDED(hr) && !passthrough()) list_reset(base_list(self, reset_variants.offset[V]), initial);
+    if (SUCCEEDED(hr) && !passthrough()) {
+        const auto list = base_list(self, reset_variants.offset[V]);
+        list_vtable_seen(list, "Reset");
+        list_reset(list, initial);
+    }
     return hr;
 }
 template <int V> void STDMETHODCALLTYPE clear_state_variant(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pipeline) {
@@ -3978,6 +3984,44 @@ void install_list_variants(ID3D12GraphicsCommandList* list) noexcept try {
     }
 } catch (...) {}
 
+// A runtime may also switch a list's vtable after creating it (e.g. to one for recording, at Reset): every list vtable
+// met at creation, Reset and submission is checked once, and the functions of a new one are hooked as well.
+std::array<std::atomic<void**>, 32> known_list_vtables{};
+std::atomic<int> known_list_vtable_count{0};
+void list_vtable_seen(ID3D12GraphicsCommandList* list, const char* where) noexcept try {
+    void** const vtable = *reinterpret_cast<void***>(list);
+    const int count = known_list_vtable_count.load(std::memory_order_acquire);
+    for (int i = 0; i < count; ++i) if (known_list_vtables[i].load(std::memory_order_relaxed) == vtable) return;
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+    const int now = known_list_vtable_count.load(std::memory_order_relaxed);
+    for (int i = 0; i < now; ++i) if (known_list_vtables[i].load(std::memory_order_relaxed) == vtable) return;
+    if (now == int(known_list_vtables.size())) return;
+    known_list_vtables[now].store(vtable, std::memory_order_relaxed);
+    known_list_vtable_count.store(now + 1, std::memory_order_release);
+    const int before = variant_hooks.load();
+    log("command_list vtable=%p first seen at %s type=%d (hooked vtable %p) %s", vtable, where, int(list->GetType()), hooked_list_vtable, describe_code(vtable).c_str());
+    install_list_variants(list);
+    if (variant_hooks.load() != before) log("command list variants now %d", variant_hooks.load());
+} catch (...) {}
+
+using QueueExecute = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+QueueExecute original_queue_execute = nullptr;
+void STDMETHODCALLTYPE queue_execute_hook(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
+    if (!passthrough() && lists)
+        for (UINT i = 0; i < count; ++i) {
+            if (!lists[i]) continue;
+            void** const vtable = *reinterpret_cast<void***>(lists[i]);
+            bool known = false;
+            const int n = known_list_vtable_count.load(std::memory_order_acquire);
+            for (int k = 0; k < n && !known; ++k) known = known_list_vtables[k].load(std::memory_order_relaxed) == vtable;
+            if (known) continue;
+            ComPtr<ID3D12GraphicsCommandList> list;
+            if (SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&list)))) list_vtable_seen(list.Get(), "ExecuteCommandLists");
+        }
+    original_queue_execute(queue, count, lists);
+}
+
 // The runtime's functions are shared by all its devices and command lists, so they are hooked once, at the first device.
 void install_d3d12_hooks(ID3D12Device* device) {
     static bool installed = false;
@@ -4029,10 +4073,19 @@ void install_d3d12_hooks(ID3D12Device* device) {
             if (list4)
                 passes = hook_slot(list4.Get(), list_begin_render_pass_slot(), reinterpret_cast<void*>(&begin_render_pass_hook), original_begin_render_pass) &&
                     hook_slot(list4.Get(), list_end_render_pass_slot(), reinterpret_cast<void*>(&end_render_pass_hook), original_end_render_pass);
-            if (lists) install_list_variants(list.Get());
+            if (lists) list_vtable_seen(list.Get(), "install");
         }
     }
-    log("d3d12 hooks pipelines=%d device=%d command_lists=%d render_passes=%d pixel_probe=%d variants=%d%s", pipelines, devices, lists, passes, probes, variant_hooks.load(),
+    // The queue's submissions, to meet list vtables the sim switches to after creating its lists.
+    bool queues = false;
+    {
+        Internal internal;
+        ComPtr<ID3D12CommandQueue> queue;
+        D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+        if (SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))))
+            queues = hook_slot(queue.Get(), queue_execute_slot(), reinterpret_cast<void*>(&queue_execute_hook), original_queue_execute);
+    }
+    log("d3d12 hooks pipelines=%d device=%d command_lists=%d render_passes=%d pixel_probe=%d queue=%d variants=%d%s", pipelines, devices, lists, passes, probes, int(queues), variant_hooks.load(),
         pipelines && devices && lists ? "" : " - ERROR the fix cannot follow the sim's drawing without these; send the log");
 }
 
