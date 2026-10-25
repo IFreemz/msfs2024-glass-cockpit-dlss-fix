@@ -2899,6 +2899,8 @@ template <int I> ffxReturnCode_t ffx_dispatch_hook(ffxContext* context, const ff
 template <int... I> constexpr std::array<FfxDispatch, sizeof...(I)> ffx_hooks(std::integer_sequence<int, I...>) { return {&ffx_dispatch_hook<I>...}; }
 constexpr auto ffx_dispatch_hooks = ffx_hooks(std::make_integer_sequence<int, max_ffx_modules>{});
 bool ffx_hooked = false; // at least one FidelityFX module hooked
+std::string describe_code(const void* address);
+void* follow_jumps(void* address);
 void install_ffx() {
     HMODULE modules[1024]; DWORD needed = 0;
     if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) return;
@@ -2915,7 +2917,20 @@ void install_ffx() {
         auto dispatch = GetProcAddress(module, "ffxDispatch");
         HMODULE pinned = nullptr;
         if (dispatch) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(dispatch), &pinned);
-        const bool hooked = dispatch && hook(reinterpret_cast<void*>(dispatch), reinterpret_cast<void*>(ffx_dispatch_hooks[index]), original_ffx_dispatch[index]);
+        // Another mod already hooked ffxDispatch (a jump into its own module): the fix attaches at that mod's handler and
+        // leaves the export's bytes as that mod wrote them. Hooking over its jump makes a mod that checks its hook (e.g.
+        // NeuralHub) hook again on top of the fix's, and the two then call each other until the stack overflows.
+        void* target = reinterpret_cast<void*>(dispatch);
+        if (target) {
+            void* const leads = follow_jumps(target);
+            HMODULE owner = nullptr;
+            if (leads != target && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    static_cast<LPCWSTR>(leads), &owner) && owner != module) {
+                log("FSR ffxDispatch in %ls is redirected by another mod: fix attached at its destination (%s)", name.c_str(), describe_code(leads).c_str());
+                target = leads;
+            }
+        }
+        const bool hooked = target && hook(target, reinterpret_cast<void*>(ffx_dispatch_hooks[index]), original_ffx_dispatch[index]);
         const auto version = file_version(path);
         log("FSR runtime found: %ls %s path=%ls hook=%d", name.c_str(), version.c_str(), path, hooked);
         if (!hooked) continue;
