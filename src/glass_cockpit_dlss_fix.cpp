@@ -157,10 +157,8 @@ std::string utf8(const wchar_t* text) {
     return buffer;
 }
 
-// Logs the first few occurrences of each skip reason.
-void note(std::atomic<uint64_t>& counter, const char* reason) {
-    if (counter++ < 3) log("skip reason=%s", reason);
-}
+// Counts a skip and logs the first few occurrences of each skip reason (each call site counts its own).
+#define note(counter, reason) do { static std::atomic<int> logged_{0}; ++(counter); if (logged_++ < 3) log("skip reason=%s", reason); } while (0)
 // Logs a message only the first time (milestones and one-off warnings).
 #define LOG_ONCE(...) do { static std::atomic<bool> logged_{false}; if (!logged_.exchange(true)) log(__VA_ARGS__); } while (0)
 
