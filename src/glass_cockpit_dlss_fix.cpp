@@ -209,10 +209,8 @@ std::string utf8(const wchar_t* text) {
     return buffer;
 }
 
-// Logs the first few occurrences of each skip reason.
-void note(std::atomic<uint64_t>& counter, const char* reason) {
-    if (counter++ < 3) log("skip reason=%s", reason);
-}
+// Counts a skip and logs the first few occurrences of each skip reason (each call site counts its own).
+#define note(counter, reason) do { static std::atomic<int> logged_{0}; ++(counter); if (logged_++ < 3) log("skip reason=%s", reason); } while (0)
 // Logs a message only the first time (milestones and one-off warnings).
 #define LOG_ONCE(...) do { static std::atomic<bool> logged_{false}; if (!logged_.exchange(true)) log(__VA_ARGS__); } while (0)
 
@@ -3852,7 +3850,7 @@ template <class F> struct Variants {
     std::array<F, max_variants> original{};
     std::array<ptrdiff_t, max_variants> offset{};
     std::array<void*, max_variants> target{};
-    int count = 0;
+    std::atomic<int> count{0};
 };
 Variants<ListReset> reset_variants;
 Variants<ListClearState> clear_state_variants;
@@ -3944,7 +3942,7 @@ template <class F> void hook_variant(const char* name, Variants<F>& variants, co
             return;
         }
     if (variants.count == max_variants) { log("WARNING command list variant %s: more than %d, %s not hooked", name, max_variants, describe_code(target).c_str()); return; }
-    const int i = variants.count;
+    const int i = variants.count.load();
     variants.offset[i] = offset;
     variants.target[i] = target;
     void* trampoline = nullptr;
@@ -3999,23 +3997,53 @@ void install_list_variants(ID3D12GraphicsCommandList* list) noexcept try {
     }
 } catch (...) {}
 
+// Whether every hooked function of a list's own vtable is one the fix already hooks (directly or as a variant).
+template <class F> bool variant_known(const Variants<F>& variants, void** vtable, size_t slot) {
+    void* const function = vtable[slot];
+    if (function == hooked_list_vtable[slot]) return true;
+    const int n = variants.count.load();
+    for (int i = 0; i < n; ++i) if (variants.target[i] == function && variants.offset[i] == 0) return true;
+    return false;
+}
+bool list_functions_hooked(void** vtable) {
+    return variant_known(reset_variants, vtable, list_reset_slot()) && variant_known(clear_state_variants, vtable, list_clear_state_slot()) &&
+        variant_known(draw_variants, vtable, list_draw_slot()) && variant_known(draw_indexed_variants, vtable, list_draw_indexed_slot()) &&
+        variant_known(copy_texture_region_variants, vtable, list_copy_texture_region_slot()) &&
+        variant_known(set_pipeline_state_variants, vtable, list_set_pipeline_state_slot()) &&
+        variant_known(set_root_signature_variants, vtable, list_set_graphics_root_signature_slot()) &&
+        variant_known(set_root_table_variants, vtable, list_set_graphics_root_table_slot()) &&
+        variant_known(set_render_targets_variants, vtable, list_set_render_targets_slot()) &&
+        (!original_set_scissor_rects || variant_known(set_scissor_rects_variants, vtable, list_set_scissor_rects_slot())) &&
+        (!original_execute_indirect || variant_known(execute_indirect_variants, vtable, list_execute_indirect_slot()));
+}
+
 // A runtime may also switch a list's vtable after creating it (e.g. to one for recording, at Reset): every list vtable
-// met at creation, Reset and submission is checked once, and the functions of a new one are hooked as well.
+// met at creation, Reset and submission is checked once, and the functions of a new one are hooked as well. Windows 11
+// 26H1 gives each list a vtable of its own (with the driver's functions), so once the table is full, a vtable whose
+// functions are all hooked already is let through, and any other is still checked.
 std::array<std::atomic<void**>, 32> known_list_vtables{};
 std::atomic<int> known_list_vtable_count{0};
 void list_vtable_seen(ID3D12GraphicsCommandList* list, const char* where) noexcept try {
     void** const vtable = *reinterpret_cast<void***>(list);
     const int count = known_list_vtable_count.load(std::memory_order_acquire);
     for (int i = 0; i < count; ++i) if (known_list_vtables[i].load(std::memory_order_relaxed) == vtable) return;
+    const bool full = count == int(known_list_vtables.size());
+    if (full && (!hooked_list_vtable || list_functions_hooked(vtable))) return;
     static std::mutex mutex;
     std::lock_guard lock(mutex);
     const int now = known_list_vtable_count.load(std::memory_order_relaxed);
     for (int i = 0; i < now; ++i) if (known_list_vtables[i].load(std::memory_order_relaxed) == vtable) return;
-    if (now == int(known_list_vtables.size())) return;
-    known_list_vtables[now].store(vtable, std::memory_order_relaxed);
-    known_list_vtable_count.store(now + 1, std::memory_order_release);
+    if (now < int(known_list_vtables.size())) {
+        known_list_vtables[now].store(vtable, std::memory_order_relaxed);
+        known_list_vtable_count.store(now + 1, std::memory_order_release);
+    }
+    static int logged = 0;
     const int before = variant_hooks.load();
-    log("command_list vtable=%p first seen at %s type=%d (hooked vtable %p) %s", vtable, where, int(list->GetType()), hooked_list_vtable, describe_code(vtable).c_str());
+    if (logged < 8)
+        log("command_list vtable=%p first seen at %s type=%d (hooked vtable %p) %s", vtable, where, int(list->GetType()), hooked_list_vtable, describe_code(vtable).c_str());
+    else if (logged == 8)
+        log("command_list: more list vtables (Windows 11 26H1 gives each list its own), not logged");
+    if (logged <= 8) ++logged;
     install_list_variants(list);
     if (variant_hooks.load() != before) log("command list variants now %d", variant_hooks.load());
 } catch (...) {}
