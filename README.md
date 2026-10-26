@@ -244,7 +244,8 @@ Other headsets and runtimes should work the same; reports welcome.
 
 ### Game versions
 
-Tested on the Microsoft Store / Xbox app (Game Pass) version and by the community on Steam.
+Tested on the Microsoft Store / Xbox app (Game Pass) version and by the community on Steam. On Windows 11 26H1 the
+standalone needs 1.0.4 or newer (tested by the community).
 
 **MSFS 2020 is not supported.** The fix finds the cockpit screens by how MSFS 2024 draws them, and I don't have
 2020 to test or port it. The source is open (GPL-3.0 from 1.0.0), so a 2020 port by someone who has it is welcome.
@@ -274,6 +275,8 @@ Tested on the Microsoft Store / Xbox app (Game Pass) version and by the communit
   installer and settings app by WeSimGlide. From its version 1.0.2.10 it installs the official standalone DLL from this
   page and keeps your `.ini`. Problems with the app go to WeSimGlide, problems with the fixed screens come here. Older
   versions installed their own build: don't add this fix on top of one of those (it would run twice).
+- **NeuralHub** (DLSS Neural Rendering on AMD): works with either version from 1.0.4 (tested by the community on an
+  RX 7900 XTX and an RX 9070 XT). Older versions could crash the sim at about 68% loading.
 - **REX Atmos:** with Atmos' **Overall Light** at 0, fixed screens flickered in daylight (user report); the default (16)
   is fine.
 - **Extra DLSS passes:** if a mod or the sim runs a second DLSS pass, the fix stays on the sim's real upscale (the one
@@ -335,6 +338,8 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Sim crashes while an FSLabs aircraft loads | Update to 1.0.1 or newer (1.0.0 only) |
 | A screen briefly flashes very bright and fades back over a second or so (seen on the iniBuilds A380 and Fenix) | Update to 1.0.2 or newer (1.0.0 and 1.0.1 only) |
 | FPS drops sharply for 20-30 seconds when opening the GSX menu with Ctrl+Shift+F12 | Update to 1.0.3 or newer (older versions used Ctrl+Shift+F12 for a debug tool) |
+| Standalone stays at "Waiting for a glass cockpit" on Windows 11 26H1 (the add-on works) | Update to 1.0.4 or newer |
+| Sim crashes at about 68% loading with NeuralHub (DLSS on AMD) | Update to 1.0.4 or newer |
 | Sim freezes when a Fenix aircraft loads, with RenoDX's DLSS add-on installed | Remove `renodx-dlss.addon64`; see [Other mods](#other-mods) |
 | "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Screen probe** under Bug reports (writes a short diagnostic to the log), then send both logs and the aircraft name |
