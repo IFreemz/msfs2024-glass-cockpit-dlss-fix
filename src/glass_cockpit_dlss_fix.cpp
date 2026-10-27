@@ -987,13 +987,24 @@ bool same_adapter(ID3D12Device* a, ID3D12Device* b) {
     const LUID x = a->GetAdapterLuid(), y = b->GetAdapterLuid();
     return x.LowPart == y.LowPart && x.HighPart == y.HighPart;
 }
+bool integrated(ID3D12Device* device) {
+    D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture))) && architecture.UMA;
+}
 void device_created(ID3D12Device* native) noexcept try {
     std::lock_guard lock(device_mutex);
     if (native == main_device) return; // the same device again: D3D12 keeps one device per adapter
-    // A device on another GPU after the sim's (e.g. a helper on a laptop's integrated GPU) is not the sim's.
+    // A device on another GPU after the sim's (e.g. a helper on a laptop's integrated GPU) is not the sim's. The
+    // exception: a device on an integrated GPU can also come before the sim's, and the sim's own on the discrete GPU
+    // then takes its place.
+    bool replacing = false;
     if (main_device && !same_adapter(native, main_device)) {
-        LOG_ONCE("note a Direct3D 12 device on another GPU was created after the sim's; the fix stays with the sim's");
-        return;
+        if (!integrated(main_device) || integrated(native)) {
+            LOG_ONCE("note a Direct3D 12 device on another GPU was created after the sim's; the fix stays with the sim's");
+            return;
+        }
+        log("note the Direct3D 12 device found first was on the integrated GPU: the fix moves to the discrete GPU's created after it");
+        replacing = true;
     }
     // Only the game's hardware device: MSFS also creates a WARP (software) device for a helper window,
     // whose descriptors have a different size and must not be mixed with the GPU's.
@@ -1019,7 +1030,7 @@ void device_created(ID3D12Device* native) noexcept try {
         gpu_nvidia = adapter_desc.VendorId == 0x10de;
         gpu_known = true;
     }
-    if (software || size > 32 || (descriptor_size && descriptor_size != size)) {
+    if (software || size > 32 || (descriptor_size && descriptor_size != size && !replacing)) {
         log("device_ignored native=%p software=%d descriptor_size=%u", native, software, size);
         return;
     }
