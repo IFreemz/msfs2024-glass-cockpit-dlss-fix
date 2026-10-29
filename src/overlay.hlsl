@@ -44,7 +44,7 @@ Texture2D<float4> displays[32] : register(t2);
 Texture2D<float> scene_depth : register(t34); // the upscaler's depth input (render resolution; occlusion check)
 RWTexture2D<float4> output : register(u0);  // DLSS output, R11G11B10_FLOAT
 RWTexture2D<uint> tiles : register(u1);     // per 8x8 map tile: display slot + 1 this frame (0 = none)
-RWStructuredBuffer<float4> params : register(u2); // per slot: [3s] = a.rgb, valid; [3s+1] = b.rgb, samples; [3s+2] = mean screen.rgb, fit quality
+RWStructuredBuffer<float4> params : register(u2); // per slot: [4s] = a.rgb, valid; [4s+1] = b.rgb, samples; [4s+2] = mean screen.rgb, fit quality; [4s+3].x = detail quality
 RWTexture2DArray<float4> map_rw : register(u3);
 RWByteAddressBuffer sums : register(u4);    // per slot 20 x uint64 fixed point
 RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * display, w = slot + 1 (0 = none), + 64 where
@@ -66,6 +66,7 @@ SamplerState display_sampler : register(s0);
 
 static const uint slot_count = 32;
 static const uint terms = 20;
+static const uint params_per_slot = 4; // float4s per slot in params
 static const float fixed_scale = 16777216.0;
 static const uint bounds_cells = 64;
 // Learnt edges in two halves that take turns (a new one every 128 upscaler calls, about a second): each call learns into
@@ -187,7 +188,7 @@ uint map_slot(float4 m)
 void zero(uint3 id : SV_DispatchThreadID)
 {
     for (uint i = id.x; i < slot_count * terms; i += 64) sums.Store<uint64_t>(i * 8, 0);
-    for (uint j = id.x; j < slot_count * 3; j += 64) params[j] = 0;
+    for (uint j = id.x; j < slot_count * params_per_slot; j += 64) params[j] = 0;
     for (uint c = id.x; c < 2 * slot_count * bounds_cells * bounds_cells; c += 64) edge_bounds.Store4(c * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
 }
 
@@ -350,7 +351,7 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     // Per-pixel remainder against last frame's gain (glass layer: dirt, glare, reflections, shadows). That gain was fitted
     // with the brightness reference then: rescaled to this call's, as the solve pass does (in VR the eyes can see
     // different meshes of one screen texture, so the reference changes with every call).
-    float4 gain = active ? params[slot * 3] : 0;
+    float4 gain = active ? params[slot * params_per_slot] : 0;
     if (active)
     {
         float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4)), fitted = asfloat(edge_bounds.Load(brightness_fitted + slot * 4));
@@ -484,7 +485,7 @@ void solve(uint3 id : SV_DispatchThreadID)
         v[i] = i == 0 ? double(raw) : double(raw) / fixed_scale;
         sums.Store<uint64_t>(base + i * 8, 0);
     }
-    float4 previous_a = params[slot * 3], previous_b = params[slot * 3 + 1], previous_q = params[slot * 3 + 2];
+    float4 previous_a = params[slot * params_per_slot], previous_b = params[slot * params_per_slot + 1], previous_q = params[slot * params_per_slot + 2];
     // The screen texture is read times each mesh's brightness relative to the slot's reference: when the reference
     // changed since the stored match was fitted, the match is rescaled to it (the same picture, no jump).
     float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4)), fitted = asfloat(edge_bounds.Load(brightness_fitted + slot * 4));
@@ -495,7 +496,7 @@ void solve(uint3 id : SV_DispatchThreadID)
     // screen to the upscaler for this call and start over on the next, with the new reference.
     if ((bounds_reset & (1u << slot)) || (reference > 0 && fitted > 0 && (reference > 16 * fitted || 16 * reference < fitted)))
     {
-        params[slot * 3] = 0;
+        params[slot * params_per_slot] = 0;
         edge_bounds.Store(brightness_fitted + slot * 4, 0);
         return;
     }
@@ -503,7 +504,7 @@ void solve(uint3 id : SV_DispatchThreadID)
     if (reference > 0) edge_bounds.Store(brightness_fitted + slot * 4, asuint(reference));
     if (flags & 1) previous_a.w = 0;
     double n = v[0];
-    if (n < 64) { params[slot * 3] = previous_a; return; }
+    if (n < 64) { params[slot * params_per_slot] = previous_a; return; }
     // Per channel: scene = gain * screen + offset (least squares).
     double mx[3], my[3], variance[3], covariance[3], pooled_variance = 0, pooled_covariance = 0, pooled_scene_variance = 0;
     [unroll] for (uint c = 0; c < 3; ++c)
@@ -515,7 +516,7 @@ void solve(uint3 id : SV_DispatchThreadID)
     // No contrast in the part of the screen's texture in view (e.g. only the blank side of the A380 EFB, at the edge of
     // the view): nothing to learn the brightness from. A screen already matched keeps its match; one never matched stays
     // with the upscaler (see below).
-    if (pooled_variance <= 3e-6 && previous_a.w > 0) { params[slot * 3] = previous_a; return; }
+    if (pooled_variance <= 3e-6 && previous_a.w > 0) { params[slot * params_per_slot] = previous_a; return; }
     float3 a, b;
     float fitted_gain = 0;
     [unroll] for (uint c = 0; c < 3; ++c)
@@ -542,14 +543,21 @@ void solve(uint3 id : SV_DispatchThreadID)
     // Experimental (dark screen fix): it can also let through a screen whose picture the sim draws differently
     // (reported for the iFly 737 EFB), so it is off by default.
     double detail_xx = v[16], detail_yy = v[17] * 1024, detail_xy = v[18] - v[19];
-    if ((flags & 16) && pooled_variance > 3e-6 && detail_xx > 0 && detail_yy > 0 && detail_xy > 0)
-        quality = max(quality, detail_xy * detail_xy / (detail_xx * detail_yy));
+    double detail_quality = pooled_variance > 3e-6 && detail_xx > 0 && detail_yy > 0 && detail_xy > 0
+        ? detail_xy * detail_xy / (detail_xx * detail_yy) : 0.0;
+    if (flags & 16) quality = max(quality, detail_quality);
     float w = previous_a.w > 0 ? smoothing : 1;
     float q = previous_a.w != 0 ? lerp(previous_q.w, float(quality), smoothing) : float(quality);
-    bool keep = previous_a.w < 0 ? q > 0.25 : q > 0.15; // hysteresis: no flicker near the limit
-    params[slot * 3] = float4(lerp(previous_a.rgb, a, w), keep ? 1 : -1); // w: valid (1), rejected (-1)
-    params[slot * 3 + 1] = float4(lerp(previous_b.rgb, b, w), float(n));
-    params[slot * 3 + 2] = float4(float3(mx[0], mx[1], mx[2]), q);
+    float dq = previous_a.w != 0 ? lerp(params[slot * params_per_slot + 3].x, float(detail_quality), smoothing) : float(detail_quality);
+    // A screen already fixed stays fixed while its fine detail still matches the sim's, even when the whole-picture score
+    // drops: dimmed or nearly blank screens (A400M glareshield at night, A2A Legacy radios) are mostly glow and backlight
+    // the texture doesn't hold. A screen not matched yet, or dropped, still needs the whole picture to match (the iFly
+    // EFB, drawn differently by the sim, stays with the upscaler).
+    bool keep = previous_a.w < 0 ? q > 0.25 : q > 0.15 || (previous_a.w > 0 && dq > 0.25); // hysteresis: no flicker near the limit
+    params[slot * params_per_slot] = float4(lerp(previous_a.rgb, a, w), keep ? 1 : -1); // w: valid (1), rejected (-1)
+    params[slot * params_per_slot + 1] = float4(lerp(previous_b.rgb, b, w), float(n));
+    params[slot * params_per_slot + 2] = float4(float3(mx[0], mx[1], mx[2]), q);
+    params[slot * params_per_slot + 3] = float4(dq, 0, 0, 0);
 }
 
 bool tap(int2 p, out float4 value)
@@ -985,7 +993,7 @@ void composite(uint3 id : SV_DispatchThreadID)
         trim_keep = saturate(dist - edge_trim + 0.5);
         if (trim_keep <= 0) return;
     }
-    float4 gain = params[slot * 3], offset = params[slot * 3 + 1];
+    float4 gain = params[slot * params_per_slot], offset = params[slot * params_per_slot + 1];
     if (gain.w <= 0) return;
     // Angle softening: on a screen seen at a steep angle the texture footprint of a pixel is long and thin. Anisotropic
     // filtering at output resolution keeps one-texel lines there crisp (they break into dashes); the sim samples at
@@ -1013,7 +1021,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     }
     if (join_share > 0)
     {
-        float4 join_gain = params[join_slot * 3];
+        float4 join_gain = params[join_slot * params_per_slot];
         float own_brightness = pixel_brightness;
         pixel_brightness = join_brightness;
         if (join_gain.w > 0) content = lerp(content, sample_lines(join_slot, join_uv, join_dx, join_dy) * join_gain.rgb, join_share);

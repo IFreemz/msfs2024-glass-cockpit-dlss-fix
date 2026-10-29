@@ -119,6 +119,7 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
 // three times per frame, and the GPU can be several frames behind the CPU (more so with the game in the background): a set
 // must not be rewritten while the GPU may still read it.
 constexpr unsigned slot_count = 32, ring_size = 32, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 12; // + depth (t34), capture (u11)
+constexpr unsigned params_per_slot = 4; // float4s per slot in the brightness match buffer (params in overlay.hlsl)
 constexpr unsigned bounds_cells = 64; // stable screen edges: cells per side of each screen texture's grid
 std::filesystem::path addon_directory; // the folder this DLL is in (the sim's): log, settings, captures
 ID3D12Device* main_device = nullptr;
@@ -1823,7 +1824,7 @@ bool create_composite(DeviceState& d) {
     D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slot_count * 20 * 8, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
         D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.sums)))) return false;
-    buffer.Width = slot_count * 3 * 16;
+    buffer.Width = slot_count * params_per_slot * 16;
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.params)))) return false;
     buffer.Width = 2 * slot_count * bounds_cells * bounds_cells * 16 + 256 + 512; // two halves of learnt edges, call counters,
                                                                                    // per-slot brightness references
@@ -1850,21 +1851,21 @@ void log_brightness(DeviceState& d) {
     uint64_t ready = d.readback_ready.load();
     if (now < ready || !d.readback_ready.compare_exchange_strong(ready, UINT64_MAX)) return;
     float* data = nullptr;
-    const D3D12_RANGE range{0, slot_count * 3 * 16};
+    const D3D12_RANGE range{0, slot_count * params_per_slot * 16};
     if (FAILED(d.params_readback->Map(0, &range, reinterpret_cast<void**>(&data)))) return;
     // Every dump for the first ~10 minutes, then about once a minute.
     static std::atomic<int> dumps{0};
     const int dump = dumps++;
     if (dump < 60 || dump % 6 == 0) {
         for (unsigned slot = 0; slot < slot_count; ++slot) {
-            const float* a = data + slot * 12;
+            const float* a = data + slot * params_per_slot * 4;
             const float* b = a + 4;
             const float* q = a + 8;
             const auto resource = slot_resources[slot].load();
             if (a[3] == 0 || !resource) continue;
             const auto desc = resource->GetDesc();
-            log("brightness slot=%u screen=%llux%u gain=%.3f,%.3f,%.3f offset=%.4f,%.4f,%.4f mean=%.4f,%.4f,%.4f quality=%.3f samples=%.0f%s", slot,
-                uint64_t(desc.Width), desc.Height, a[0], a[1], a[2], b[0], b[1], b[2], q[0], q[1], q[2], q[3], b[3],
+            log("brightness slot=%u screen=%llux%u gain=%.3f,%.3f,%.3f offset=%.4f,%.4f,%.4f mean=%.4f,%.4f,%.4f quality=%.3f detail=%.3f samples=%.0f%s", slot,
+                uint64_t(desc.Width), desc.Height, a[0], a[1], a[2], b[0], b[1], b[2], q[0], q[1], q[2], q[3], a[12], b[3],
                 a[3] < 0 ? " skipped (screen doesn't match the sim's picture)" : "");
         }
     }
@@ -2298,12 +2299,12 @@ void write_capture(std::vector<CapturedFrame> frames, std::filesystem::path fold
         summary << "\nframe " << f << ": " << info.upscaler << " render " << info.render_w << "x" << info.render_h << " output " << info.out_w << "x" << info.out_h
             << " jitter " << info.jitter_x << "," << info.jitter_y << " map layer " << info.layer << "\n";
         const auto& params = frames[f].params;
-        for (unsigned slot = 0; params.size() >= slot_count * 12 && slot < slot_count; ++slot) {
-            const float* a = params.data() + slot * 12;
+        for (unsigned slot = 0; params.size() >= slot_count * params_per_slot * 4 && slot < slot_count; ++slot) {
+            const float* a = params.data() + slot * params_per_slot * 4;
             if (a[3] == 0) continue;
             char line[256];
-            snprintf(line, sizeof(line), "    colour match slot %u: gain=%.4f,%.4f,%.4f offset=%.5f,%.5f,%.5f quality=%.3f %s\n", slot, a[0], a[1], a[2], a[4], a[5], a[6],
-                a[11], a[3] > 0 ? "fixed" : "skipped");
+            snprintf(line, sizeof(line), "    colour match slot %u: gain=%.4f,%.4f,%.4f offset=%.5f,%.5f,%.5f quality=%.3f detail=%.3f %s\n", slot, a[0], a[1], a[2], a[4], a[5], a[6],
+                a[11], a[12], a[3] > 0 ? "fixed" : "skipped");
             summary << line;
         }
         std::vector<uint8_t> map_records;
@@ -2396,9 +2397,9 @@ void capture_flush(uint64_t now) {
         copy.info.list.Reset();
         if (frame.params) {
             void* data = nullptr;
-            const D3D12_RANGE range{0, slot_count * 3 * 16};
+            const D3D12_RANGE range{0, slot_count * params_per_slot * 16};
             if (SUCCEEDED(frame.params->Map(0, &range, &data))) {
-                copy.params.assign(static_cast<float*>(data), static_cast<float*>(data) + slot_count * 12);
+                copy.params.assign(static_cast<float*>(data), static_cast<float*>(data) + slot_count * params_per_slot * 4);
                 const D3D12_RANGE none{0, 0};
                 frame.params->Unmap(0, &none);
             }
@@ -2567,7 +2568,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     uav.Format = DXGI_FORMAT_R32_UINT;
     d.native->CreateUnorderedAccessView(map->tiles.Get(), nullptr, &uav, at(uav_base + 1));
     D3D12_UNORDERED_ACCESS_VIEW_DESC structured{DXGI_FORMAT_UNKNOWN, D3D12_UAV_DIMENSION_BUFFER};
-    structured.Buffer = {0, slot_count * 3, 16, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+    structured.Buffer = {0, slot_count * params_per_slot, 16, 0, D3D12_BUFFER_UAV_FLAG_NONE};
     d.native->CreateUnorderedAccessView(d.params.Get(), nullptr, &structured, at(uav_base + 2));
     D3D12_UNORDERED_ACCESS_VIEW_DESC map_uav{glass::map_format, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
     map_uav.Texture2DArray = {0, 0, map->layers, 0};
@@ -2726,7 +2727,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         uint64_t next = d.readback_next.load();
         if (now >= next && d.readback_ready.load() == UINT64_MAX && d.readback_next.compare_exchange_strong(next, now + 600)) {
             transition(native, d.params.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            native->CopyBufferRegion(d.params_readback.Get(), 0, d.params.Get(), 0, slot_count * 3 * 16);
+            native->CopyBufferRegion(d.params_readback.Get(), 0, d.params.Get(), 0, slot_count * params_per_slot * 16);
             transition(native, d.params.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             d.readback_ready = now + 30;
         }
@@ -2812,11 +2813,11 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         }
         // The colour match this frame used (the solve pass wrote it before the composite).
         D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
-        D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slot_count * 3 * 16, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+        D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, slot_count * params_per_slot * 16, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
         if (SUCCEEDED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&capture.params)))) {
             transition(native, d.params.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            native->CopyBufferRegion(capture.params.Get(), 0, d.params.Get(), 0, slot_count * 3 * 16);
+            native->CopyBufferRegion(capture.params.Get(), 0, d.params.Get(), 0, slot_count * params_per_slot * 16);
             transition(native, d.params.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
         std::lock_guard capture_lock(capture_mutex);
