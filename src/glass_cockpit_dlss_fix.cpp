@@ -1631,7 +1631,7 @@ void log_brightness(DeviceState& d) {
             const auto desc = resource->GetDesc();
             log("brightness slot=%u screen=%llux%u gain=%.3f,%.3f,%.3f offset=%.4f,%.4f,%.4f mean=%.4f,%.4f,%.4f quality=%.3f detail=%.3f samples=%.0f%s", slot,
                 uint64_t(desc.Width), desc.Height, a[0], a[1], a[2], b[0], b[1], b[2], q[0], q[1], q[2], q[3], a[12], b[3],
-                a[3] < 0 ? " skipped (screen doesn't match the sim's picture)" : "");
+                a[3] < 0 ? " skipped (screen doesn't match the sim's picture)" : q[3] <= 0.25f && (a[13] > 0 || a[14] > 0 || a[15] > 0) ? " held" : "");
         }
     }
     const D3D12_RANGE none{0, 0};
