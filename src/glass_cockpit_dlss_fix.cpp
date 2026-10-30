@@ -540,10 +540,12 @@ std::mutex heaps_mutex;                                   // creating heaps (rar
 std::vector<std::unique_ptr<MirrorHeap>> heap_storage;   // kept until the device goes: a copy may still be reading one
 std::vector<std::unique_ptr<HeapSnapshot>> snapshot_storage;
 std::atomic<const HeapSnapshot*> heap_snapshot{nullptr};
-// Texture ids: index into a fixed table (resource, format); a destroyed texture's entry is cleared, never reused.
-constexpr uint32_t max_texture_ids = 65536;
+// Texture ids: index into a table (resource, format) that grows in pages; a destroyed texture's entry is cleared, never
+// reused. The sim makes about 1000 new ids a minute (Fenix A320): a fixed 65536 was full after an hour.
+constexpr uint32_t texture_id_page_size = 65536, texture_id_pages = 256, max_texture_ids = texture_id_page_size * texture_id_pages;
 struct TextureId { std::atomic<ID3D12Resource*> resource{nullptr}; std::atomic<DXGI_FORMAT> format{DXGI_FORMAT_UNKNOWN}; };
-std::unique_ptr<TextureId[]> texture_ids;
+std::array<std::atomic<TextureId*>, texture_id_pages> texture_id_page{}; // kept until the process ends (readers hold no lock)
+TextureId& texture_entry(uint32_t id) { return texture_id_page[id / texture_id_page_size].load(std::memory_order_acquire)[id % texture_id_page_size]; }
 std::atomic<uint32_t> texture_id_count{1}; // id 0 = none
 std::mutex texture_ids_mutex;
 std::map<std::pair<ID3D12Resource*, DXGI_FORMAT>, uint32_t> texture_id_of;
@@ -587,8 +589,9 @@ uint32_t texture_id(ID3D12Resource* resource, DXGI_FORMAT format) {
         LOG_ONCE("descriptor tracking: texture table full, new screen textures are not tracked");
         return 0;
     }
-    texture_ids[id].format = format;
-    texture_ids[id].resource = resource;
+    if (auto& page = texture_id_page[id / texture_id_page_size]; !page.load(std::memory_order_relaxed)) page.store(new TextureId[texture_id_page_size], std::memory_order_release);
+    texture_entry(id).format = format;
+    texture_entry(id).resource = resource;
     texture_id_count = id + 1;
     texture_id_of[{resource, format}] = id;
     return id;
@@ -596,7 +599,7 @@ uint32_t texture_id(ID3D12Resource* resource, DXGI_FORMAT format) {
 void forget_texture_ids(ID3D12Resource* resource) {
     std::lock_guard lock(texture_ids_mutex);
     for (auto it = texture_id_of.lower_bound({resource, DXGI_FORMAT_UNKNOWN}); it != texture_id_of.end() && it->first.first == resource;) {
-        texture_ids[it->second].resource = nullptr;
+        texture_entry(it->second).resource = nullptr;
         it = texture_id_of.erase(it);
     }
 }
@@ -608,8 +611,8 @@ bool tracked_texture(uintptr_t address, ID3D12Resource*& resource, DXGI_FORMAT& 
     if (!heap) return false;
     const uint32_t id = heap->ids[(address - heap->start) / descriptor_size].load(std::memory_order_relaxed);
     if (!id || id >= texture_id_count.load(std::memory_order_acquire)) return false;
-    format = texture_ids[id].format.load(std::memory_order_relaxed);
-    resource = texture_ids[id].resource.load(std::memory_order_relaxed);
+    format = texture_entry(id).format.load(std::memory_order_relaxed);
+    resource = texture_entry(id).resource.load(std::memory_order_relaxed);
     return resource != nullptr;
 }
 void track_copy(uintptr_t dest, uintptr_t source, UINT count) {
@@ -843,11 +846,33 @@ void install_ffx();
 
 // ---------------------------------------------------------------------------------------------------------------
 // ReShade events.
+bool same_adapter(ID3D12Device* a, ID3D12Device* b) {
+    const LUID x = a->GetAdapterLuid(), y = b->GetAdapterLuid();
+    return x.LowPart == y.LowPart && x.HighPart == y.HighPart;
+}
+bool integrated(ID3D12Device* device) {
+    D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture))) && architecture.UMA;
+}
 void on_init_device(api::device* device) {
     if (device->get_api() != api::device_api::d3d12) return;
+    const auto native = reinterpret_cast<ID3D12Device*>(device->get_native());
+    // A device on a laptop's integrated GPU after the sim's is a helper. One can also come before the sim's, and the sim's
+    // own on the discrete GPU then takes its place.
+    bool replacing = false;
+    if (main_device && !same_adapter(native, main_device)) {
+        const bool first_integrated = integrated(main_device), this_integrated = integrated(native);
+        if (this_integrated && !first_integrated) {
+            LOG_ONCE("note a Direct3D 12 device on the integrated GPU was created after the sim's; the fix stays with the sim's");
+            return;
+        }
+        if (first_integrated && !this_integrated) {
+            log("note the Direct3D 12 device found first was on the integrated GPU: the fix moves to the discrete GPU's created after it");
+            replacing = true;
+        }
+    }
     // Only the game's hardware device: MSFS also creates a WARP (software) device for a helper window,
     // whose descriptors have a different size and must not be mixed with the GPU's.
-    const auto native = reinterpret_cast<ID3D12Device*>(device->get_native());
     const auto size = native->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     bool software = false;
     ComPtr<IDXGIFactory4> factory; ComPtr<IDXGIAdapter1> adapter; DXGI_ADAPTER_DESC1 adapter_desc{};
@@ -870,7 +895,7 @@ void on_init_device(api::device* device) {
         gpu_nvidia = adapter_desc.VendorId == 0x10de;
         gpu_known = true;
     }
-    if (software || size > 32 || (descriptor_size && descriptor_size != size)) {
+    if (software || size > 32 || (descriptor_size && descriptor_size != size && !replacing)) {
         log("device_ignored native=%p software=%d descriptor_size=%u", native, software, size);
         return;
     }
@@ -888,7 +913,6 @@ void on_init_device(api::device* device) {
         hooked &= hook((*reinterpret_cast<void***>(device2.Get()))[pipeline_stream_slot()], reinterpret_cast<void*>(&stream_hook), original_stream);
     track_descriptors = !gpu_nvidia || force_tracking;
     if (track_descriptors) {
-        if (!texture_ids) texture_ids = std::make_unique<TextureId[]>(max_texture_ids);
         const bool tracking = hook(table[create_descriptor_heap_slot()], reinterpret_cast<void*>(&create_heap_hook), original_create_heap) &&
             hook(table[copy_descriptors_slot()], reinterpret_cast<void*>(&copy_hook), original_copy) &&
             hook(table[copy_descriptors_simple_slot()], reinterpret_cast<void*>(&copy_simple_hook), original_copy_simple);
@@ -925,7 +949,7 @@ void on_init_pipeline(api::device*, api::pipeline_layout, uint32_t count, const 
 
 void on_destroy_device(api::device* device) {
     if (auto state = device->get_private_data<DeviceState>()) {
-        if (main_state == state) main_state = nullptr;
+        if (main_state == state) { main_state = nullptr; main_device = nullptr; }
         device->destroy_private_data<DeviceState>();
     }
 }
