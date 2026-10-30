@@ -351,14 +351,17 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     // Per-pixel remainder against last frame's gain (glass layer: dirt, glare, reflections, shadows). That gain was fitted
     // with the brightness reference then: rescaled to this call's, as the solve pass does (in VR the eyes can see
     // different meshes of one screen texture, so the reference changes with every call).
-    // A slot that just took another texture has the old texture's gain: no remainder from it this frame.
-    float4 gain = active && !(bounds_reset & (1u << slot)) ? params[slot * params_per_slot] : 0;
+    // A slot that just took another texture has the old texture's gain: no remainder from it this frame. Tagged (+128) so
+    // the glass layer of these pixels stays last frame's: the glass in front of the screen didn't change with the texture,
+    // and without it the screen's background dropped to the plain offset for a frame (iniBuilds A380: a flash at each swap).
+    bool swapped_slot = active && (bounds_reset & (1u << slot));
+    float4 gain = active && !swapped_slot ? params[slot * params_per_slot] : 0;
     if (active)
     {
         float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4)), fitted = asfloat(edge_bounds.Load(brightness_fitted + slot * 4));
         if (reference > 0 && fitted > 0) gain.rgb *= reference / fitted;
     }
-    if (all(p < int2(map_size))) residual[p] = active && gain.w > 0 ? float4(y - gain.rgb * x, slot + 1 + (outline ? 64 : 0)) : 0;
+    if (all(p < int2(map_size))) residual[p] = swapped_slot ? float4(0, 0, 0, slot + 1 + 128) : active && gain.w > 0 ? float4(y - gain.rgb * x, slot + 1 + (outline ? 64 : 0)) : 0;
     if ((flags & 65536) && all(p < int2(map_size))) fit_input[p] = active ? float4(x, slot + 1) : 0;
     if (index == 0 && all(group.xy < (map_size + 7) / 8)) tiles[group.xy] = tile_slot < slot_count ? tile_slot + 1 : 0;
     // Diagnostics: screen pixels in the map at this call (the GPU's view: were this frame's screens drawn before it?).
@@ -429,7 +432,7 @@ bool glass_around(float2 location, out float3 glass, out float3 spread, out floa
         if (any(q < 0) || any(q >= int2(map_size))) continue;
         float4 rv = residual[q];
         uint tag = uint(rv.w + 0.5);
-        if ((tag & 63) == 0) continue;
+        if ((tag & 63) == 0 || (tag & 128)) continue;
         float2 t = float2(q) - location;
         float w = exp(-dot(t, t) / (2 * 1.7 * 1.7));
         if (tag & 64) { outline_weight += w; outline_sum += w * rv.rgb; outline_m2 += w * rv.rgb * rv.rgb; continue; }
@@ -458,6 +461,7 @@ void glass_filter(uint3 id : SV_DispatchThreadID)
     uint3 h = uint3(id.xy, layer);
     float3 now, spread;
     float outline_share;
+    if (uint(residual[id.xy].w + 0.5) & 128) return; // the slot just took another texture: the average stays
     if ((uint(residual[id.xy].w + 0.5) & 63) == 0 || !glass_around(float2(id.xy), now, spread, outline_share)) { glass_history[h] = 0; return; }
     // The view moved (the pixel shows another spot of its screen than last frame, by more than a quarter of a render
     // pixel): start over, the average belongs elsewhere now.
@@ -1094,6 +1098,7 @@ void composite(uint3 id : SV_DispatchThreadID)
         // Any screen's pixels: the glass is one sheet, also where two screen textures meet within one display (e.g.
         // the E-Jet PFD's halves); taken from this slot's alone, a small box at such a join has almost none.
         if ((tag & 63) == 0) continue;
+        if (tag & 128) { count += 1; continue; }
         float2 t = float2(q) - location;
         float w = exp(-dot(t, t) / (2 * 1.7 * 1.7));
         if (tag & 64) { outline_weight += w; outline_sum += w * rv.rgb; outline_m2 += w * rv.rgb * rv.rgb; continue; }
@@ -1145,6 +1150,7 @@ void composite(uint3 id : SV_DispatchThreadID)
             glass = lerp(glass, clamp(output[id.xy].rgb - content, glass - spread, glass + spread), detail);
         }
     }
+    else if (steady_weight > 0.05) glass = steady / steady_weight; // the slot just took another texture: last frame's glass
     float3 colour = content + glass;
     // Detail clamp: the redrawn screen may not be brighter or darker than what the sim itself drew in the 5x5 render
     // pixels around this one this frame. Content the sim shows survives; texture detail too thin for the sim to show
