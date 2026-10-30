@@ -44,7 +44,7 @@ Texture2D<float4> displays[32] : register(t2);
 Texture2D<float> scene_depth : register(t34); // the upscaler's depth input (render resolution; occlusion check)
 RWTexture2D<float4> output : register(u0);  // DLSS output, R11G11B10_FLOAT
 RWTexture2D<uint> tiles : register(u1);     // per 8x8 map tile: display slot + 1 this frame (0 = none)
-RWStructuredBuffer<float4> params : register(u2); // per slot: [4s] = a.rgb, valid; [4s+1] = b.rgb, samples; [4s+2] = mean screen.rgb, fit quality; [4s+3].x = detail quality
+RWStructuredBuffer<float4> params : register(u2); // per slot: [4s] = a.rgb, valid; [4s+1] = b.rgb, samples; [4s+2] = mean screen.rgb, fit quality; [4s+3] = detail quality, last good gain.rgb
 RWTexture2DArray<float4> map_rw : register(u3);
 RWByteAddressBuffer sums : register(u4);    // per slot 20 x uint64 fixed point
 RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * display, w = slot + 1 (0 = none), + 64 where
@@ -500,7 +500,13 @@ void solve(uint3 id : SV_DispatchThreadID)
         edge_bounds.Store(brightness_fitted + slot * 4, 0);
         return;
     }
-    if (reference > 0 && fitted > 0 && reference != fitted) previous_a.rgb *= reference / fitted;
+    float4 previous_detail = params[slot * params_per_slot + 3];
+    if (reference > 0 && fitted > 0 && reference != fitted)
+    {
+        previous_a.rgb *= reference / fitted;
+        previous_detail.yzw *= reference / fitted;
+        params[slot * params_per_slot + 3] = previous_detail;
+    }
     if (reference > 0) edge_bounds.Store(brightness_fitted + slot * 4, asuint(reference));
     if (flags & 1) previous_a.w = 0;
     double n = v[0];
@@ -548,16 +554,30 @@ void solve(uint3 id : SV_DispatchThreadID)
     if (flags & 16) quality = max(quality, detail_quality);
     float w = previous_a.w > 0 ? smoothing : 1;
     float q = previous_a.w != 0 ? lerp(previous_q.w, float(quality), smoothing) : float(quality);
-    float dq = previous_a.w != 0 ? lerp(params[slot * params_per_slot + 3].x, float(detail_quality), smoothing) : float(detail_quality);
-    // A screen already fixed stays fixed while its fine detail still matches the sim's, even when the whole-picture score
-    // drops: dimmed or nearly blank screens (A400M glareshield at night, A2A Legacy radios) are mostly glow and backlight
-    // the texture doesn't hold. A screen not matched yet, or dropped, still needs the whole picture to match (the iFly
-    // EFB, drawn differently by the sim, stays with the upscaler).
-    bool keep = previous_a.w < 0 ? q > 0.25 : q > 0.15 || (previous_a.w > 0 && dq > 0.25); // hysteresis: no flicker near the limit
-    params[slot * params_per_slot] = float4(lerp(previous_a.rgb, a, w), keep ? 1 : -1); // w: valid (1), rejected (-1)
+    float dq = previous_a.w != 0 ? lerp(previous_detail.x, float(detail_quality), smoothing) : float(detail_quality);
+    // A screen that matched well and now scores low is held: dark panels and things the texture doesn't hold (A2A Legacy
+    // radios, A400M glareshield, a lit LED) are mostly glow, and a fit to that gives a wrong gain, so the last good gain
+    // stays and only the offset follows the sim. Never brighter on average than the sim's picture, so a screen switched
+    // off goes dark with it. Below 0.08 the sim shows another picture, unless the texture is nearly blank at that gain
+    // (its picture would be a small part of what the sim shows there, as when the A400M's digits blink off): then the score
+    // means nothing. Otherwise back to the upscaler (hysteresis: no flicker near the limit). A screen not matched yet, or dropped, still needs the whole picture to match (the iFly EFB).
+    float3 good_gain = previous_a.w != 0 ? previous_detail.yzw : 0;
+    bool hold = previous_a.w > 0 && q <= 0.25 && any(good_gain > 0);
+    if (hold)
+        [unroll] for (uint c = 0; c < 3; ++c)
+        {
+            a[c] = mx[c] > 1e-5 ? min(good_gain[c], max(float(my[c] / mx[c]), 0)) : good_gain[c];
+            b[c] = float(my[c] - a[c] * mx[c]);
+        }
+    double held_variance = 0;
+    [unroll] for (uint c = 0; c < 3; ++c) held_variance += good_gain[c] * good_gain[c] * variance[c];
+    bool keep = previous_a.w < 0 ? q > 0.25 : q > 0.15 || (hold && (q > 0.08 || held_variance < 0.1 * pooled_scene_variance));
+    float3 gain = lerp(previous_a.rgb, a, w);
+    if (keep && q > 0.25) good_gain = gain;
+    params[slot * params_per_slot] = float4(gain, keep ? 1 : -1); // w: valid (1), rejected (-1)
     params[slot * params_per_slot + 1] = float4(lerp(previous_b.rgb, b, w), float(n));
     params[slot * params_per_slot + 2] = float4(float3(mx[0], mx[1], mx[2]), q);
-    params[slot * params_per_slot + 3] = float4(dq, 0, 0, 0);
+    params[slot * params_per_slot + 3] = float4(dq, good_gain);
 }
 
 bool tap(int2 p, out float4 value)
