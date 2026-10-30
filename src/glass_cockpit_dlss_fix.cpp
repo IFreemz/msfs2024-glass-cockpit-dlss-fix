@@ -599,10 +599,12 @@ std::mutex heaps_mutex;                                   // creating heaps (rar
 std::vector<std::unique_ptr<MirrorHeap>> heap_storage;   // kept until the device goes: a copy may still be reading one
 std::vector<std::unique_ptr<HeapSnapshot>> snapshot_storage;
 std::atomic<const HeapSnapshot*> heap_snapshot{nullptr};
-// Texture ids: index into a fixed table (resource, format); a destroyed texture's entry is cleared, never reused.
-constexpr uint32_t max_texture_ids = 65536;
+// Texture ids: index into a table (resource, format) that grows in pages; a destroyed texture's entry is cleared, never
+// reused. The sim makes about 1000 new ids a minute (Fenix A320): a fixed 65536 was full after an hour.
+constexpr uint32_t texture_id_page_size = 65536, texture_id_pages = 256, max_texture_ids = texture_id_page_size * texture_id_pages;
 struct TextureId { std::atomic<ID3D12Resource*> resource{nullptr}; std::atomic<DXGI_FORMAT> format{DXGI_FORMAT_UNKNOWN}; };
-std::unique_ptr<TextureId[]> texture_ids;
+std::array<std::atomic<TextureId*>, texture_id_pages> texture_id_page{}; // kept until the process ends (readers hold no lock)
+TextureId& texture_entry(uint32_t id) { return texture_id_page[id / texture_id_page_size].load(std::memory_order_acquire)[id % texture_id_page_size]; }
 std::atomic<uint32_t> texture_id_count{1}; // id 0 = none
 std::mutex texture_ids_mutex;
 std::map<std::pair<ID3D12Resource*, DXGI_FORMAT>, uint32_t> texture_id_of;
@@ -646,8 +648,9 @@ uint32_t texture_id(ID3D12Resource* resource, DXGI_FORMAT format) {
         LOG_ONCE("descriptor tracking: texture table full, new screen textures are not tracked");
         return 0;
     }
-    texture_ids[id].format = format;
-    texture_ids[id].resource = resource;
+    if (auto& page = texture_id_page[id / texture_id_page_size]; !page.load(std::memory_order_relaxed)) page.store(new TextureId[texture_id_page_size], std::memory_order_release);
+    texture_entry(id).format = format;
+    texture_entry(id).resource = resource;
     texture_id_count = id + 1;
     texture_id_of[{resource, format}] = id;
     return id;
@@ -655,7 +658,7 @@ uint32_t texture_id(ID3D12Resource* resource, DXGI_FORMAT format) {
 void forget_texture_ids(ID3D12Resource* resource) {
     std::lock_guard lock(texture_ids_mutex);
     for (auto it = texture_id_of.lower_bound({resource, DXGI_FORMAT_UNKNOWN}); it != texture_id_of.end() && it->first.first == resource;) {
-        texture_ids[it->second].resource = nullptr;
+        texture_entry(it->second).resource = nullptr;
         it = texture_id_of.erase(it);
     }
 }
@@ -667,8 +670,8 @@ bool tracked_texture(uintptr_t address, ID3D12Resource*& resource, DXGI_FORMAT& 
     if (!heap) return false;
     const uint32_t id = heap->ids[(address - heap->start) / descriptor_size].load(std::memory_order_relaxed);
     if (!id || id >= texture_id_count.load(std::memory_order_acquire)) return false;
-    format = texture_ids[id].format.load(std::memory_order_relaxed);
-    resource = texture_ids[id].resource.load(std::memory_order_relaxed);
+    format = texture_entry(id).format.load(std::memory_order_relaxed);
+    resource = texture_entry(id).resource.load(std::memory_order_relaxed);
     return resource != nullptr;
 }
 void track_copy(uintptr_t dest, uintptr_t source, UINT count) {
@@ -1049,7 +1052,6 @@ void device_created(ID3D12Device* native) noexcept try {
         native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&state->scratch));
     }
     track_descriptors = !gpu_nvidia || force_tracking;
-    if (track_descriptors && !texture_ids) texture_ids = std::make_unique<TextureId[]>(max_texture_ids);
     main_state = state;
     main_device = native;
     install_d3d12_hooks(native);
