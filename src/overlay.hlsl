@@ -351,7 +351,8 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     // Per-pixel remainder against last frame's gain (glass layer: dirt, glare, reflections, shadows). That gain was fitted
     // with the brightness reference then: rescaled to this call's, as the solve pass does (in VR the eyes can see
     // different meshes of one screen texture, so the reference changes with every call).
-    float4 gain = active ? params[slot * params_per_slot] : 0;
+    // A slot that just took another texture has the old texture's gain: no remainder from it this frame.
+    float4 gain = active && !(bounds_reset & (1u << slot)) ? params[slot * params_per_slot] : 0;
     if (active)
     {
         float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4)), fitted = asfloat(edge_bounds.Load(brightness_fitted + slot * 4));
@@ -494,12 +495,19 @@ void solve(uint3 id : SV_DispatchThreadID)
     // at 16x, a texture from a mesh much brighter than that (iniBuilds A380: 1 against 3600) was fitted 16x off and then
     // rescaled by the full 3600x: the screen flashed ~200x too bright. The same for a reference change over 16x. Leave the
     // screen to the upscaler for this call and start over on the next, with the new reference.
-    if ((bounds_reset & (1u << slot)) || (reference > 0 && fitted > 0 && (reference > 16 * fitted || 16 * reference < fitted)))
+    // But the sim swaps some screens' textures every few seconds (iniBuilds A380), and that one frame from the upscaler
+    // showed as a flash. So when the new texture's meshes are within the cap of the reference, this frame's fit is sound:
+    // used at once if it matches well (see `fresh` below), and rescaled like any other when the reference follows.
+    bool swapped = bounds_reset & (1u << slot);
+    float seen = asfloat(edge_bounds.Load(brightness_next + slot * 4));
+    bool fresh = swapped && reference > 0 && seen > 0 && seen <= 16 * reference && 16 * seen >= reference;
+    if ((swapped && !fresh) || (!swapped && reference > 0 && fitted > 0 && (reference > 16 * fitted || 16 * reference < fitted)))
     {
         params[slot * params_per_slot] = 0;
         edge_bounds.Store(brightness_fitted + slot * 4, 0);
         return;
     }
+    if (fresh) { previous_a = 0; fitted = 0; }
     float4 previous_detail = params[slot * params_per_slot + 3];
     if (reference > 0 && fitted > 0 && reference != fitted)
     {
@@ -551,6 +559,12 @@ void solve(uint3 id : SV_DispatchThreadID)
     double detail_xx = v[16], detail_yy = v[17] * 1024, detail_xy = v[18] - v[19];
     double detail_quality = pooled_variance > 3e-6 && detail_xx > 0 && detail_yy > 0 && detail_xy > 0
         ? detail_xy * detail_xy / (detail_xx * detail_yy) : 0.0;
+    if (fresh && quality <= 0.5)
+    {
+        params[slot * params_per_slot] = 0;
+        edge_bounds.Store(brightness_fitted + slot * 4, 0);
+        return;
+    }
     if (flags & 16) quality = max(quality, detail_quality);
     float w = previous_a.w > 0 ? smoothing : 1;
     float q = previous_a.w != 0 ? lerp(previous_q.w, float(quality), smoothing) : float(quality);
@@ -560,7 +574,9 @@ void solve(uint3 id : SV_DispatchThreadID)
     // stays and only the offset follows the sim. Never brighter on average than the sim's picture, so a screen switched
     // off goes dark with it. Below 0.08 the sim shows another picture, unless the texture is nearly blank at that gain
     // (its picture would be a small part of what the sim shows there, as when the A400M's digits blink off): then the score
-    // means nothing. Otherwise back to the upscaler (hysteresis: no flicker near the limit). A screen not matched yet, or dropped, still needs the whole picture to match (the iFly EFB).
+    // means nothing. Otherwise back to the upscaler after about 2 seconds of that (a moment's dip while the camera moves
+    // isn't another picture, and such a screen rarely scores enough to come back). A screen not matched yet, or dropped,
+    // still needs the whole picture to match (the iFly EFB).
     float3 good_gain = previous_a.w != 0 ? previous_detail.yzw : 0;
     bool hold = previous_a.w > 0 && q <= 0.25 && any(good_gain > 0);
     if (hold)
@@ -571,10 +587,23 @@ void solve(uint3 id : SV_DispatchThreadID)
         }
     double held_variance = 0;
     [unroll] for (uint c = 0; c < 3; ++c) held_variance += good_gain[c] * good_gain[c] * variance[c];
-    bool keep = previous_a.w < 0 ? q > 0.25 : q > 0.15 || (hold && (q > 0.08 || held_variance < 0.1 * pooled_scene_variance));
+    bool matches = previous_a.w < 0 ? q > 0.25 : q > 0.15 || (hold && (q > 0.08 || held_variance < 0.1 * pooled_scene_variance));
+    float low_calls = matches || previous_a.w <= 1 ? (matches ? 0 : 1) : previous_a.w;
+    bool keep = matches || (hold && low_calls < 120);
     float3 gain = lerp(previous_a.rgb, a, w);
-    if (keep && q > 0.25) good_gain = gain;
-    params[slot * params_per_slot] = float4(gain, keep ? 1 : -1); // w: valid (1), rejected (-1)
+    // The gain to hold: from a strong match only (a brief 0.3 on a dark panel is mostly glow). The sim's gain is about the
+    // same in all channels, so one the texture barely has (no blue in amber digits: that fit is noise) takes the others'.
+    if (keep && q > 0.5 && quality > 0.5)
+    {
+        double strongest = max(variance[0], max(variance[1], variance[2]));
+        float strong_gain = 0, strong_channels = 0;
+        [unroll] for (uint c = 0; c < 3; ++c)
+            if (variance[c] > 0.05 * strongest) { strong_gain += gain[c]; strong_channels += 1; }
+        strong_gain /= max(strong_channels, 1);
+        [unroll] for (uint c = 0; c < 3; ++c) good_gain[c] = variance[c] > 0.05 * strongest ? gain[c] : strong_gain;
+    }
+    // w: valid (1, or above: calls with a low match so far), rejected (-1)
+    params[slot * params_per_slot] = float4(gain, keep ? 1 + (matches ? 0 : low_calls) : -1);
     params[slot * params_per_slot + 1] = float4(lerp(previous_b.rgb, b, w), float(n));
     params[slot * params_per_slot + 2] = float4(float3(mx[0], mx[1], mx[2]), q);
     params[slot * params_per_slot + 3] = float4(dq, good_gain);
