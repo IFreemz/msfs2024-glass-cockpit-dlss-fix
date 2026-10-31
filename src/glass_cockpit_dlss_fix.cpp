@@ -631,7 +631,8 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     auto copy = copy_pipeline(device, desc);
     copy->vr = vr;
     copy->screen_t0 = screen_t0;
-    copy->brightness = !screen_t0 && (vr ? ps == vr_display_ps : ps == display_ps);
+    // The flat variant reads the same constants as the standard shader, so its meshes' brightness is read the same way.
+    copy->brightness = !screen_t0 && (vr ? ps == vr_display_ps : ps == display_ps || alike);
     std::lock_guard lock(pipelines_mutex);
     for (size_t i = 0; i < max_pipelines; ++i) if (!pipeline_keys[i].load()) {
         pipeline_values[i] = copy;
@@ -1716,8 +1717,8 @@ bool replay(ListState& state, const glass::Draw& draw) noexcept try {
         static std::set<std::tuple<ID3D12Resource*, uint32_t, uint32_t, int32_t, uint32_t>> draws;
         std::lock_guard lock(draws_mutex);
         if (draws.size() < 400 && draws.emplace(texture.resource, draw.count, draw.first, draw.base_vertex, draw.instances).second)
-            log("screen_draw slot=%d texture=%p %s count=%u first=%u base_vertex=%d instances=%u", slot, texture.resource, draw.indexed ? "indexed" : "plain",
-                draw.count, draw.first, draw.base_vertex, draw.instances);
+            log("screen_draw slot=%d texture=%p %s count=%u first=%u base_vertex=%d instances=%u pso=%p", slot, texture.resource, draw.indexed ? "indexed" : "plain",
+                draw.count, draw.first, draw.base_vertex, draw.instances, reinterpret_cast<void*>(state.pso));
     }
     return draw_map(state, draw, state.display, unsigned(slot));
 } catch (...) { note(stats.unsupported_draw, "exception"); return false; }
