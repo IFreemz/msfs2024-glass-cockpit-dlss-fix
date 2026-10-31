@@ -134,6 +134,11 @@ void draw(reshade::api::effect_runtime*) {
         ImGui::SetItemTooltip("Leaves the sim's own picture wherever something sits in front of a screen (a sidestick, a hand, the yoke),\n"
             "using the sim's depth buffer. Off: a screen can be drawn over things in front of it, e.g. the A380 EFB over the sidestick.");
         e.occlusion_check = occlusion ? 1 : 0;
+        bool painted = e.painted_screens != 0;
+        changed |= ImGui::Checkbox("Painted screens (on by default)", &painted);
+        ImGui::SetItemTooltip("Also fixes readouts the sim shows through a virtual painting with a see-through material, e.g. the Fenix\n"
+            "A320's FCU with \"FCU readouts: New\". Turn off if something painted looks wrong.");
+        e.painted_screens = painted ? 1 : 0;
         bool calm_glass = e.calm_glass != 0;
         changed |= ImGui::Checkbox("Calm glass at symbols", &calm_glass);
         ImGui::SetItemTooltip("Right next to symbols and lines, the glass effects (dirt, glare, reflections) are drawn without their finest\n"

@@ -72,7 +72,7 @@ void read_status() { status = glass::status(); }
 
 enum Id : int {
     id_none = 0, id_enabled, id_smoothing, id_extra, id_tint, id_key, id_bug_reports, id_advanced, id_jitter, id_glass, id_reset_advanced,
-    id_occlusion, id_stable, id_full_size, id_seam, id_calm, id_dark, id_soft, id_temporal,
+    id_occlusion, id_painted, id_stable, id_full_size, id_seam, id_calm, id_dark, id_soft, id_temporal,
     id_edge_trim, id_detail_clamp, id_edge_fade, id_angle, id_edge_stretch, id_reset_experimental,
     id_pixel_probe, id_screen_probe, id_capture, id_log_folder, id_copy_report, id_settings_file, id_website, id_jason,
 };
@@ -113,6 +113,8 @@ const wchar_t* const tip_stable = L"Keeps the pixels along each screen's edge fr
     L"Turn off if a screen's edge looks cut off or too wide.";
 const wchar_t* const tip_occlusion = L"Leaves the sim's own picture wherever something sits in front of a screen (a sidestick, a hand, the yoke). "
     L"Off: a screen can be drawn over things in front of it.";
+const wchar_t* const tip_painted = L"Also fixes readouts the sim shows through a virtual painting with a see-through material, e.g. the Fenix A320's "
+    L"FCU with \"FCU readouts: New\". Turn off if something painted looks wrong.";
 const wchar_t* const tip_calm = L"Next to symbols and lines, the glass effects (dirt, glare, reflections) are drawn without their finest detail, which "
     L"flickers there. Turn off if something drawn over a screen (a highlight, a cursor) looks blurred.";
 const wchar_t* const tip_dark = L"Keeps mostly black screens with thin symbols (e.g. the F/A-18E's) fixed in strong sun glare. Can also let the fix draw "
@@ -155,6 +157,7 @@ int setting_value(Id id) {
     case id_tint: return status.tint;
     case id_jitter: return !status.jitter_positive;
     case id_occlusion: return e.occlusion_check;
+    case id_painted: return e.painted_screens;
     case id_stable: return e.stable_edges;
     case id_full_size: return e.full_size;
     case id_seam: return e.seam_fix;
@@ -177,6 +180,7 @@ void set_value(Id id, int v) {
     default:
         switch (id) {
         case id_occlusion: e.occlusion_check = v; break;
+        case id_painted: e.painted_screens = v; break;
         case id_stable: e.stable_edges = v; break;
         case id_full_size: e.full_size = v; break;
         case id_seam: e.seam_fix = v; break;
@@ -360,9 +364,10 @@ void paint(HWND hwnd, HDC target) {
         }
 
         // Right column: experimental fixes.
-        const int experimental_h = 32 + 8 * 32 + 6 + 5 * 32 + 44;
+        const int experimental_h = 32 + 9 * 32 + 6 + 5 * 32 + 44;
         p.card_begin(rx, top, rw, experimental_h, L"EXPERIMENTAL FIXES");
         p.toggle(id_occlusion, L"Occlusion check", L"on by default", tip_occlusion);
+        p.toggle(id_painted, L"Painted screens", L"on by default", tip_painted);
         p.toggle(id_stable, L"Stable screen edges", L"on by default", tip_stable);
         p.toggle(id_full_size, L"Full-size sampling", L"on by default", tip_full_size);
         p.toggle(id_seam, L"UV seam fix", L"on by default", tip_seam);
@@ -562,8 +567,8 @@ void show(HWND hwnd, bool visible) {
 std::string shown_state() {
     char buffer[512];
     const auto& e = status.experimental;
-    snprintf(buffer, sizeof(buffer), "%d%d%d%d%d %d %d %u|%d%d%d%d%d%d%d%d %d %d %d %d %d|", status.active, status.enabled, status.tint, status.extra_smoothing,
-        status.jitter_positive, status.line_smoothing, status.glass_strength, status.settings_window_key, e.occlusion_check, e.stable_edges, e.full_size,
+    snprintf(buffer, sizeof(buffer), "%d%d%d%d%d %d %d %u|%d%d%d%d%d%d%d%d%d %d %d %d %d %d|", status.active, status.enabled, status.tint, status.extra_smoothing,
+        status.jitter_positive, status.line_smoothing, status.glass_strength, status.settings_window_key, e.occlusion_check, e.painted_screens, e.stable_edges, e.full_size,
         e.seam_fix, e.calm_glass, e.dark_screens, e.soft_smoothing, e.temporal_aa, e.edge_trim, e.detail_clamp, e.edge_fade, e.angle_softening, e.edge_stretch);
     return buffer + glass::status_summary(status) + "|" + status.capture;
 }
