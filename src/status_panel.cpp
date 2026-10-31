@@ -8,6 +8,7 @@
 #define ImTextureID ImU64
 #include <imgui.h>
 #include <reshade.hpp>
+#include "host.hpp"
 #include "status.hpp"
 #include "version.h"
 #include <cstdarg>
@@ -34,7 +35,71 @@ std::string format(const char* text, ...) {
     return buffer;
 }
 
-void draw(reshade::api::effect_runtime*) {
+// Hotkeys set in the tab: the one being recorded (hotkey_count: none), the key just pressed for it (the fix's hotkeys stay
+// paused until it is let go, or the new one would fire at once), what came of it, and the presents (the tab's last).
+glass::Hotkey recording = glass::hotkey_count;
+uint32_t released = 0;
+std::string hotkey_message;
+uint64_t presents = 0, drawn_at = 0;
+
+// ReShade's own shortcut that `key` is ([INPUT] in ReShade.ini: "key code,ctrl,shift,alt"), by its setting's name, or null.
+const char* reshade_shortcut(reshade::api::effect_runtime* runtime, uint32_t key) {
+    static const char* const names[]{"KeyOverlay", "KeyEffects", "KeyScreenshot", "KeyReload", "KeyNextPreset", "KeyPreviousPreset",
+        "KeyPerformanceMode", "KeyFPS", "KeyFrameTime"};
+    for (const char* name : names) {
+        char value[64]{};
+        size_t size = sizeof(value);
+        unsigned code = 0, ctrl = 0, shift = 0, alt = 0;
+        if (reshade::get_config_value(runtime, "INPUT", name, value, &size) && sscanf_s(value, "%u,%u,%u,%u", &code, &ctrl, &shift, &alt) == 4 &&
+            (code | (ctrl ? glass::key_ctrl : 0) | (shift ? glass::key_shift : 0) | (alt ? glass::key_alt : 0)) == key)
+            return name;
+    }
+    return nullptr;
+}
+
+// While a hotkey is being recorded: the next key pressed, with the modifiers held. Esc cancels, Backspace alone leaves the
+// action without a hotkey. The sim gets no keyboard input meanwhile.
+void record_hotkey(reshade::api::effect_runtime* runtime) {
+    if (recording == glass::hotkey_count) return;
+    runtime->block_input_next_frame();
+    if (runtime->is_key_pressed(VK_ESCAPE)) { recording = glass::hotkey_count; released = VK_ESCAPE; return; }
+    uint32_t key = 0;
+    for (uint32_t vk = VK_BACK; vk <= 0xFE && !key; ++vk) {
+        const bool modifier = vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN || (vk >= VK_LSHIFT && vk <= VK_RMENU);
+        if (!modifier && runtime->is_key_pressed(vk)) key = vk;
+    }
+    if (!key) return;
+    released = key;
+    if (runtime->is_key_down(VK_CONTROL)) key |= glass::key_ctrl;
+    if (runtime->is_key_down(VK_SHIFT)) key |= glass::key_shift;
+    if (runtime->is_key_down(VK_MENU)) key |= glass::key_alt;
+    if (key == VK_BACK) key = 0;
+    const glass::Hotkey which = recording;
+    recording = glass::hotkey_count;
+    const std::string name = glass::hotkey_name(key);
+    if (key && (name.find('?') != std::string::npos || glass::parse_hotkey(name) != key))
+        hotkey_message = "That key can't be used for a hotkey: try another key with Ctrl, Shift or Alt.";
+    else if (const char* reshade = key ? reshade_shortcut(runtime, key) : nullptr)
+        hotkey_message = name + " is ReShade's " + reshade + " shortcut, so it was not changed.";
+    else hotkey_message = glass::set_hotkey(which, key);
+}
+
+// Every frame, also with the overlay closed: the fix's hotkeys come back once the recorded keys are let go, or when the
+// tab stopped being drawn while recording.
+void on_present(reshade::api::effect_runtime* runtime) {
+    ++presents;
+    if (recording != glass::hotkey_count && presents > drawn_at + 2) { recording = glass::hotkey_count; glass::hotkeys_paused = false; }
+    if (released && !runtime->is_key_down(released & 0xFF)) { released = 0; glass::hotkeys_paused = false; }
+}
+
+// "  (Ctrl+Shift+F9)" for a label, or nothing without a hotkey.
+std::string hotkey_hint(const glass::Status& s, glass::Hotkey which) {
+    return s.hotkeys[which] ? "  (" + glass::hotkey_name(s.hotkeys[which]) + ")" : "";
+}
+
+void draw(reshade::api::effect_runtime* runtime) {
+    drawn_at = presents;
+    record_hotkey(runtime);
     const auto s = glass::status();
     ImGui::Text("%s %s", GLASS_NAME, GLASS_VERSION_STRING);
     ImGui::SameLine(); ImGui::TextColored(grey, "by %s", GLASS_AUTHOR);
@@ -46,7 +111,7 @@ void draw(reshade::api::effect_runtime*) {
     ImGui::SeparatorText("Settings");
     bool enabled = s.enabled, tint = s.tint;
     int smoothing = s.line_smoothing;
-    if (ImGui::Checkbox("Fix enabled  (Ctrl+Shift+F9)", &enabled)) glass::set_enabled(enabled);
+    if (ImGui::Checkbox(("Fix enabled" + hotkey_hint(s, glass::hotkey_fix) + "###enabled").c_str(), &enabled)) glass::set_enabled(enabled);
     bool extra = s.extra_smoothing;
     if (ImGui::SliderInt("Line smoothing", &smoothing, 0, extra ? 100 : 50, smoothing ? "%d%%" : "off (sharpest)", ImGuiSliderFlags_AlwaysClamp))
         glass::set_line_smoothing(smoothing);
@@ -56,7 +121,26 @@ void draw(reshade::api::effect_runtime*) {
     if (ImGui::Checkbox("Extra", &extra)) glass::set_extra_smoothing(extra);
     ImGui::SetItemTooltip("Lets Line smoothing go up to 100 %% for stubborn shimmer (e.g. in VR).\n"
         "Above 50 the whole screen picture gets softer than with DLSS alone.");
-    if (ImGui::Checkbox("Green tint on fixed screens  (Ctrl+Shift+F11)", &tint)) glass::set_tint(tint);
+    if (ImGui::Checkbox(("Green tint on fixed screens" + hotkey_hint(s, glass::hotkey_tint) + "###tint").c_str(), &tint)) glass::set_tint(tint);
+    // Hotkeys: a button for each, which takes the next keys pressed. (The settings window's is the standalone version's.)
+    if (ImGui::TreeNode("Hotkeys")) {
+        for (const glass::Hotkey which : {glass::hotkey_fix, glass::hotkey_tint}) {
+            ImGui::PushID(which);
+            const bool now = recording == which;
+            if (ImGui::Button(((now ? std::string("Press the new keys...") : glass::hotkey_name(s.hotkeys[which])) + "###key").c_str(), ImVec2(ImGui::GetFontSize() * 12, 0))) {
+                recording = now ? glass::hotkey_count : which;
+                glass::hotkeys_paused = recording != glass::hotkey_count;
+                hotkey_message.clear();
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(which == glass::hotkey_fix ? "Fix on / off" : "Green tint on / off");
+            ImGui::PopID();
+        }
+        ImGui::TextColored(grey, "Click a hotkey, then press the new keys: a key with any of Ctrl, Shift and Alt.\n"
+            "Esc cancels, Backspace leaves it without a hotkey. Saved as fix_on_off and green_tint under [hotkeys] in the .ini.");
+        if (!hotkey_message.empty()) ImGui::TextColored(yellow, "%s", hotkey_message.c_str());
+        ImGui::TreePop();
+    }
     if (!(s.experimental == glass::Experimental{})) ImGui::TextColored(yellow, "Experimental fixes changed (see Troubleshooting below)");
     if (!s.jitter_positive || s.glass_strength != 100) ImGui::TextColored(yellow, "Advanced settings changed (see Troubleshooting below)");
 
@@ -206,9 +290,12 @@ bool init_status_panel(void* reshade_module) {
         GetProcAddress(static_cast<HMODULE>(reshade_module), "ReShadeGetImGuiFunctionTable"));
     if (!get_table || !(imgui_function_table_instance() = get_table(IMGUI_VERSION_NUM))) return false;
     reshade::register_overlay(GLASS_NAME, draw);
+    reshade::register_event<reshade::addon_event::reshade_present>(on_present);
     return true;
 }
 void uninit_status_panel() {
-    if (imgui_function_table_instance()) reshade::unregister_overlay(GLASS_NAME, draw);
+    if (!imgui_function_table_instance()) return;
+    reshade::unregister_overlay(GLASS_NAME, draw);
+    reshade::unregister_event<reshade::addon_event::reshade_present>(on_present);
 }
 }

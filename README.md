@@ -118,7 +118,7 @@ for the fix. Your settings carry over: both versions use the same `glass-cockpit
 
 Settings are in the add-on's tab in the ReShade menu (**Home**), or in the standalone's settings window
 (**Ctrl+Shift+F6**, or click its X to close it; hover over an option to see what it does). The window never takes the
-keyboard or mouse from the sim; if its hotkey clashes with another mod, click it in the window and press a new one.
+keyboard or mouse from the sim; if a hotkey clashes with another mod, click it under **Hotkeys** and press a new one.
 Everything is saved in `glass-cockpit-dlss-fix.ini` next to the add-on or DLL, which you can also edit with Notepad
 while the sim runs (saved changes apply within a second).
 
@@ -127,6 +127,7 @@ while the sim runs (saved changes apply within a second).
 | Fix enabled / `enabled` (Ctrl+Shift+F9) | Fix on/off, for comparison |
 | Line smoothing / `line_smoothing` (0-50 %, default 35 %) | Smooths stair steps on thin slanted lines in the screens, like the upscaler did. 0 = sharpest, 50 = softest. In the tab, Ctrl+click to type a value. Tick **Extra** next to it (`extra_smoothing=1`) to go up to 100 % (blurs the whole screen; for screens with very jagged lines) |
 | Green tint (Ctrl+Shift+F11) | Tints every screen the fix covers (for checking, not remembered) |
+| Hotkeys / `fix_on_off`, `green_tint`, `settings_window` under `[hotkeys]` | The fix on/off (Ctrl+Shift+F9), the green tint (Ctrl+Shift+F11) and, in the standalone version, the settings window (Ctrl+Shift+F6). Click one under **Hotkeys** (in the add-on's tab, or in the window) and press the new keys: a key with any of Ctrl, Shift and Alt. Esc cancels, and Backspace leaves the fix on/off or the green tint without a hotkey (`None` in the `.ini`). A combination that is already another of the fix's hotkeys, or one of ReShade's, is not taken |
 
 **Advanced** (only change these if asked to in a bug report; **Reset to defaults** puts them back):
 
@@ -346,7 +347,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | The log is called `glass-cockpit-dlss-fix-<number>.log` | Normal after flying some aircraft (e.g. Fenix): a helper program kept the usual log file open. Send the newest numbered log |
 | Screens flicker in brightness (G-Sync / FreeSync monitor) | VRR flicker from a changing frame rate, most visible on dark screens. Turn on V-Sync, or cap the frame rate a few fps below your refresh rate |
 | Crash at startup | Remove the add-on or the DLL, start once, put it back, then send both logs, and try the other version in the meantime |
-| Standalone: Ctrl+Shift+F6 clashes with another mod's hotkey (e.g. a DLSS 5 add-on) | Click the hotkey in the settings window and press a new combination, or set `settings_window=` under `[hotkeys]` in the `.ini` (e.g. `Ctrl+Alt+G`) |
+| Ctrl+Shift+F9, F11 or (standalone) F6 clashes with another mod's hotkey or a binding in the sim (e.g. a DLSS 5 add-on, or a camera binding on Ctrl+Shift+F9) | Click the hotkey under **Hotkeys** in the add-on's tab or the settings window and press a new combination, or set `fix_on_off=`, `green_tint=` or `settings_window=` under `[hotkeys]` in the `.ini` (e.g. `Ctrl+Alt+G`; `None` for no hotkey, except the settings window's) |
 
 ## How the fix works
 

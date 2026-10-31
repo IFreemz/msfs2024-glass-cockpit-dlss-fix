@@ -19,12 +19,13 @@ void write_log(const char* format, ...);
 // Standalone: hooks D3D12CreateDevice (the sim creates its device after loading dxgi.dll), and swapchain creation on
 // every DXGI factory made through this DLL's exports.
 void hook_device_creation() noexcept;
-// Standalone: the settings window (settings_window.cpp), opened and closed with Ctrl+Shift+F6 through
-// settings_window_hotkey (null in the add-on, which has its tab in the ReShade overlay instead).
+// Standalone: the settings window (settings_window.cpp), opened and closed with its hotkey (Ctrl+Shift+F6 by default)
+// through settings_window_hotkey (null in the add-on, which has its tab in the ReShade overlay instead).
 void init_settings_window(void* self_module);
 extern void (*settings_window_hotkey)();
-// Set while the settings window records a new hotkey: the current one doesn't toggle the window meanwhile.
-extern std::atomic<bool> settings_window_capturing;
+// Set while a new hotkey is being recorded (settings window, or the add-on's overlay tab) and until its keys are let go:
+// the fix's hotkeys don't fire meanwhile.
+extern std::atomic<bool> hotkeys_paused;
 void dxgi_factory_created(IUnknown* factory);
 
 // ReShade add-on: the devices ReShade reports (the add-on is loaded when the first one is created), and the swapchain

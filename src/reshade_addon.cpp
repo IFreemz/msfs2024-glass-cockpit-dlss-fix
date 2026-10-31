@@ -17,7 +17,7 @@ extern "C" __declspec(dllexport) const char* NAME = GLASS_NAME;
 extern "C" __declspec(dllexport) const char* AUTHOR = GLASS_AUTHOR;
 extern "C" __declspec(dllexport) const char* WEBSITE = GLASS_WEBSITE;
 extern "C" __declspec(dllexport) const char* ISSUES = GLASS_ISSUES;
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghosting from MSFS 2024 glass cockpit displays. Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint.";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghosting from MSFS 2024 glass cockpit displays. Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint (changeable in its tab).";
 
 namespace {
 void on_init_device(api::device* device) {
