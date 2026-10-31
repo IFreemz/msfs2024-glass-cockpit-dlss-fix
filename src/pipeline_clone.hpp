@@ -8,19 +8,28 @@
 namespace glass {
 constexpr DXGI_FORMAT map_format = DXGI_FORMAT_R32G32B32A32_FLOAT;
 
+// translucent (painted screens): also a pipeline with a stencil test (the clone tests the same but never writes the
+// stencil), without a depth test (the clone then covers what the game's draw covers, as it does), or without a render
+// target (a decal blended into the G-buffer through UAVs: the clone gets the map as its only render target).
 inline bool clone_pipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& original,
-    D3D12_SHADER_BYTECODE pixel_shader, D3D12_GRAPHICS_PIPELINE_STATE_DESC& result) {
+    D3D12_SHADER_BYTECODE pixel_shader, D3D12_GRAPHICS_PIPELINE_STATE_DESC& result, bool translucent = false) {
     if (!original.pRootSignature || !original.VS.pShaderBytecode || !original.VS.BytecodeLength ||
         !pixel_shader.pShaderBytecode || !pixel_shader.BytecodeLength ||
         original.GS.BytecodeLength || original.HS.BytecodeLength || original.DS.BytecodeLength ||
         original.StreamOutput.NumEntries || original.StreamOutput.NumStrides ||
         original.SampleDesc.Count != 1 || original.SampleDesc.Quality != 0 ||
-        original.DepthStencilState.StencilEnable || original.BlendState.AlphaToCoverageEnable ||
+        (original.DepthStencilState.StencilEnable && !translucent) || original.BlendState.AlphaToCoverageEnable ||
         original.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE ||
-        original.NumRenderTargets == 0 || original.NumRenderTargets > 8 ||
-        !original.DepthStencilState.DepthEnable || original.DSVFormat == DXGI_FORMAT_UNKNOWN) return false;
+        (original.NumRenderTargets == 0 && !translucent) || original.NumRenderTargets > 8 ||
+        ((!original.DepthStencilState.DepthEnable || original.DSVFormat == DXGI_FORMAT_UNKNOWN) && !translucent)) return false;
     result = original;
     result.PS = pixel_shader;
+    if (translucent) {
+        // Drawing with UAVs only can force a sample count and use conservative rasterization; the map has a render
+        // target and wants the pixels the game's draw shades.
+        result.RasterizerState.ForcedSampleCount = 0;
+        result.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+    }
     result.NumRenderTargets = 1;
     for (auto& format : result.RTVFormats) format = DXGI_FORMAT_UNKNOWN;
     result.RTVFormats[0] = map_format;
@@ -33,12 +42,14 @@ inline bool clone_pipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& original,
         blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     }
     result.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    result.DepthStencilState.StencilWriteMask = 0;
     // Replayed right after the game's own draw, against the depth it just wrote: only the triangle the game kept passes
     // (a screen mesh can hold layers drawn in either order, e.g. the iFly 737's CDU and radio displays have a backing
     // plate 0.2 mm off the screen, after it in the mesh). A tiny bias towards the camera (16 float steps) absorbs
     // rounding differences between the two pipelines; layers millimetres apart stay apart.
     const auto func = original.DepthStencilState.DepthFunc;
-    if (func == D3D12_COMPARISON_FUNC_GREATER || func == D3D12_COMPARISON_FUNC_GREATER_EQUAL) {
+    if (!original.DepthStencilState.DepthEnable) {
+    } else if (func == D3D12_COMPARISON_FUNC_GREATER || func == D3D12_COMPARISON_FUNC_GREATER_EQUAL) {
         result.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
         result.RasterizerState.DepthBias = original.RasterizerState.DepthBias + 16; // on top of the game's own bias
     } else if (func == D3D12_COMPARISON_FUNC_LESS || func == D3D12_COMPARISON_FUNC_LESS_EQUAL) {

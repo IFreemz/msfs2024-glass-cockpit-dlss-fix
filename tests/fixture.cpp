@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
         bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false,
-            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false;
+            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
@@ -255,9 +255,32 @@ int main(int argc, char** argv) {
             optiscaler_fsr |= !std::strcmp(argv[i], "--optiscaler-fsr");
             ngx_proxy |= !std::strcmp(argv[i], "--ngx-proxy");
             motion |= !std::strcmp(argv[i], "--motion");
+            painted |= !std::strcmp(argv[i], "--painted");
+            depthless |= !std::strcmp(argv[i], "--depthless");
+            rov |= !std::strcmp(argv[i], "--rov");
+            gauge_source |= !std::strcmp(argv[i], "--source");
+            alpha_only |= !std::strcmp(argv[i], "--alpha");
         }
         if (hotpatch) redirect_evaluate_like_mfg_unlock();
         if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
+        // --painted: like the Fenix A320's readouts with "FCU readouts: New", a translucent material (blended, a pixel shader
+        // the fix doesn't know) draws a virtual painting (a render target with a full mip chain) from t0.
+        require(!painted || (!vr && !screen_t0), "--painted is flat only, with its own shader");
+        require(!depthless || painted, "--depthless is for --painted");
+        // --rov (with --painted): like the sim's geometry decals (the Fenix A320's readouts), no render target: the colour
+        // goes into the scene through a rasterizer-ordered UAV.
+        require(!rov || painted, "--rov is for --painted");
+        // --source (with --rov): the painting is drawn every frame from an intermediate texture copied from a gauge texture (as
+        // the sim's HTML renderer draws the Fenix's readouts painting from the gauge's live view), and both are black again
+        // before the upscaler runs: the fix must copy the painting while the decal reads it.
+        require(!gauge_source || rov, "--source is for --painted --rov");
+        if (gauge_source) std::printf("display: the painting drawn from a gauge texture each frame, black again before the upscaler\n");
+        // --alpha (with --source): the painting holds the gauge's picture in alpha only, its colour black (the Fenix A320's
+        // readouts painting): the alpha is black laid over the lit backing (1 - grey), so the fix must read 1 - alpha.
+        require(!alpha_only || gauge_source, "--alpha is for --painted --rov --source");
+        if (alpha_only) std::printf("display: the painting's picture in alpha only\n");
+        if (painted) std::printf("display: painted screen (%s, virtual painting in t0%s)\n", rov ? "decal through a rasterizer-ordered UAV" : "translucent material",
+            depthless ? ", no depth test" : "");
         const UINT views = vr ? 2 : 1;
         if (vr) std::printf("display: VR (instanced stereo, %u eyes)\n", views);
         FfxDispatch ffx_dispatch = nullptr;
@@ -305,8 +328,8 @@ int main(int argc, char** argv) {
             std::printf("the fix: ReShade add-on\n");
         }
         const auto vs = load(here / (vr ? "fixture_vr_vs.cso" : "fixture_vs.cso"));
-        const std::string kind = std::string(vr ? "_vr" : "") + (screen_t0 ? "_t0" : "");
-        const auto ps = load(here / ("fixture" + kind + "_ps.cso")), reference_ps = load(here / ("reference" + kind + "_ps.cso"));
+        const std::string kind = std::string(vr ? "_vr" : "") + (screen_t0 ? "_t0" : "") + (painted ? "_painted" : "") + (alpha_only ? "_alpha" : "");
+        const auto ps = load(here / ("fixture" + kind + (rov ? "_rov" : "") + "_ps.cso")), reference_ps = load(here / ("reference" + kind + "_ps.cso"));
         const auto reference_vs = vr ? load(here / "reference_vr_vs_eye0.cso") : vs, reference_vs_eye1 = vr ? load(here / "reference_vr_vs_eye1.cso") : vs;
 
         ComPtr<IDXGIFactory6> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
@@ -326,6 +349,15 @@ int main(int argc, char** argv) {
         const auto set_smooth = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixLineSmoothing"));
         require(set_smooth != nullptr, "exports missing");
         set_smooth(0);
+        // --painted: the screen probe runs over the whole test, so its painted probe logs the painted screen's draw.
+        if (painted) {
+            const auto screen_probe = reinterpret_cast<void (*)()>(GetProcAddress(addon, "GlassFixScreenProbe"));
+            require(screen_probe != nullptr, "exports missing");
+            screen_probe();
+        }
+        // --source: what the add-on's copy of the painting held, read back (it decides how the add-on reads the copy).
+        const auto painting_readbacks = reinterpret_cast<void (*)()>(GetProcAddress(addon, "GlassFixPaintingReadbacks"));
+        require(!gauge_source || painting_readbacks, "exports missing");
 
         ComPtr<ID3D12CommandQueue> queue; D3D12_COMMAND_QUEUE_DESC qd{};
         check(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)));
@@ -347,20 +379,24 @@ int main(int argc, char** argv) {
         };
 
         // Root signature shaped like the game's: VS b0-b2 (b2 also PS: per-instance brightness), PS b1/b3, SRV table t0-t1, static s1.
-        std::array<D3D12_ROOT_PARAMETER, 6> params{};
+        // --rov: and a UAV table u0 (the decal writes the scene through it).
+        std::array<D3D12_ROOT_PARAMETER, 7> params{};
         for (UINT i = 0; i < 5; ++i) {
             params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             params[i].ShaderVisibility = i == 2 ? D3D12_SHADER_VISIBILITY_ALL : i < 3 ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
             params[i].Descriptor.ShaderRegister = i < 3 ? i : i == 3 ? 1 : screen_t0 ? 4 : 3; // variant: material in b4
         }
-        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0}, uav_range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
         params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         params[5].DescriptorTable = {1, &range};
+        params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[6].DescriptorTable = {1, &uav_range};
         D3D12_STATIC_SAMPLER_DESC sampler{D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
             D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 0, 1, D3D12_COMPARISON_FUNC_NEVER, D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK, 0, D3D12_FLOAT32_MAX, 1, 0,
             D3D12_SHADER_VISIBILITY_PIXEL};
-        D3D12_ROOT_SIGNATURE_DESC rsd{UINT(params.size()), params.data(), 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+        D3D12_ROOT_SIGNATURE_DESC rsd{rov ? 7u : 6u, params.data(), 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
         ComPtr<ID3DBlob> blob, blob_error;
         check(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &blob_error));
         ComPtr<ID3D12RootSignature> rs; check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs)));
@@ -383,8 +419,14 @@ int main(int argc, char** argv) {
         }
         pd.DepthStencilState.DepthEnable = TRUE; pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        pd.BlendState.RenderTarget[0].BlendEnable = painted && !rov; // translucent (ONE, ZERO: the same picture)
+        if (depthless) { pd.DepthStencilState.DepthEnable = FALSE; pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO; } // one quad: the same picture
+        if (rov) { pd.NumRenderTargets = 0; pd.RTVFormats[0] = DXGI_FORMAT_UNKNOWN; pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO; } // a decal
         ComPtr<ID3D12PipelineState> game_pso; check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&game_pso)));
         auto rd = pd; rd.VS = {reference_vs.data(), reference_vs.size()}; rd.PS = {reference_ps.data(), reference_ps.size()}; rd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        rd.NumRenderTargets = 1;
+        rd.BlendState.RenderTarget[0].BlendEnable = FALSE;
+        rd.DepthStencilState.DepthEnable = TRUE; rd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         ComPtr<ID3D12PipelineState> reference_pso; check(device->CreateGraphicsPipelineState(&rd, IID_PPV_ARGS(&reference_pso)));
         rd.VS = {reference_vs_eye1.data(), reference_vs_eye1.size()};
         ComPtr<ID3D12PipelineState> reference_pso_eye1; check(device->CreateGraphicsPipelineState(&rd, IID_PPV_ARGS(&reference_pso_eye1)));
@@ -392,6 +434,18 @@ int main(int argc, char** argv) {
         auto sum_desc = rd; sum_desc.VS = {reference_vs.data(), reference_vs.size()}; sum_desc.DepthStencilState.DepthEnable = FALSE;
         for (auto& b : sum_desc.BlendState.RenderTarget) { b.BlendEnable = TRUE; b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_ONE; }
         ComPtr<ID3D12PipelineState> accumulate_pso; check(device->CreateGraphicsPipelineState(&sum_desc, IID_PPV_ARGS(&accumulate_pso)));
+        // --source: the HTML renderer stand-in (gauge in t0 drawn over a whole mip of the painting).
+        ComPtr<ID3D12PipelineState> blit_pso;
+        if (gauge_source) {
+            const auto blit_vs = load(here / "fixture_blit_vs.cso"), blit_ps = load(here / (alpha_only ? "fixture_blit_alpha_ps.cso" : "fixture_blit_ps.cso"));
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC bd{};
+            bd.pRootSignature = rs.Get(); bd.VS = {blit_vs.data(), blit_vs.size()}; bd.PS = {blit_ps.data(), blit_ps.size()};
+            bd.SampleMask = UINT_MAX; bd.SampleDesc.Count = 1; bd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            bd.NumRenderTargets = 1; bd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            bd.RasterizerState = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE}; bd.RasterizerState.DepthClipEnable = TRUE;
+            bd.BlendState = pd.BlendState; bd.BlendState.RenderTarget[0].BlendEnable = FALSE;
+            check(device->CreateGraphicsPipelineState(&bd, IID_PPV_ARGS(&blit_pso)));
+        }
 
         // Mesh, constants.
         // Vertices 1-6: the display quad; 7-12 and 13-18: its top and bottom halves, each showing a whole texture (join test).
@@ -487,13 +541,21 @@ int main(int argc, char** argv) {
             materials[glare] = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD); upload(materials[glare].Get(), material.data(), sizeof(material));
         }
 
-        // Textures: 2x1 alpha texture (t0) and a 768x768 5-mip render-target display texture (t1).
+        // Textures: 2x1 alpha texture (t0) and a 768x768 5-mip render-target display texture (t1). A virtual painting
+        // (--painted) has the full chain of 10 mip levels.
+        const UINT16 display_mips = painted && !gauge_source ? 10 : 5;
         auto alpha = texture(device.Get(), 2, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-        auto display = texture(device.Get(), 768, 768, 5, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
-        auto display2 = texture(device.Get(), 768, 768, 5, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+        // --source: the painting the decal reads, drawn every frame from an intermediate texture of one mip level that is
+        // itself copied from the display texture, the gauge (the sim's HTML renderer goes through such a surface).
+        auto painting = gauge_source ? texture(device.Get(), 768, 768, 10, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) : nullptr;
+        auto intermediate = gauge_source ? texture(device.Get(), 768, 768, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) : nullptr;
+        auto display = texture(device.Get(), 768, 768, display_mips, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+        auto display2 = texture(device.Get(), 768, 768, display_mips, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
         // The display texture is rewritten whenever its content scrolls (like the sim's instrument renderer does).
-        std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 5> display_fp{}; UINT64 display_total = 0;
-        { const auto dd = display->GetDesc(); device->GetCopyableFootprints(&dd, 0, 5, 0, display_fp.data(), nullptr, nullptr, &display_total); }
+        std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 10> display_fp{}; UINT64 display_total = 0;
+        { const auto dd = display->GetDesc(); device->GetCopyableFootprints(&dd, 0, display_mips, 0, display_fp.data(), nullptr, nullptr, &display_total); }
         auto display_staging = buffer(device.Get(), display_total, D3D12_HEAP_TYPE_UPLOAD);
         bool display_initialised = false, display2_initialised = false;
         // second = the join test's bottom texture: the pattern's lower half, black in its top rows; the top texture then
@@ -515,7 +577,7 @@ int main(int argc, char** argv) {
                 level[y * 768 + x] = {float(p[0]), float(p[1]), float(p[2]), float(p[3])};
             }
             UINT size = 768;
-            for (UINT m = 0; m < 5; ++m) {
+            for (UINT m = 0; m < display_mips; ++m) {
                 for (UINT y = 0; y < size; ++y) for (UINT x = 0; x < size; ++x)
                     for (int c = 0; c < 4; ++c) bytes[size_t(display_fp[m].Offset + y * display_fp[m].Footprint.RowPitch + x * 4 + c)] = uint8_t(std::lround(level[y * size + x][c]));
                 const UINT next = size / 2;
@@ -527,7 +589,7 @@ int main(int argc, char** argv) {
             upload(display_staging.Get(), bytes.data(), bytes.size());
             constexpr auto readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             if (initialised) transition(list.Get(), target, readable, D3D12_RESOURCE_STATE_COPY_DEST);
-            for (UINT m = 0; m < 5; ++m) {
+            for (UINT m = 0; m < display_mips; ++m) {
                 D3D12_TEXTURE_COPY_LOCATION to{target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{display_staging.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
                 to.SubresourceIndex = m; from.PlacedFootprint = display_fp[m];
                 list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
@@ -551,14 +613,15 @@ int main(int argc, char** argv) {
         // Descriptors created in a CPU heap and copied into the shader-visible heap, like the game.
         const UINT inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         ComPtr<ID3D12DescriptorHeap> cpu_heap, gpu_heap;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&cpu_heap)));
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gpu_heap)));
         auto cpu0 = cpu_heap->GetCPUDescriptorHandleForHeapStart(), gpu0 = gpu_heap->GetCPUDescriptorHandleForHeapStart();
         auto cpu1 = cpu0; cpu1.ptr += inc;
-        // Variant: the screen sits in t0 (first descriptor of the table).
-        device->CreateShaderResourceView(screen_t0 ? display.Get() : alpha.Get(), nullptr, cpu0);
-        device->CreateShaderResourceView(screen_t0 ? alpha.Get() : display.Get(), nullptr, cpu1);
+        // Variant and painted screen: the screen sits in t0 (first descriptor of the table).
+        const bool screen_first = screen_t0 || painted;
+        device->CreateShaderResourceView(screen_first ? (gauge_source ? painting.Get() : display.Get()) : alpha.Get(), nullptr, cpu0);
+        device->CreateShaderResourceView(screen_first ? alpha.Get() : display.Get(), nullptr, cpu1);
         // Views the sim creates that the add-on must leave alone: a depth-stencil texture read as depth (plane 0)
         // and as stencil (plane 1), plus a plain sampled RGBA8 texture and an HDR UAV texture.
         D3D12_CLEAR_VALUE stencil_clear{DXGI_FORMAT_D24_UNORM_S8_UINT}; stencil_clear.DepthStencil.Depth = 1;
@@ -575,6 +638,19 @@ int main(int argc, char** argv) {
             device->CreateShaderResourceView(sampled.Get(), nullptr, spare);
             device->CreateShaderResourceView(hdr.Get(), nullptr, spare);
         }
+        // Render targets with a full mip chain that are no screen, each viewed one mip level at a time (the sim fills the
+        // smaller levels of such textures this way, many of them while still in the menu): 280 views that must not crowd
+        // out a virtual painting's own (--painted).
+        std::vector<ComPtr<ID3D12Resource>> decoys;
+        for (int i = 0; i < 40; ++i) {
+            decoys.push_back(texture(device.Get(), 64, 64, 7, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON));
+            auto spare = cpu0; spare.ptr += 3 * inc;
+            for (UINT mip = 0; mip < 7; ++mip) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC v{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+                v.Texture2D.MostDetailedMip = mip; v.Texture2D.MipLevels = 1;
+                device->CreateShaderResourceView(decoys.back().Get(), &v, spare);
+            }
+        }
         auto gpu_slot = gpu0; gpu_slot.ptr += 4 * inc; // table at slot 4
         device->CopyDescriptorsSimple(2, gpu_slot, cpu0, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto table = gpu_heap->GetGPUDescriptorHandleForHeapStart(); table.ptr += 4 * inc;
@@ -582,12 +658,74 @@ int main(int argc, char** argv) {
             // Join test: the same table with the second display texture, at slots 6-7.
             auto cpu6 = cpu0; cpu6.ptr += 6 * inc;
             auto cpu7 = cpu0; cpu7.ptr += 7 * inc;
-            device->CreateShaderResourceView(screen_t0 ? display2.Get() : alpha.Get(), nullptr, cpu6);
-            device->CreateShaderResourceView(screen_t0 ? alpha.Get() : display2.Get(), nullptr, cpu7);
+            device->CreateShaderResourceView(screen_first ? display2.Get() : alpha.Get(), nullptr, cpu6);
+            device->CreateShaderResourceView(screen_first ? alpha.Get() : display2.Get(), nullptr, cpu7);
             auto gpu6 = gpu0; gpu6.ptr += 6 * inc;
             device->CopyDescriptorsSimple(2, gpu6, cpu6, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         }
         auto table2 = table; table2.ptr += 2 * inc;
+        // --source: the gauge's own table at slots 0-1 (t0 = the gauge, t1 = alpha): what the reference shows; the
+        // intermediate texture's at slots 8-9: what the HTML renderer stand-in draws the painting from. Plus one RTV per mip
+        // of the painting and one for the intermediate texture.
+        const auto gauge_table = gpu_heap->GetGPUDescriptorHandleForHeapStart();
+        auto intermediate_table = gauge_table; intermediate_table.ptr += 8 * inc;
+        ComPtr<ID3D12DescriptorHeap> painting_rtvs;
+        const UINT rinc_painting = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        if (gauge_source) {
+            auto gpu1 = gpu0; gpu1.ptr += inc;
+            device->CreateShaderResourceView(display.Get(), nullptr, gpu0);
+            device->CreateShaderResourceView(alpha.Get(), nullptr, gpu1);
+            auto gpu8 = gpu0; gpu8.ptr += 8 * inc;
+            auto gpu9 = gpu0; gpu9.ptr += 9 * inc;
+            device->CreateShaderResourceView(intermediate.Get(), nullptr, gpu8);
+            device->CreateShaderResourceView(alpha.Get(), nullptr, gpu9);
+            D3D12_DESCRIPTOR_HEAP_DESC ph{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 11, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            check(device->CreateDescriptorHeap(&ph, IID_PPV_ARGS(&painting_rtvs)));
+            for (UINT m = 0; m < 10; ++m) {
+                D3D12_RENDER_TARGET_VIEW_DESC v{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D};
+                v.Texture2D.MipSlice = m;
+                auto at = painting_rtvs->GetCPUDescriptorHandleForHeapStart(); at.ptr += m * rinc_painting;
+                device->CreateRenderTargetView(painting.Get(), &v, at);
+            }
+            auto at = painting_rtvs->GetCPUDescriptorHandleForHeapStart(); at.ptr += 10 * rinc_painting;
+            device->CreateRenderTargetView(intermediate.Get(), nullptr, at);
+        }
+        // --source: the gauge copied into the intermediate texture and the painting drawn from that (paint = true), or both
+        // emptied to black (paint = false).
+        auto paint = [&](bool from_gauge) {
+            constexpr auto readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            auto intermediate_rtv = painting_rtvs->GetCPUDescriptorHandleForHeapStart(); intermediate_rtv.ptr += 10 * rinc_painting;
+            if (from_gauge) {
+                transition(list.Get(), display.Get(), readable, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(list.Get(), intermediate.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION to{intermediate.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{display.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                transition(list.Get(), intermediate.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                transition(list.Get(), display.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, readable);
+            } else {
+                transition(list.Get(), intermediate.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                const float black_rgba[4]{}; list->ClearRenderTargetView(intermediate_rtv, black_rgba, 0, nullptr);
+                transition(list.Get(), intermediate.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
+            transition(list.Get(), painting.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            if (from_gauge) {
+                list->SetGraphicsRootSignature(rs.Get());
+                ID3D12DescriptorHeap* heaps[]{gpu_heap.Get()}; list->SetDescriptorHeaps(1, heaps);
+                list->SetPipelineState(blit_pso.Get());
+                list->SetGraphicsRootDescriptorTable(5, intermediate_table);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            }
+            for (UINT m = 0; m < 10; ++m) {
+                auto at = painting_rtvs->GetCPUDescriptorHandleForHeapStart(); at.ptr += m * rinc_painting;
+                if (!from_gauge) { const float black_rgba[4]{}; list->ClearRenderTargetView(at, black_rgba, 0, nullptr); continue; }
+                const float size = float(std::max(768u >> m, 1u));
+                const D3D12_VIEWPORT vp{0, 0, size, size, 0, 1}; const D3D12_RECT sc{0, 0, LONG(size), LONG(size)};
+                list->RSSetViewports(1, &vp); list->RSSetScissorRects(1, &sc);
+                list->OMSetRenderTargets(1, &at, FALSE, nullptr);
+                list->DrawInstanced(3, 1, 0, 0);
+            }
+            transition(list.Get(), painting.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        };
         if (bench) {
             // The sim makes millions of descriptor copies per second from several threads; with descriptor tracking
             // (--track) each goes through the add-on. Time them: 4 threads, 1M single-descriptor copies each, from a
@@ -625,7 +763,11 @@ int main(int argc, char** argv) {
 
         // Targets.
         D3D12_CLEAR_VALUE black{DXGI_FORMAT_R11G11B10_FLOAT, {}};
-        auto scene = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, &black, UINT16(views));
+        auto scene = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R11G11B10_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | (rov ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_RENDER_TARGET, &black, UINT16(views));
+        // --rov: the decal's UAV of the scene, in the shader-visible heap (slot 2).
+        auto uav_table = gpu_heap->GetGPUDescriptorHandleForHeapStart(); uav_table.ptr += 2 * inc;
+        if (rov) { auto gpu2 = gpu0; gpu2.ptr += 2 * inc; device->CreateUnorderedAccessView(scene.Get(), nullptr, nullptr, gpu2); }
         // VR: each eye's layer is copied here before its upscaler call (the sim's per-view colour input).
         auto eye_colour = vr ? texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST) : nullptr;
         auto final_views = vr ? texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, UINT16(views)) : nullptr;
@@ -675,6 +817,7 @@ int main(int argc, char** argv) {
             list->SetGraphicsRootConstantBufferView(3, render_cb->GetGPUVirtualAddress());
             list->SetGraphicsRootConstantBufferView(4, materials[0]->GetGPUVirtualAddress());
             list->SetGraphicsRootDescriptorTable(5, table);
+            if (rov) list->SetGraphicsRootDescriptorTable(6, uav_table);
             list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST); list->IASetVertexBuffers(0, 1, &vbv); list->IASetIndexBuffer(&ibv);
         };
 
@@ -711,6 +854,7 @@ int main(int argc, char** argv) {
             list->ClearRenderTargetView(rtv(2), zero, 0, nullptr);
             list->ClearDepthStencilView(dsv(1), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
             bind(eye ? reference_pso_eye1.Get() : reference_pso.Get(), camera);
+            if (gauge_source) list->SetGraphicsRootDescriptorTable(5, gauge_table); // the picture is the gauge's
             const D3D12_VIEWPORT vp{0, 0, float(output_w), float(output_h), 0, 1}; const D3D12_RECT sc{0, 0, LONG(output_w), LONG(output_h)};
             list->RSSetViewports(1, &vp); list->RSSetScissorRects(1, &sc);
             auto r2 = rtv(2), d1 = dsv(1); list->OMSetRenderTargets(1, &r2, FALSE, &d1);
@@ -1215,12 +1359,14 @@ int main(int argc, char** argv) {
         for (const auto& f : frames) {
             set_jitter(f.jitter_positive);
             if (!std::strcmp(f.name, "warmup2")) Sleep(1500); // let the background PSO compile finish
+            if (gauge_source) painting_readbacks(); // the copies of the frames before (the GPU is done with them: no presents here)
             set_material(f);
             static UINT current_scroll = 0;
             if (f.scroll != current_scroll) { upload_display(f.scroll); current_scroll = f.scroll; }
             const int variant = f.camera == 1 ? 1 : (f.glare ? 2 : 0);
             std::array<std::vector<std::array<float, 4>>, 2> refs;
             for (UINT eye = 0; eye < views; ++eye) refs[eye] = render_reference(variant, eye);
+            if (gauge_source) paint(true); // the HTML renderer draws the painting from the gauge
             list->ClearRenderTargetView(rtv(0), black.Color, 0, nullptr);
             list->ClearDepthStencilView(dsv(0), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
             if (f.draw) {
@@ -1228,9 +1374,15 @@ int main(int argc, char** argv) {
                 // Jitter: geometry displaced by +J render pixels (y down). VR: one instance per eye.
                 const D3D12_VIEWPORT vp{f.jx, f.jy, float(render_w), float(render_h), 0, 1}; const D3D12_RECT sc{0, 0, LONG(render_w), LONG(render_h)};
                 list->RSSetViewports(1, &vp); list->RSSetScissorRects(1, &sc);
-                auto r0 = rtv(0), d0 = dsv(0); list->OMSetRenderTargets(1, &r0, FALSE, &d0);
+                auto r0 = rtv(0), d0 = dsv(0);
+                if (rov) { // a decal: no render target, the scene written through its UAV
+                    transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    list->OMSetRenderTargets(0, nullptr, FALSE, &d0);
+                } else list->OMSetRenderTargets(1, &r0, FALSE, &d0);
                 list->DrawIndexedInstanced(6, views, 0, 1, 0);
+                if (rov) transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
             }
+            if (gauge_source) paint(false); // and empties it again before the upscaler runs
             transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, vr ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             submit();
           for (UINT call = 0; call < views; ++call) {
