@@ -89,7 +89,7 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
 // three times per frame, and the GPU can be several frames behind the CPU (more so with the game in the background): a set
 // must not be rewritten while the GPU may still read it.
 constexpr unsigned slot_count = 32, ring_size = 32, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 12; // + depth (t34), capture (u11)
-constexpr unsigned params_per_slot = 4; // float4s per slot in the brightness match buffer (params in overlay.hlsl)
+constexpr unsigned params_per_slot = 5; // float4s per slot in the brightness match buffer (params in overlay.hlsl)
 constexpr unsigned bounds_cells = 64; // stable screen edges: cells per side of each screen texture's grid
 std::filesystem::path addon_directory;
 ID3D12Device* main_device = nullptr;
@@ -653,6 +653,7 @@ std::atomic<bool> mip0_only{true};
 std::array<std::atomic<uint64_t>, slot_count> slot_last_used{};
 // Painted screens: the mesh a slot belongs to (0: a display slot, one per texture; see "Painted screens").
 std::array<std::atomic<uint64_t>, slot_count> slot_meshes{};
+std::array<std::atomic<bool>, slot_count> slot_matched{}; // from the last readback of the brightness match
 std::atomic<uint64_t> present_count{0};
 std::mutex slots_mutex;
 UINT descriptor_size = 0;
@@ -951,17 +952,42 @@ bool rgba8(api::format format) {
     }
 }
 
-// mesh: 0 for a display texture (one slot per texture); a painted screen's mesh gets a slot of its own (see "Painted screens").
-int slot_of(ID3D12Resource* resource, DXGI_FORMAT format, uint64_t mesh = 0) {
+// Textures whose meshes get a match each: their brightness doesn't explain the picture (see `levels` in overlay.hlsl's solve).
+std::array<std::atomic<ID3D12Resource*>, 16> separate_textures{};
+bool separate_matches(ID3D12Resource* resource) {
+    for (const auto& texture : separate_textures) if (texture.load(std::memory_order_relaxed) == resource) return true;
+    return false;
+}
+// True the first time a texture is added.
+bool set_separate_matches(ID3D12Resource* resource) {
+    if (separate_matches(resource)) return false;
+    for (auto& texture : separate_textures) { ID3D12Resource* expected = nullptr; if (texture.compare_exchange_strong(expected, resource)) return true; }
+    LOG_ONCE("%llu screen textures with separate matches, no more", uint64_t(separate_textures.size()));
+    return false;
+}
+// A mesh: where its indices start in the game's buffers (each readout is a node of its own).
+template <class Draw> uint64_t mesh_key(const Draw& draw) {
+    return (uint64_t(draw.first) * 0x9E3779B97F4A7C15ull ^ uint64_t(int64_t(draw.base_vertex)) * 0xC2B2AE3D27D4EB4Full ^
+        (uint64_t(draw.count) << 1) ^ (draw.indexed ? 1u : 0u)) | 1;
+}
+
+// mesh: 0 for a display texture (one slot per texture); a painted screen's mesh gets a slot of its own (see "Painted screens"),
+// and so does a mesh of a texture with separate matches (separate: true).
+int slot_of(ID3D12Resource* resource, DXGI_FORMAT format, uint64_t mesh = 0, bool separate = false) {
     const auto now = present_count.load(std::memory_order_relaxed);
     for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() == resource && slot_meshes[i].load() == mesh) { slot_last_used[i] = now; return int(i); }
     std::lock_guard lock(slots_mutex);
     if (mesh) {
-        // Painted meshes never take more than a quarter of the slots, so the cockpit screens always find theirs.
-        constexpr unsigned max_painted_slots = slot_count / 4;
+        // Painted meshes never take more than a quarter of the slots, so the cockpit screens always find theirs. Meshes with
+        // separate matches can go to three eighths; past that they share their texture's slot as before.
+        const unsigned max_painted_slots = separate ? slot_count * 3 / 8 : slot_count / 4;
         unsigned used = 0;
         for (unsigned i = 0; i < slot_count; ++i) used += slot_resources[i].load() && slot_meshes[i].load() && now <= slot_last_used[i] + 120;
-        if (used >= max_painted_slots) { LOG_ONCE("painted screens: %u meshes in use, more are left to the upscaler", max_painted_slots); return -1; }
+        if (used >= max_painted_slots) {
+            if (separate) LOG_ONCE("separate matches: %u meshes in use, more share their texture's match", max_painted_slots);
+            else LOG_ONCE("painted screens: %u meshes in use, more are left to the upscaler", max_painted_slots);
+            return -1;
+        }
     }
     // Free slot first, else the least recently used one that has not been drawn for ~3 s (aircraft changes, closed pages).
     int chosen = -1;
@@ -979,10 +1005,11 @@ int slot_of(ID3D12Resource* resource, DXGI_FORMAT format, uint64_t mesh = 0) {
     { std::lock_guard view_lock(view_mips_mutex); if (const auto found = view_mips.find(resource); found != view_mips.end()) { mips = found->second; known = true; } }
     slot_first_mip[chosen] = mips.first; slot_mip_count[chosen] = mips.second;
     slot_meshes[chosen] = mesh;
+    slot_matched[chosen] = true;
     slot_resources[chosen] = resource;
     bounds_reset.fetch_or(1u << chosen);
     const auto d = resource->GetDesc();
-    log("%s slot=%d resource=%p w=%llu h=%u mips=%u format=%u game_view_mips=%u+%d%s", mesh ? "painted_slot" : "display_slot", chosen, resource, d.Width, d.Height,
+    log("%s slot=%d resource=%p w=%llu h=%u mips=%u format=%u game_view_mips=%u+%d%s", separate ? "mesh_slot" : mesh ? "painted_slot" : "display_slot", chosen, resource, d.Width, d.Height,
         d.MipLevels, unsigned(format), mips.first, int(mips.second), known ? "" : " (view not seen)");
     return chosen;
 }
@@ -1051,7 +1078,7 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     uint32_t diag_index = 0, diag_copied_at = 0;
     uint64_t diag_ready = UINT64_MAX, diag_next = 300;
     int diag_dumps = 0;
-    std::atomic<uint64_t> readback_next{600}, readback_ready{UINT64_MAX};
+    std::atomic<uint64_t> readback_calls{0}, readback_next{120}, readback_ready{UINT64_MAX}; // in upscaler calls
     uint64_t frame = 0;
     ComPtr<ID3D12QueryHeap> timestamps; // cost diagnostics: start and end of the passes of each upscaler call
     ComPtr<ID3D12Resource> timestamps_readback;
@@ -1498,7 +1525,8 @@ bool replay(api::command_list* list, ListState& state, const glass::Draw& draw) 
         }
         note(stats.unknown_texture, "texture_not_recognised"); return false;
     }
-    const int slot = slot_of(texture.resource, texture.format);
+    int slot = separate_matches(texture.resource) ? slot_of(texture.resource, texture.format, mesh_key(draw), true) : -1;
+    if (slot < 0) slot = slot_of(texture.resource, texture.format);
     if (slot < 0) { note(stats.unsupported_draw, "slots_full"); return false; }
     {
         // Diagnostics: each distinct draw of a screen texture once (several panels can share one texture, e.g. the iFly
@@ -1793,8 +1821,7 @@ bool replay_painted(ListState& state, const glass::Draw& draw) noexcept try {
     }
     if (painting_stays_black(texture.resource)) return false;
     // The mesh: where its indices start in the game's buffers (each readout is a node of its own).
-    const uint64_t mesh = (uint64_t(draw.first) * 0x9E3779B97F4A7C15ull ^ uint64_t(int64_t(draw.base_vertex)) * 0xC2B2AE3D27D4EB4Full ^
-        (uint64_t(draw.count) << 1) ^ (draw.indexed ? 1u : 0u)) | 1;
+    const uint64_t mesh = mesh_key(draw);
     // The painting's copy (see PaintingCopy): the same picture, readable after the upscaler.
     ID3D12Resource* const painting = texture.resource;
     texture = painting_copy(state, texture);
@@ -2191,19 +2218,33 @@ bool create_composite(DeviceState& d) {
     return true;
 }
 
-// Log the brightness match (scene = gain * screen + offset, per colour channel) of every screen in use. Copied from
-// the GPU every ~600 frames and read ~30 frames later, when the copy has long finished.
+// Log the brightness match (scene = gain * screen + offset, per colour channel) of every screen in use, keep which screens
+// match, and give the meshes of a texture separate matches when it needs them. Copied from the GPU every ~120 upscaler calls
+// and read ~30 calls later, when the copy has long finished.
 void log_brightness(DeviceState& d) {
-    const uint64_t now = present_count.load(std::memory_order_relaxed);
+    const uint64_t now = d.readback_calls.load();
     uint64_t ready = d.readback_ready.load();
     if (now < ready || !d.readback_ready.compare_exchange_strong(ready, UINT64_MAX)) return;
     float* data = nullptr;
     const D3D12_RANGE range{0, slot_count * params_per_slot * 16};
     if (FAILED(d.params_readback->Map(0, &range, reinterpret_cast<void**>(&data)))) return;
+    static std::atomic<int> reads{0}, dumps{0}, log_after_split{0};
+    for (unsigned slot = 0; slot < slot_count; ++slot) {
+        const float* a = data + slot * params_per_slot * 4;
+        const float* levels = a + 16;
+        slot_matched[slot] = a[3] > 0;
+        const auto resource = slot_resources[slot].load();
+        if (resource && !slot_meshes[slot].load() && levels[3] >= 8 && set_separate_matches(resource)) {
+            log("separate matches for the meshes of screen texture %p (slot=%u): brightest %.4g, dimmest %.4g, and their brightness doesn't explain the picture",
+                resource, slot, levels[1], levels[2]);
+            log_after_split = 3; // this read and the next ones show how the new matches do
+        }
+    }
     // Every dump for the first ~10 minutes, then about once a minute.
-    static std::atomic<int> dumps{0};
-    const int dump = dumps++;
-    if (dump < 60 || dump % 6 == 0) {
+    const int dump = reads++ % 5 ? -1 : dumps++;
+    bool split_shown = false;
+    if (log_after_split.load() > 0) { --log_after_split; split_shown = true; }
+    if (split_shown || (dump >= 0 && (dump < 60 || dump % 6 == 0))) {
         for (unsigned slot = 0; slot < slot_count; ++slot) {
             const float* a = data + slot * params_per_slot * 4;
             const float* b = a + 4;
@@ -2211,8 +2252,8 @@ void log_brightness(DeviceState& d) {
             const auto resource = slot_resources[slot].load();
             if (a[3] == 0 || !resource) continue;
             const auto desc = resource->GetDesc();
-            log("brightness slot=%u screen=%llux%u gain=%.3f,%.3f,%.3f offset=%.4f,%.4f,%.4f mean=%.4f,%.4f,%.4f quality=%.3f detail=%.3f samples=%.0f%s", slot,
-                uint64_t(desc.Width), desc.Height, a[0], a[1], a[2], b[0], b[1], b[2], q[0], q[1], q[2], q[3], a[12], b[3],
+            log("brightness slot=%u screen=%llux%u gain=%.3f,%.3f,%.3f offset=%.4f,%.4f,%.4f mean=%.4f,%.4f,%.4f quality=%.3f detail=%.3f samples=%.0f levels=%.4g,%.4g,%.4g%s", slot,
+                uint64_t(desc.Width), desc.Height, a[0], a[1], a[2], b[0], b[1], b[2], q[0], q[1], q[2], q[3], a[12], b[3], a[16], a[17], a[18],
                 a[3] < 0 ? " skipped (screen doesn't match the sim's picture)" : q[3] <= 0.25f && (a[13] > 0 || a[14] > 0 || a[15] > 0) ? " held" : "");
         }
     }
@@ -3075,10 +3116,10 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
     uav_barrier(native);
     if (d.params_readback) {
+        const uint64_t now = ++d.readback_calls;
         log_brightness(d);
-        const uint64_t now = present_count.load(std::memory_order_relaxed);
         uint64_t next = d.readback_next.load();
-        if (now >= next && d.readback_ready.load() == UINT64_MAX && d.readback_next.compare_exchange_strong(next, now + 600)) {
+        if (now >= next && d.readback_ready.load() == UINT64_MAX && d.readback_next.compare_exchange_strong(next, now + 120)) {
             transition(native, d.params.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             native->CopyBufferRegion(d.params_readback.Get(), 0, d.params.Get(), 0, slot_count * params_per_slot * 16);
             transition(native, d.params.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3810,7 +3851,17 @@ Status status() {
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
     s.active = s.enabled && s.overlay_frames && now <= last_composite_present + 30;
-    for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() && now <= slot_last_used[i] + 30) ++s.screens;
+    // Meshes with a match each are still one screen texture. A screen drawn but not matching isn't being fixed.
+    std::array<ID3D12Resource*, slot_count> visible{}, fixed{};
+    const auto add = [](auto& list, unsigned& count, ID3D12Resource* resource) {
+        if (std::find(list.begin(), list.begin() + count, resource) == list.begin() + count) list[count++] = resource;
+    };
+    for (unsigned i = 0; i < slot_count; ++i) {
+        const auto resource = slot_resources[i].load();
+        if (!resource || now > slot_last_used[i] + 30) continue;
+        add(visible, s.screens, resource);
+        if (slot_matched[i].load()) add(fixed, s.fixed_screens, resource);
+    }
     s.render_w = last_render_w; s.render_h = last_render_h; s.out_w = last_out_w; s.out_h = last_out_h;
     s.problem = problem;
     s.log_path = (log_file_path.empty() ? addon_directory / L"glass-cockpit-dlss-fix.log" : log_file_path).wstring();

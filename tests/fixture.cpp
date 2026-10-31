@@ -509,6 +509,7 @@ int main(int argc, char** argv) {
         const D3D12_INDEX_BUFFER_VIEW ibv{ib->GetGPUVirtualAddress(), sizeof(indices), DXGI_FORMAT_R16_UINT};
         std::array<ComPtr<ID3D12Resource>, 2> globals, worlds, objects;
         ComPtr<ID3D12Resource> objects_dim, objects_off; // per-instance brightness 0.35 (dim modes), 0 (power-on mode)
+        ComPtr<ID3D12Resource> objects_faint, material_faint; // mixed modes: brightness 0.02 with a 50x gain, so it shows as bright as 1
         for (int k = 0; k < 2; ++k) {
             auto c = constants(k ? 0.25f : 0.0f);
             c.object[0] = {1, 1, 1, 1}; // instance 0's brightness (the display shader multiplies its output by row 0's rgb)
@@ -520,6 +521,8 @@ int main(int argc, char** argv) {
                 objects_dim = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD); upload(objects_dim.Get(), c.object.data(), sizeof(c.object));
                 c.object[0] = {0, 0, 0, 1};
                 objects_off = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD); upload(objects_off.Get(), c.object.data(), sizeof(c.object));
+                c.object[0] = {0.02f, 0.02f, 0.02f, 1};
+                objects_faint = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD); upload(objects_faint.Get(), c.object.data(), sizeof(c.object));
             }
         }
         auto render_cb = buffer(device.Get(), 256, D3D12_HEAP_TYPE_UPLOAD);
@@ -533,6 +536,10 @@ int main(int argc, char** argv) {
             material[4] = glare ? std::array<float, 4>{0.25f, 0.3f, 0.15f, 0.8f} : std::array<float, 4>{};
             materials[glare] = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD); upload(materials[glare].Get(), material.data(), sizeof(material));
         }
+        material[4] = {};
+        material[2] = {gain[0] * 50, gain[1] * 50, gain[2] * 50, 0};
+        material_faint = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD); upload(material_faint.Get(), material.data(), sizeof(material));
+        material[2] = {gain[0], gain[1], gain[2], 0};
 
         // Textures: 2x1 alpha texture (t0) and a 768x768 5-mip render-target display texture (t1). A virtual painting
         // (--painted) has the full chain of 10 mip levels.
@@ -893,7 +900,7 @@ int main(int argc, char** argv) {
             using Image = std::vector<std::array<float, 4>>;
             bool join = false;
             // The display as drawn: one quad, or (join) its two halves with their own textures.
-            bool band = false, inset = false, atlas = false, windows = false, dim = false, unpowered = false;
+            bool band = false, inset = false, atlas = false, windows = false, dim = false, unpowered = false, mixed = false;
             auto window_material = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD);
             auto draw_display = [&] {
                 if (windows) {
@@ -906,6 +913,16 @@ int main(int argc, char** argv) {
                 if (band) { list->DrawIndexedInstanced(6, 1, 0, 19, 0); list->DrawIndexedInstanced(6, 1, 0, 25, 0); return; }
                 if (inset) { list->DrawIndexedInstanced(6, 1, 0, 31, 0); return; }
                 if (unpowered) list->SetGraphicsRootConstantBufferView(2, objects_off->GetGPUVirtualAddress());
+                if (atlas && mixed) {
+                    for (int q = 0; q < 4; ++q) {
+                        list->SetGraphicsRootConstantBufferView(2, (q == 2 ? objects[0] : objects_faint)->GetGPUVirtualAddress());
+                        list->SetGraphicsRootConstantBufferView(4, (q == 2 ? materials[0] : material_faint)->GetGPUVirtualAddress());
+                        list->DrawIndexedInstanced(6, 1, 0, 37 + q * 6, 0);
+                    }
+                    list->SetGraphicsRootConstantBufferView(2, objects[0]->GetGPUVirtualAddress());
+                    list->SetGraphicsRootConstantBufferView(4, materials[0]->GetGPUVirtualAddress());
+                    return;
+                }
                 if (atlas) {
                     for (int q = 0; q < 4; ++q) {
                         // Dim: the third quad at its own brightness (like the Fenix A320's readouts on one texture).
@@ -1080,7 +1097,13 @@ int main(int argc, char** argv) {
                 {"still-blank", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, false, 0, true},
                 // Windows over most of the screen pointing at one texture spot, brighter (iFly 737 radio windows): the fake
                 // DLSS output is magenta, "screen_dropped" = share of the rest of the screen left to the upscaler.
-                {"still-windows", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, false, 0, false, true}};
+                {"still-windows", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0, false, 0, false, true},
+                // One texture whose meshes' brightness doesn't explain the picture (A400M: the pedestal readouts share the
+                // glareshield's texture but not its knob): each mesh must end up with a match of its own. Last, because the
+                // texture keeps its separate matches, and with warm-up runs, because they only start after a readback.
+                {"mixed-warmup-1", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true}, {"mixed-warmup-2", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true},
+                {"mixed-warmup-3", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true}, {"mixed-warmup-5", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true}, {"mixed-warmup-4", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true},
+                {"still-mixed-atlas", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, true},};
             const auto set_stable = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixStableEdges"));
             require(set_stable != nullptr, "exports missing");
             const auto set_gaussian = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixGaussian"));
@@ -1119,7 +1142,7 @@ int main(int argc, char** argv) {
                 dlss_magenta = std::strstr(m.name, "trim") != nullptr || m.blank || m.windows;
                 set_full_size(m.full_size);
                 set_temporal(0);
-                join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas; windows = m.windows; dim = m.dim;
+                join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas; windows = m.windows; dim = m.dim; mixed = std::strstr(m.name, "mixed") != nullptr;
                 if (m.windows) {
                     auto bright = material; bright[2] = {}; bright[3] = {1.5f, 1.3f, 1.0f, 0}; // the windows' own light (lit digits)
                     upload(window_material.Get(), bright.data(), sizeof(bright));

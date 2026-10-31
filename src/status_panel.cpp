@@ -35,7 +35,7 @@ std::string format(const char* text, ...) {
 }
 
 std::string summary(const glass::Status& s) {
-    if (s.active) return format("Working: fixing %u screen%s (%s %ux%u -> %ux%u)", s.screens, s.screens == 1 ? "" : "s", s.upscaler, s.render_w, s.render_h, s.out_w, s.out_h);
+    if (s.active) return format("Working: fixing %u screen%s (%s %ux%u -> %ux%u)", s.fixed_screens, s.fixed_screens == 1 ? "" : "s", s.upscaler, s.render_w, s.render_h, s.out_w, s.out_h);
     if (!s.enabled) return "Off (Ctrl+Shift+F9 to turn on)";
     if (s.problem) return std::string("Not working: ") + s.problem;
     return "Waiting for a glass cockpit with DLSS or FSR selected";
