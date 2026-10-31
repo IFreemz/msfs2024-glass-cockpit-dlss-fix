@@ -508,9 +508,20 @@ void solve(uint3 id : SV_DispatchThreadID)
     bool swapped = bounds_reset & (1u << slot);
     float seen = asfloat(edge_bounds.Load(brightness_next + slot * 4));
     bool fresh = swapped && reference > 0 && seen > 0 && seen <= 16 * reference && 16 * seen >= reference;
-    if ((swapped && !fresh) || (!swapped && reference > 0 && fitted > 0 && (reference > 16 * fitted || 16 * reference < fitted)))
+    bool reference_jump = !swapped && reference > 0 && fitted > 0 && (reference > 16 * fitted || 16 * reference < fitted);
+    if ((swapped && !fresh) || reference_jump)
     {
-        params[slot * params_per_slot] = 0;
+        // The same screen with its brightness knob turned far (A400M glareshield displays: over 16x): the gain to hold stays
+        // valid at the new reference, so it comes back like any dropped screen, not as one that never matched.
+        float4 kept = params[slot * params_per_slot + 3];
+        bool matched = reference_jump && previous_a.w != 0 && any(kept.yzw > 0);
+        if (matched)
+        {
+            kept.yzw *= reference / fitted;
+            params[slot * params_per_slot + 3] = kept;
+            params[slot * params_per_slot + 2] = float4(previous_q.xyz, 0);
+        }
+        params[slot * params_per_slot] = float4(0, 0, 0, matched ? -1 : 0);
         edge_bounds.Store(brightness_fitted + slot * 4, 0);
         return;
     }
@@ -587,6 +598,16 @@ void solve(uint3 id : SV_DispatchThreadID)
     float3 good_gain = previous_a.w != 0 ? previous_detail.yzw : 0;
     bool matched_before = any(good_gain > 0);
     bool hold = (previous_a.w > 0 || (previous_a.w < 0 && q > 0.15)) && q <= 0.25 && matched_before;
+    // The gain held follows the match slowly, in steps too small for one bad frame to matter: a knob can dim a screen without
+    // changing its texture or its mesh's brightness (A2A Legacy radios), and a gain frozen from another knob position showed
+    // the digits brighter at the lowest setting than at the highest. About a second to double or halve.
+    if (hold && pooled_variance > 3e-6)
+    {
+        double weighted = 0;
+        [unroll] for (uint c = 0; c < 3; ++c) weighted += good_gain[c] * variance[c];
+        float held = float(weighted / pooled_variance);
+        if (held > 0) good_gain *= exp(0.02 * log(clamp(float(pooled_covariance / pooled_variance) / held, 0.5, 2.0)));
+    }
     if (hold)
         [unroll] for (uint c = 0; c < 3; ++c)
         {
