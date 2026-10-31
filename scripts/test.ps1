@@ -20,6 +20,23 @@ try {
     # Screen textures identified by descriptor tracking only (how AMD/Intel GPUs run).
     & .\FlightSimulator2024.exe --track
     if ($LASTEXITCODE) { throw "Offline descriptor tracking test failed ($LASTEXITCODE)" }
+    # A virtual painting drawn by a translucent material the fix doesn't know (Fenix A320 readouts, "FCU readouts: New").
+    & .\FlightSimulator2024.exe --painted
+    if ($LASTEXITCODE) { throw "Offline painted screen test failed ($LASTEXITCODE)" }
+    & .\FlightSimulator2024.exe --painted --track
+    if ($LASTEXITCODE) { throw "Offline painted screen descriptor tracking test failed ($LASTEXITCODE)" }
+    & .\FlightSimulator2024.exe --painted --depthless
+    if ($LASTEXITCODE) { throw "Offline painted screen without depth test failed ($LASTEXITCODE)" }
+    # The same as a decal with no render target, written through a rasterizer-ordered UAV (how the sim draws those readouts).
+    & .\FlightSimulator2024.exe --painted --rov
+    if ($LASTEXITCODE) { throw "Offline painted decal test failed ($LASTEXITCODE)" }
+    # The painting drawn every frame from a copy of a gauge, both black again before the upscaler (the Fenix A320's readouts):
+    # the fix must copy the painting while the decal reads it.
+    & .\FlightSimulator2024.exe --painted --rov --source
+    if ($LASTEXITCODE) { throw "Offline painted decal from a gauge test failed ($LASTEXITCODE)" }
+    # The same with the painting's picture in alpha only, its colour black (how the Fenix's readouts painting holds it).
+    & .\FlightSimulator2024.exe --painted --rov --source --alpha
+    if ($LASTEXITCODE) { throw "Offline painted decal in alpha only test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --fsr --vr --track
     if ($LASTEXITCODE) { throw "Offline FSR VR descriptor tracking test failed ($LASTEXITCODE)" }
     # Another mod (the RTX 40 MFG unlock) has redirected DLSS evaluate in a way that can't be hooked directly.

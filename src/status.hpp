@@ -16,6 +16,7 @@ struct Experimental {
     int calm_glass = 0; // calm glass at symbols on/off (off by default; no glass detail from the upscaler next to symbols)
     int edge_trim = 0; // hundredths of a render pixel of each screen's edge left to the upscaler (the reverse of edge_stretch)
     int occlusion_check = 1; // occlusion check on/off (on by default; screen pixels with something in front of them left to the upscaler)
+    int painted_screens = 1; // painted screens on/off (on by default; virtual paintings drawn by translucent materials, e.g. Fenix A320 readouts "New")
     bool operator==(const Experimental&) const = default;
 };
 
