@@ -29,7 +29,7 @@ struct Status {
     int line_smoothing = 0, glass_strength = 100;
     uint32_t settings_window_key = 0; // standalone: the settings window's hotkey (hotkey_name)
     uint64_t dlss_calls = 0, dlss_upscales = 0, fsr_calls = 0, screen_draws = 0, recorded = 0, overlay_frames = 0, skipped = 0;
-    unsigned screens = 0, render_w = 0, render_h = 0, out_w = 0, out_h = 0;
+    unsigned screens = 0, fixed_screens = 0, render_w = 0, render_h = 0, out_w = 0, out_h = 0;
     const char* upscaler = "DLSS"; // the one the fix was last drawn after
     const char* problem = nullptr; // plain-language description of the current problem, if any
     std::wstring log_path;

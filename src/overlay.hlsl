@@ -45,7 +45,7 @@ Texture2D<float4> displays[32] : register(t2);
 Texture2D<float> scene_depth : register(t34); // the upscaler's depth input (render resolution; occlusion check)
 RWTexture2D<float4> output : register(u0);  // DLSS output, R11G11B10_FLOAT
 RWTexture2D<uint> tiles : register(u1);     // per 8x8 map tile: display slot + 1 this frame (0 = none)
-RWStructuredBuffer<float4> params : register(u2); // per slot: [4s] = a.rgb, valid; [4s+1] = b.rgb, samples; [4s+2] = mean screen.rgb, fit quality; [4s+3] = detail quality, last good gain.rgb
+RWStructuredBuffer<float4> params : register(u2); // per slot: [5s] = a.rgb, valid; [5s+1] = b.rgb, samples; [5s+2] = mean screen.rgb, fit quality; [5s+3] = detail quality, last good gain.rgb; [5s+4] = brightness reference, brightest, dimmest mesh, frames their brightness didn't explain the picture
 RWTexture2DArray<float4> map_rw : register(u3);
 RWByteAddressBuffer sums : register(u4);    // per slot 20 x uint64 fixed point
 RWTexture2D<float4> residual : register(u5); // per render pixel: scene - a * display, w = slot + 1 (0 = none), + 64 where
@@ -67,7 +67,7 @@ SamplerState display_sampler : register(s0);
 
 static const uint slot_count = 32;
 static const uint terms = 20;
-static const uint params_per_slot = 4; // float4s per slot in params
+static const uint params_per_slot = 5; // float4s per slot in params
 static const float fixed_scale = 16777216.0;
 static const uint bounds_cells = 64;
 // Learnt edges in two halves that take turns (a new one every 128 upscaler calls, about a second): each call learns into
@@ -82,6 +82,7 @@ static const float bounds_scale = 16777215.0;
 // brightest mesh seen this frame (the next frame's reference; meshes drawn black, e.g. unpowered, don't count).
 static const uint brightness_base = diag_base + 256;
 static const uint brightness_fitted = brightness_base + 128, brightness_next = brightness_base + 256;
+static const uint brightness_dimmest = brightness_base + 384; // 1 / the dimmest mesh seen this frame (0: none seen)
 static const float brightness_floor = 1.0 / 1048576; // below: a mesh drawn black
 
 float map_level(float4 m) { return exp2((m.w - round(m.w)) * 64); }
@@ -413,7 +414,13 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
                 // The slot's brightest mesh this frame: the next frame's brightness reference.
                 float level = map_level(m);
                 float brightest = WaveActiveMax(level >= brightness_floor && isfinite(level) ? level : 0);
-                if (WaveIsFirstLane() && brightest > 0) { uint unused; edge_bounds.InterlockedMax(brightness_next + slot * 4, asuint(brightest), unused); }
+                float dimmest_inverse = WaveActiveMax(level >= brightness_floor && isfinite(level) ? 1 / level : 0);
+                if (WaveIsFirstLane() && brightest > 0)
+                {
+                    uint unused;
+                    edge_bounds.InterlockedMax(brightness_next + slot * 4, asuint(brightest), unused);
+                    edge_bounds.InterlockedMax(brightness_dimmest + slot * 4, asuint(dimmest_inverse), unused);
+                }
                 done = true;
             }
         }
@@ -508,6 +515,10 @@ void solve(uint3 id : SV_DispatchThreadID)
     bool swapped = bounds_reset & (1u << slot);
     float seen = asfloat(edge_bounds.Load(brightness_next + slot * 4));
     bool fresh = swapped && reference > 0 && seen > 0 && seen <= 16 * reference && 16 * seen >= reference;
+    // The slot's meshes this frame (read back for the log), and how often their brightness didn't explain the picture (below).
+    float dimmest_inverse = asfloat(edge_bounds.Load(brightness_dimmest + slot * 4));
+    float4 levels = float4(reference, seen, dimmest_inverse > 0 ? 1 / dimmest_inverse : 0, swapped ? 0 : params[slot * params_per_slot + 4].w);
+    params[slot * params_per_slot + 4] = levels;
     bool reference_jump = !swapped && reference > 0 && fitted > 0 && (reference > 16 * fitted || 16 * reference < fitted);
     if ((swapped && !fresh) || reference_jump)
     {
@@ -584,6 +595,15 @@ void solve(uint3 id : SV_DispatchThreadID)
         return;
     }
     if (flags & 16) quality = max(quality, detail_quality);
+    // Meshes of one texture far apart in brightness and no match: their brightness doesn't explain the picture (A400M: the
+    // pedestal readouts share the glareshield's texture but not its knob, and when they come into view the glareshield and
+    // radio pixels are read far too dark). Counted here; from a few frames on, each mesh gets a match of its own (see
+    // separate_matches in the C++).
+    if (seen * dimmest_inverse >= 4 && pooled_variance > 3e-6 && quality < 0.35)
+    {
+        levels.w += 1;
+        params[slot * params_per_slot + 4] = levels;
+    }
     float w = previous_a.w > 0 ? smoothing : 1;
     float q = previous_a.w != 0 ? lerp(previous_q.w, float(quality), smoothing) : float(quality);
     float dq = previous_a.w != 0 ? lerp(previous_detail.x, float(detail_quality), smoothing) : float(detail_quality);
@@ -1225,5 +1245,6 @@ void clear(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID)
         uint brightest = edge_bounds.Load(brightness_next + id.x * 4);
         if (brightest) edge_bounds.Store(brightness_base + id.x * 4, brightest);
         edge_bounds.Store(brightness_next + id.x * 4, 0);
+        edge_bounds.Store(brightness_dimmest + id.x * 4, 0);
     }
 }
