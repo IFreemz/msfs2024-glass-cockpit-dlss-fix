@@ -14,6 +14,18 @@ $cases = @(
     @{ Args = @('--vr', '--screen-t0'); Name = 'Offline VR screen-in-t0 variant test' }
     # Screen textures identified by descriptor tracking only (how AMD/Intel GPUs run).
     @{ Args = @('--track'); Name = 'Offline descriptor tracking test' }
+    # A virtual painting drawn by a translucent material the fix doesn't know (Fenix A320 readouts, "FCU readouts: New").
+    @{ Args = @('--painted'); Name = 'Offline painted screen test' }
+    @{ Args = @('--painted', '--track'); Name = 'Offline painted screen descriptor tracking test' }
+    @{ Args = @('--painted', '--depthless'); Name = 'Offline painted screen without depth test' }
+    # The same as a decal with no render target, written through a rasterizer-ordered UAV (how the sim draws those readouts).
+    @{ Args = @('--painted', '--rov'); Name = 'Offline painted decal test' }
+    # The painting drawn every frame from a copy of a gauge, both black again before the upscaler (the Fenix A320's readouts):
+    # the fix must copy the painting while the decal reads it.
+    @{ Args = @('--painted', '--rov', '--source'); Name = 'Offline painted decal from a gauge test' }
+    # The same with the painting's picture in alpha only, its colour black: the alpha is black laid over the lit backing,
+    # the digits are where it is low (how the Fenix's readouts painting holds it).
+    @{ Args = @('--painted', '--rov', '--source', '--alpha'); Name = 'Offline painted decal in alpha only test' }
     @{ Args = @('--fsr', '--vr', '--track'); Name = 'Offline FSR VR descriptor tracking test' }
     # Another mod (the RTX 40 MFG unlock) has redirected DLSS evaluate in a way that can't be hooked directly.
     @{ Args = @('--hotpatch'); Name = 'Offline redirected DLSS test' }

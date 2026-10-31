@@ -36,6 +36,7 @@ cbuffer Constants : register(b0)
     uint bounds_reset;       // stable screen edges: slots whose learnt edges are forgotten (another texture took the slot)
     uint diag_index;         // diagnostics: this upscaler call's number (screen pixels in the map are counted per call)
     float edge_trim;         // experimental: leave the outer edge_trim render pixels of each screen to the upscaler
+    uint inverted_slots;     // painted screens: slots read as 1 - texture (a painting whose alpha is black coverage, read as grey)
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -110,8 +111,10 @@ static bool sim_sampling = false;
 static float pixel_brightness = 1;
 float3 texture_tap(uint slot, float2 uv, float2 gx, float2 gy)
 {
-    if ((flags & 512) && !sim_sampling) return displays[NonUniformResourceIndex(slot)].SampleLevel(display_sampler, uv, 0).rgb;
-    return displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv, gx, gy).rgb;
+    float3 t = (flags & 512) && !sim_sampling ? displays[NonUniformResourceIndex(slot)].SampleLevel(display_sampler, uv, 0).rgb
+                                               : displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv, gx, gy).rgb;
+    // A painting whose alpha is black laid over its lit backing (the Fenix A320's readouts): the picture is where it isn't.
+    return (inverted_slots >> slot) & 1 ? 1 - t : t;
 }
 
 uint taps_for(uint slot, float2 fx, float2 fy)

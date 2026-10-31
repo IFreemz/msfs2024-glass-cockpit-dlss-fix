@@ -9,7 +9,9 @@
 //
 // 1. Every cockpit display draw (MSFS display shader, VS f102f1e3f5d9f66f / PS 37e87c938bc76310) is drawn once more
 //    into a private render-resolution "UV map" (uv, depth, display slot) using the game's own vertex shader,
-//    bindings and depth test. The bound display texture is identified by its descriptor bytes.
+//    bindings and depth test. The bound display texture is identified by its descriptor bytes. Screens that other
+//    (translucent) materials draw from a virtual painting, e.g. the Fenix A320's readouts with "FCU readouts: New", are
+//    found by their texture instead (see "Painted screens").
 // 2. Right after DLSS evaluate, on the same command list, compute passes fit each display's brightness against the
 //    DLSS input colour, sample the clean display texture at output resolution (jitter removed) and write it over the
 //    DLSS output. Dirt, glare and shadows on the glass come from the DLSS output itself, clamped to this frame's
@@ -33,6 +35,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
@@ -53,6 +56,7 @@
 #include <set>
 #include <vector>
 #include "pipeline_clone.hpp"
+#include "dxbc.hpp"
 #include "overlay_shaders.h"
 #include "host.hpp"
 #include "status.hpp"
@@ -85,6 +89,7 @@ size_t list_begin_render_pass_slot();
 size_t list_end_render_pass_slot();
 size_t list_set_scissor_rects_slot();
 size_t list_execute_indirect_slot();
+size_t list_resource_barrier_slot();
 size_t queue_execute_slot();
 size_t factory_create_swapchain_slot();
 size_t factory_create_swapchain_hwnd_slot();
@@ -164,6 +169,9 @@ std::atomic<int> calm_glass{0};
 // Occlusion check (experimental, on/off): screen pixels where the sim's depth buffer shows something closer to the camera
 // than the screen (a sidestick, a hand, the yoke drawn after the screen) are left to the upscaler.
 std::atomic<int> occlusion_check{1};
+// Painted screens (experimental, on by default): screens drawn by a translucent material from a virtual painting (see
+// "Painted screens" below), e.g. the Fenix A320's FCU and other readouts with "FCU readouts: New".
+std::atomic<int> painted_screens{1};
 // Depth direction of the cockpit display pipelines' depth test: 0 unknown, 1 reversed (closer = larger), 2 standard.
 std::atomic<int> depth_direction{0};
 std::atomic<uint32_t> bounds_reset{0}; // slots whose learnt edges must be forgotten (the slot took another texture)
@@ -259,7 +267,8 @@ struct Stats {
     std::atomic<uint64_t> repeated_calls{0}; // upscaler calls repeated for a frame already fixed (frame generation)
     std::atomic<uint64_t> replays{0}, variant_pending{0}, unknown_texture{0}, unsupported_draw{0},
         composites{0}, composite_skipped{0}, evaluations{0}, fsr_dispatches{0}, display_draws{0}, display_pipelines{0},
-        dlss_upscales{0}; // evaluations that upscale (have a render size); the others are DLSS Frame Generation
+        dlss_upscales{0}, // evaluations that upscale (have a render size); the others are DLSS Frame Generation
+        painted_pipelines{0}, painted_draws{0}, painted_replays{0}, painted_skipped{0};
 } stats;
 
 std::string file_version(const wchar_t* path) {
@@ -334,6 +343,13 @@ struct DisplayPipeline {
     bool vr = false;
     bool screen_t0 = false; // screen texture in t0 (display_ps_t0)
     bool brightness = false; // the standard display shader (flat or VR): its map variant records each mesh's brightness (b2)
+    // Painted screens: a translucent material pipeline that may draw a virtual painting (plain map shader, no colour variant).
+    bool painted = false;
+    bool rov = false; // painted: a decal with no render target, blended into the G-buffer through rasterizer-ordered UAVs
+    uint32_t textures = 0; // painted: the 2D texture registers its pixel shader declares (bit n: tn, n < 16)
+    uint32_t phase = 0; // painted: which frames it is looked at in (spread over the pipelines)
+    std::atomic<int> painted_register{-1}; // painted: where it was last seen reading a virtual painting (-1: not yet)
+    std::atomic<uint32_t> painted_misses{0}; // painted: draws looked at without finding one
     std::array<std::atomic<ID3D12PipelineState*>, slot_count> variants{};
     std::array<std::atomic<bool>, slot_count> requested{};
     std::atomic<ID3D12PipelineState*> colour_variant{}; // screen capture: writes the screen's colour at draw time
@@ -351,6 +367,29 @@ DisplayPipeline* find_pipeline(uint64_t handle) {
         if (key == handle) return pipeline_values[i];
     }
     return nullptr;
+}
+
+// Painted-screen candidates (translucent cockpit material pipelines): far more than display pipelines, and looked up on
+// every pipeline bind, so an open-addressing table. Entries are never removed; a pipeline created later at the same
+// address clears its entry's value (forget_painted).
+constexpr size_t painted_table_size = 8192, max_painted_pipelines = painted_table_size / 2;
+std::unique_ptr<std::atomic<uint64_t>[]> painted_keys = std::make_unique<std::atomic<uint64_t>[]>(painted_table_size);
+std::unique_ptr<std::atomic<DisplayPipeline*>[]> painted_values = std::make_unique<std::atomic<DisplayPipeline*>[]>(painted_table_size);
+size_t painted_slot(uint64_t handle) { return size_t((handle >> 4) * 0x9E3779B97F4A7C15ull >> 51) & (painted_table_size - 1); }
+DisplayPipeline* find_painted(uint64_t handle) {
+    for (size_t i = painted_slot(handle), n = 0; n < painted_table_size; i = (i + 1) & (painted_table_size - 1), ++n) {
+        const auto key = painted_keys[i].load(std::memory_order_acquire);
+        if (key == handle) return painted_values[i].load(std::memory_order_acquire);
+        if (!key) return nullptr;
+    }
+    return nullptr;
+}
+void forget_painted(uint64_t handle) {
+    for (size_t i = painted_slot(handle), n = 0; n < painted_table_size; i = (i + 1) & (painted_table_size - 1), ++n) {
+        const auto key = painted_keys[i].load(std::memory_order_acquire);
+        if (key == handle) { painted_values[i].store(nullptr, std::memory_order_release); return; } // the old record stays allocated: a list may still point at it
+        if (!key) return;
+    }
 }
 
 const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shaders{{
@@ -401,10 +440,19 @@ const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shader
     SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
 #undef SLOT
 }};
+const std::array<std::pair<const unsigned char*, size_t>, slot_count> map_shaders_plain{{
+#define SLOT(n) {map_ps_p_##n, sizeof(map_ps_p_##n)},
+    SLOT(0) SLOT(1) SLOT(2) SLOT(3) SLOT(4) SLOT(5) SLOT(6) SLOT(7)
+    SLOT(8) SLOT(9) SLOT(10) SLOT(11) SLOT(12) SLOT(13) SLOT(14) SLOT(15)
+    SLOT(16) SLOT(17) SLOT(18) SLOT(19) SLOT(20) SLOT(21) SLOT(22) SLOT(23)
+    SLOT(24) SLOT(25) SLOT(26) SLOT(27) SLOT(28) SLOT(29) SLOT(30) SLOT(31)
+#undef SLOT
+}};
 const std::pair<const unsigned char*, size_t>& map_shader(bool vr, bool screen_t0, unsigned slot) {
     return vr ? (screen_t0 ? map_shaders_vr_t0[slot] : map_shaders_vr[slot]) : screen_t0 ? map_shaders_t0[slot] : map_shaders[slot];
 }
 const std::pair<const unsigned char*, size_t>& map_shader(const DisplayPipeline& pipeline, unsigned slot) {
+    if (pipeline.painted) return map_shaders_plain[slot];
     if (pipeline.brightness) return pipeline.vr ? map_shaders_vr_brightness[slot] : map_shaders_brightness[slot];
     return map_shader(pipeline.vr, pipeline.screen_t0, slot);
 }
@@ -423,7 +471,7 @@ void worker() {
         const std::pair<const unsigned char*, size_t> shader = colour
             ? (pipeline->screen_t0 ? std::pair<const unsigned char*, size_t>{map_colour_ps_t0, sizeof(map_colour_ps_t0)} : std::pair<const unsigned char*, size_t>{map_colour_ps, sizeof(map_colour_ps)})
             : map_shader(*pipeline, slot);
-        if (!glass::clone_pipeline(pipeline->desc, {shader.first, shader.second}, clone)) {
+        if (!glass::clone_pipeline(pipeline->desc, {shader.first, shader.second}, clone, pipeline->painted)) {
             log("variant_rejected slot=%u", slot); continue;
         }
         ID3D12PipelineState* created = nullptr;
@@ -443,7 +491,7 @@ void worker() {
 }
 ID3D12PipelineState* colour_variant(DisplayPipeline* pipeline) {
     if (auto ready = pipeline->colour_variant.load(std::memory_order_acquire)) return ready;
-    if (!pipeline->vr && !pipeline->colour_requested.exchange(true)) {
+    if (!pipeline->vr && !pipeline->painted && !pipeline->colour_requested.exchange(true)) { // painted: its texture's register varies
         { std::lock_guard lock(work_mutex); work.emplace_back(pipeline, slot_count); }
         work_ready.notify_one();
     }
@@ -461,25 +509,12 @@ ID3D12PipelineState* variant(DisplayPipeline* pipeline, unsigned slot) {
 
 std::shared_mutex hashes_mutex;
 std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> pipeline_hashes; // pso -> vs, ps (probes)
+// Every pipeline as the painted probe sees it (see painted_probe), under hashes_mutex.
+struct PipelineInfo { uint32_t textures = 0; bool cockpit_inputs = false, blended = false, depth = false, stencil = false; UINT targets = 0; bool uavs = false; };
+std::unordered_map<uint64_t, PipelineInfo> pipeline_infos;
 
-void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D12PipelineState* pso,
-    const D3D12_VIEW_INSTANCING_DESC& views = {}) noexcept try {
-    if (!desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode) return;
-    const auto ps = shader_hash(desc.PS.pShaderBytecode, desc.PS.BytecodeLength), vs = shader_hash(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
-    {
-        std::unique_lock lock(hashes_mutex);
-        if (pipeline_hashes.size() < 65536) pipeline_hashes[reinterpret_cast<uint64_t>(pso)] = {vs, ps};
-    }
-    if (views.ViewInstanceCount > 1) return; // view-instanced pipelines: not how MSFS draws its displays
-    const bool vr = vs == vr_display_vs && (ps == vr_display_ps || ps == vr_display_ps_t0);
-    const bool screen_t0 = (ps == display_ps_t0 && vs == display_vs) || (ps == vr_display_ps_t0 && vs == vr_display_vs);
-    const bool alike = vs == display_vs && std::find(std::begin(display_ps_alike), std::end(display_ps_alike), ps) != std::end(display_ps_alike);
-    if (!vr && !screen_t0 && !alike && (ps != display_ps || vs != display_vs)) return;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC probe{};
-    const auto& shader = map_shader(vr, screen_t0, 0);
-    if (!glass::clone_pipeline(desc, {shader.first, shader.second}, probe)) {
-        log("pipeline_unsupported pso=%p", pso); return;
-    }
+// Deep copy of the game's description (its VS and input layout; the pixel shader is the map shader's, set per variant).
+DisplayPipeline* copy_pipeline(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
     auto copy = new DisplayPipeline;
     copy->desc = desc;
     copy->vs.assign(static_cast<const uint8_t*>(desc.VS.pShaderBytecode), static_cast<const uint8_t*>(desc.VS.pShaderBytecode) + desc.VS.BytecodeLength);
@@ -493,6 +528,103 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     copy->desc.InputLayout = {copy->elements.data(), UINT(copy->elements.size())};
     copy->root = desc.pRootSignature;
     copy->device = device;
+    return copy;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Painted screens. MSFS also shows a gauge through a "virtual painting" ([VPaintingNN] in an aircraft's panel.cfg): an
+// HTML page rendered into a texture of its own, named like a screen material ("$Name"). The Fenix A320's readouts do this
+// with "FCU readouts: New": its Readouts.html shows the live view of the gauge that draws the old readouts, and a
+// translucent, emissive decal material ($A320_Readouts, Part_Exterior_Readouts) draws that texture over a static LCD.
+// MSFS 2024 draws such geometry decals with no render target at all: the decal's pixel shader (ph_base_gbuffer, e.g.
+// bae2397dcbe5ac3e) blends into the G-buffer through rasterizer-ordered UAVs, the painting as its base colour in t0.
+// That material is not the display shader, and its texture sits in another register than t1, varying with the shader
+// permutation. So for every translucent pipeline (blended, or such a decal) whose pixel shader takes the cockpit vertex
+// shader's output, the draws are looked at for a virtual painting in the 2D texture registers the shader declares; the map
+// is drawn with a plain map shader (no alpha test: the material's constants sit elsewhere too), a decal's at the size its
+// scissor covers. Virtual paintings are told from gauge render targets by their full chain of mip levels (gauges have
+// five). Several readouts share one painting at different brightness (one light knob each), so each mesh gets its own
+// slot and brightness match.
+bool cockpit_material_inputs(const D3D12_SHADER_BYTECODE& ps) {
+    // The pixel shader's inputs in the order the map shader takes them (CockpitVertex); SV_IsFrontFace is the system's.
+    static const std::pair<const char*, uint32_t> expected[]{{"PREVIOUS_POSITION", 0}, {"TEXCOORD", 1}, {"TEXSPACE_MAT", 2},
+        {"TEXSPACE_MAT", 3}, {"TEXSPACE_MAT", 4}, {"SV_Position", 5}, {"INSTANCE_ID", 6}, {"COLOR_RGB", 7}, {"COLOR_ALPHA", 7}};
+    std::vector<glass::SignatureElement> inputs;
+    if (!glass::input_signature(ps.pShaderBytecode, ps.BytecodeLength, inputs)) return false;
+    size_t n = 0;
+    for (const auto& e : inputs) {
+        if (e.semantic == "SV_IsFrontFace") continue;
+        if (n >= std::size(expected) || _stricmp(e.semantic.c_str(), expected[n].first) || e.reg != expected[n].second) return false;
+        ++n;
+    }
+    return n == std::size(expected);
+}
+bool blended(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+    bool any = false;
+    for (UINT i = 0; i < (desc.BlendState.IndependentBlendEnable ? std::min<UINT>(desc.NumRenderTargets, 8) : 1); ++i) any |= desc.BlendState.RenderTarget[i].BlendEnable != 0;
+    return any;
+}
+void painted_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D12PipelineState* pso, uint64_t ps, const PipelineInfo& info) {
+    // Translucent: blended into its render targets, or (decals) into the G-buffer through UAVs with no render target.
+    // Opaque materials are the display shader's own, depth-only passes (shadows) no screen.
+    const bool rov = desc.NumRenderTargets == 0 && info.uavs;
+    if (!rov && !info.blended) return;
+    const uint32_t textures = info.textures & 0xffff;
+    if (!textures || !info.cockpit_inputs) return;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC probe{};
+    if (!glass::clone_pipeline(desc, {map_shaders_plain[0].first, map_shaders_plain[0].second}, probe, true)) {
+        static std::atomic<int> logged{0};
+        if (logged++ < 16) log("painted screens: translucent cockpit material pipeline pso=%p ps=%016llx can't be mapped (depth=%d stencil=%d depth_format=%u samples=%u targets=%u rov=%d topology=%u gs=%d)",
+            pso, ps, desc.DepthStencilState.DepthEnable, desc.DepthStencilState.StencilEnable, unsigned(desc.DSVFormat), desc.SampleDesc.Count, desc.NumRenderTargets,
+            rov, unsigned(desc.PrimitiveTopologyType), desc.GS.BytecodeLength != 0);
+        return;
+    }
+    auto copy = copy_pipeline(device, desc);
+    copy->painted = true;
+    copy->rov = rov;
+    copy->textures = textures;
+    copy->phase = uint32_t((reinterpret_cast<uint64_t>(pso) >> 6) * 0x9E3779B1u);
+    std::lock_guard lock(pipelines_mutex);
+    if (stats.painted_pipelines.load() >= max_painted_pipelines) { LOG_ONCE("painted screens: %llu candidate pipelines, no more", uint64_t(max_painted_pipelines)); delete copy; return; }
+    const auto key = reinterpret_cast<uint64_t>(pso);
+    for (size_t i = painted_slot(key);; i = (i + 1) & (painted_table_size - 1)) {
+        const auto current = painted_keys[i].load(std::memory_order_relaxed);
+        if (current && current != key) continue;
+        painted_values[i].store(copy, std::memory_order_release); // a recycled address keeps its key: the value is replaced
+        if (!current) painted_keys[i].store(key, std::memory_order_release);
+        break;
+    }
+    const auto n = ++stats.painted_pipelines;
+    if ((n & (n - 1)) == 0) log("painted screens: %llu candidate pipelines (translucent cockpit materials; latest pso=%p textures=0x%x rov=%d)", n, pso, textures, rov);
+    static std::atomic<int> rov_logged{0};
+    if (rov && rov_logged++ < 8) log("painted screens: decal pipeline pso=%p ps=%016llx (no render target, blended into the G-buffer through UAVs) textures=0x%x", pso, ps, textures);
+}
+
+void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D12PipelineState* pso,
+    const D3D12_VIEW_INSTANCING_DESC& views = {}) noexcept try {
+    if (!desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode) return;
+    const auto ps = shader_hash(desc.PS.pShaderBytecode, desc.PS.BytecodeLength), vs = shader_hash(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
+    const PipelineInfo info{glass::declared_textures(desc.PS.pShaderBytecode, desc.PS.BytecodeLength), cockpit_material_inputs(desc.PS), blended(desc),
+        desc.DepthStencilState.DepthEnable != 0, desc.DepthStencilState.StencilEnable != 0, desc.NumRenderTargets,
+        glass::declares_uavs(desc.PS.pShaderBytecode, desc.PS.BytecodeLength)};
+    {
+        std::unique_lock lock(hashes_mutex);
+        if (pipeline_hashes.size() < 65536) pipeline_hashes[reinterpret_cast<uint64_t>(pso)] = {vs, ps};
+        if (pipeline_infos.size() < 65536) pipeline_infos[reinterpret_cast<uint64_t>(pso)] = info;
+        else if (const auto found = pipeline_infos.find(reinterpret_cast<uint64_t>(pso)); found != pipeline_infos.end()) found->second = info;
+    }
+    forget_painted(reinterpret_cast<uint64_t>(pso)); // a new pipeline at a released one's address
+    if (views.ViewInstanceCount > 1) return; // view-instanced pipelines: not how MSFS draws its displays
+    const bool vr = vs == vr_display_vs && (ps == vr_display_ps || ps == vr_display_ps_t0);
+    const bool screen_t0 = (ps == display_ps_t0 && vs == display_vs) || (ps == vr_display_ps_t0 && vs == vr_display_vs);
+    const bool alike = vs == display_vs && std::find(std::begin(display_ps_alike), std::end(display_ps_alike), ps) != std::end(display_ps_alike);
+    if (!vr && !screen_t0 && !alike && (ps != display_ps || vs != display_vs)) { painted_created(device, desc, pso, ps, info); return; }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC probe{};
+    const auto& shader = map_shader(vr, screen_t0, 0);
+    if (!glass::clone_pipeline(desc, {shader.first, shader.second}, probe)) {
+        log("pipeline_unsupported pso=%p", pso); return;
+    }
+    auto copy = copy_pipeline(device, desc);
     copy->vr = vr;
     copy->screen_t0 = screen_t0;
     copy->brightness = !screen_t0 && (vr ? ps == vr_display_ps : ps == display_ps);
@@ -577,9 +709,130 @@ std::unordered_map<ID3D12Resource*, std::pair<UINT, UINT>> view_mips;
 // size only, their smaller mip levels flicker as the view moves. Off: the game's own mip levels, as before 0.8.4.
 std::atomic<bool> mip0_only{true};
 std::array<std::atomic<uint64_t>, slot_count> slot_last_used{};
+// Painted screens: the mesh a slot belongs to (0: a display slot, one per texture; see "Painted screens").
+std::array<std::atomic<uint64_t>, slot_count> slot_meshes{};
 std::atomic<uint64_t> present_count{0};
 std::mutex slots_mutex;
 UINT descriptor_size = 0;
+
+// Painted screens: the views of virtual paintings (screen texture candidates with a full mip chain), read without a lock
+// on every look at a painted-screen candidate's draw: an immutable snapshot, replaced on change (rare: when an aircraft
+// loads), the old ones kept since a draw may still be reading one.
+struct PaintedView { Signature signature; ID3D12Resource* resource = nullptr; DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; };
+struct PaintedViews { std::vector<PaintedView> views; };
+constexpr size_t max_painted_views = 256;
+std::mutex painted_views_mutex;
+std::vector<std::unique_ptr<PaintedViews>> painted_views_storage;
+std::atomic<const PaintedViews*> painted_views{nullptr};
+bool full_mip_chain(const D3D12_RESOURCE_DESC& r) {
+    UINT levels = 1;
+    for (uint64_t size = std::max<uint64_t>(r.Width, r.Height); size > 1; size >>= 1) ++levels;
+    return r.MipLevels >= 2 && r.MipLevels == levels;
+}
+template <class Change> void change_painted_views(Change&& change) {
+    std::lock_guard lock(painted_views_mutex);
+    auto next = std::make_unique<PaintedViews>();
+    if (const auto current = painted_views.load()) next->views = current->views;
+    if (!change(next->views)) return;
+    painted_views.store(next.get(), std::memory_order_release);
+    painted_views_storage.push_back(std::move(next));
+}
+void add_painted_view(const Signature& signature, ID3D12Resource* resource, DXGI_FORMAT format) {
+    change_painted_views([&](std::vector<PaintedView>& views) {
+        for (auto& v : views)
+            if (v.signature == signature) {
+                if (v.resource == resource && v.format == format) return false; // the same view made again: nothing to publish
+                v = {signature, resource, format};
+                return true;
+            }
+        if (views.size() >= max_painted_views) { LOG_ONCE("painted screens: %llu painting views, no more", uint64_t(max_painted_views)); return false; }
+        const bool known = std::any_of(views.begin(), views.end(), [&](const PaintedView& v) { return v.resource == resource; });
+        views.push_back({signature, resource, format});
+        if (!known) { // each painting once (a painting can be viewed in more than one format)
+            const auto d = resource->GetDesc();
+            log("painted screens: virtual painting resource=%p %llux%u mips=%u format=%u (%llu views of paintings)", resource, d.Width, d.Height,
+                unsigned(d.MipLevels), unsigned(format), uint64_t(views.size()));
+        }
+        return true;
+    });
+}
+void forget_painted_views(ID3D12Resource* resource) {
+    if (const auto current = painted_views.load(); !current || std::none_of(current->views.begin(), current->views.end(), [&](const PaintedView& v) { return v.resource == resource; })) return;
+    change_painted_views([&](std::vector<PaintedView>& views) { std::erase_if(views, [&](const PaintedView& v) { return v.resource == resource; }); return true; });
+}
+bool is_painting(ID3D12Resource* resource) {
+    const auto views = painted_views.load(std::memory_order_acquire);
+    return resource && views && std::any_of(views->views.begin(), views->views.end(), [&](const PaintedView& v) { return v.resource == resource; });
+}
+// Painted screens: a virtual painting only holds its picture while the cockpit is drawn. After the upscaler the fix reads
+// it black (the Fenix A320's readouts), as it does the textures the sim's HTML renderer draws it from. So each painting the
+// fix maps is copied into a texture of the fix's own right before the first decal that shows it in each command list, and
+// the fix reads that copy after the upscaler. The copy needs the state the painting is in there: the last shader-readable state
+// the sim's barriers left each of its mip levels in (the decal reads it with a pixel shader). Some paintings hold their
+// picture in alpha only, their colour all black (the Fenix A320's readouts): the decal lays that black over the lit
+// backing of the readouts as far as the alpha goes, so the digits are where the alpha is low. Read back once, such a copy
+// is read as 1 - alpha, a grey picture (the brightness match then finds the colour).
+struct PaintingCopy {
+    std::atomic<ID3D12Resource*> painting{nullptr}; // null: free (its painting was destroyed)
+    ComPtr<ID3D12Resource> copy; // kept for the fix's lifetime: the GPU or a slot may still read it
+    D3D12_RESOURCE_DESC desc{};
+    std::array<std::atomic<uint32_t>, 16> states{}; // per mip level; 0: none seen yet
+    std::atomic<uint64_t> copied_recording{UINT64_MAX}; // the list recording it was last copied in (see ListState::recording)
+    std::atomic<bool> copied_once{false}, waiting_logged{false};
+    std::atomic<int> alpha_only{-1}; // the picture is in alpha only: 1, in colour: 0, not read back yet (or all black): -1
+    // The copy's level 0 read back (see painting_readbacks) until it shows where the picture is; released then. Only
+    // 8-bit RGBA/BGRA paintings (alpha in the top byte); others are read as they are, in colour.
+    ComPtr<ID3D12Resource> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT readback_footprint{};
+    std::atomic<uint64_t> readback_present{0}, next_readback{0}; // readback_present: when the pending one was recorded (0: none)
+};
+constexpr int max_painting_copies = 16;
+std::array<PaintingCopy, max_painting_copies> painting_copies;
+std::atomic<int> painting_copy_count{0}; // entries made (in use or free)
+std::mutex painting_copies_mutex; // making or reusing an entry
+// Whether a slot's texture is the copy of a painting whose picture is in alpha only (see PaintingCopy).
+bool alpha_only_copy(ID3D12Resource* resource) {
+    const int n = painting_copy_count.load(std::memory_order_acquire);
+    for (int c = 0; c < n; ++c) if (painting_copies[c].copy.Get() == resource) return painting_copies[c].alpha_only.load(std::memory_order_relaxed) == 1;
+    return false;
+}
+constexpr uint32_t written_states = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE |
+    D3D12_RESOURCE_STATE_STREAM_OUT | D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_RESOLVE_DEST;
+// The sim's resource barriers: the states its copied paintings are left in.
+void barriers_recorded(UINT count, const D3D12_RESOURCE_BARRIER* barriers) noexcept {
+    const int n = painting_copy_count.load(std::memory_order_acquire);
+    if (!n || !barriers) return;
+    for (UINT i = 0; i < count; ++i) {
+        const auto& b = barriers[i];
+        if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !b.Transition.pResource) continue;
+        const uint32_t after = b.Transition.StateAfter;
+        if (!(after & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) || (after & written_states)) continue;
+        for (int c = 0; c < n; ++c) {
+            auto& entry = painting_copies[c];
+            if (entry.painting.load(std::memory_order_acquire) != b.Transition.pResource) continue;
+            const UINT mips = std::min<UINT>(entry.desc.MipLevels, UINT(entry.states.size())), sub = b.Transition.Subresource;
+            for (UINT m = 0; m < mips; ++m) {
+                if (sub != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && sub != m) continue;
+                if (entry.states[m].exchange(after, std::memory_order_relaxed) == after) continue;
+                static std::atomic<int> logged{0};
+                if (logged++ < 16) log("painted screens: painting %p mip %u left in state 0x%x by the sim (subresource %s)", b.Transition.pResource, m, after,
+                    sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ? "all" : "one");
+            }
+            break;
+        }
+    }
+}
+// A destroyed painting: its entry is free again, and no slot names its copy any more.
+void forget_painting_copy(ID3D12Resource* painting) {
+    const int n = painting_copy_count.load(std::memory_order_acquire);
+    for (int c = 0; c < n; ++c) {
+        auto& entry = painting_copies[c];
+        if (entry.painting.load(std::memory_order_acquire) != painting) continue;
+        std::lock_guard lock(painting_copies_mutex);
+        entry.painting = nullptr;
+        for (auto& slot : slot_resources) { auto expected = entry.copy.Get(); slot.compare_exchange_strong(expected, nullptr); }
+    }
+}
 
 // Descriptor tracking (all GPUs but NVIDIA). AMD's descriptors contain their own address, so a copied descriptor's
 // bytes never equal the original's. Instead the views' addresses are followed through the game's descriptor copies.
@@ -804,10 +1057,18 @@ DXGI_FORMAT typed(DXGI_FORMAT format) {
 }
 bool typeless(DXGI_FORMAT format) { return typed(format) != format; }
 
-int slot_of(ID3D12Resource* resource, DXGI_FORMAT format) {
+// mesh: 0 for a display texture (one slot per texture); a painted screen's mesh gets a slot of its own (see "Painted screens").
+int slot_of(ID3D12Resource* resource, DXGI_FORMAT format, uint64_t mesh = 0) {
     const auto now = present_count.load(std::memory_order_relaxed);
-    for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() == resource) { slot_last_used[i] = now; return int(i); }
+    for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() == resource && slot_meshes[i].load() == mesh) { slot_last_used[i] = now; return int(i); }
     std::lock_guard lock(slots_mutex);
+    if (mesh) {
+        // Painted meshes never take more than a quarter of the slots, so the cockpit screens always find theirs.
+        constexpr unsigned max_painted_slots = slot_count / 4;
+        unsigned used = 0;
+        for (unsigned i = 0; i < slot_count; ++i) used += slot_resources[i].load() && slot_meshes[i].load() && now <= slot_last_used[i] + 120;
+        if (used >= max_painted_slots) { LOG_ONCE("painted screens: %u meshes in use, more are left to the upscaler", max_painted_slots); return -1; }
+    }
     // Free slot first, else the least recently used one that has not been drawn for ~3 s (aircraft changes, closed pages).
     int chosen = -1;
     for (unsigned i = 0; i < slot_count && chosen < 0; ++i) if (!slot_resources[i].load()) chosen = int(i);
@@ -823,11 +1084,12 @@ int slot_of(ID3D12Resource* resource, DXGI_FORMAT format) {
     bool known = false;
     { std::lock_guard view_lock(view_mips_mutex); if (const auto found = view_mips.find(resource); found != view_mips.end()) { mips = found->second; known = true; } }
     slot_first_mip[chosen] = mips.first; slot_mip_count[chosen] = mips.second;
+    slot_meshes[chosen] = mesh;
     slot_resources[chosen] = resource;
     bounds_reset.fetch_or(1u << chosen);
     const auto d = resource->GetDesc();
-    log("display_slot slot=%d resource=%p w=%llu h=%u mips=%u format=%u game_view_mips=%u+%d%s", chosen, resource, d.Width, d.Height, d.MipLevels, unsigned(format),
-        mips.first, int(mips.second), known ? "" : " (view not seen)");
+    log("%s slot=%d resource=%p w=%llu h=%u mips=%u format=%u game_view_mips=%u+%d%s", mesh ? "painted_slot" : "display_slot", chosen, resource, d.Width, d.Height,
+        d.MipLevels, unsigned(format), mips.first, int(mips.second), known ? "" : " (view not seen)");
     return chosen;
 }
 
@@ -876,6 +1138,8 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     std::vector<std::unique_ptr<Map>> maps;
     std::shared_mutex layouts_mutex;
     std::unordered_map<uint64_t, std::array<std::pair<uint32_t, uint32_t>, 2>> display_bindings; // layout -> root index, table offset of t0 and t1
+    // layout -> root index, table offset of the pixel shader's t0-t15 (space 0; root index UINT32_MAX: not in a table). Painted screens.
+    std::unordered_map<uint64_t, std::array<std::pair<uint32_t, uint32_t>, 16>> texture_bindings;
     struct SrvRange { uint32_t param, offset, reg, space, count; };
     std::unordered_map<uint64_t, std::vector<SrvRange>> srv_ranges; // layout -> pixel shader texture ranges (screen probe)
     std::mutex composite_mutex;
@@ -904,6 +1168,7 @@ struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
     ID3D12GraphicsCommandList* native = nullptr;
     DeviceState* device = nullptr; // null: a list of another device (e.g. the sim's software device), not followed
     DisplayPipeline* display = nullptr;
+    DisplayPipeline* painted = nullptr; // a painted-screen candidate pipeline is bound (see "Painted screens")
     uint64_t pso = 0, layout = 0;
     std::array<uint64_t, 64> tables{};
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> targets{};
@@ -914,7 +1179,9 @@ struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
     D3D12_RECT scissor{}; // the game's first scissor rectangle (pixel probe restores it)
     uint64_t pass_rt0 = 0; UINT pass_targets = 0; // inside a render pass: its first render target (pixel probe)
     bool scissor_known = false;
+    uint64_t recording = 0; // which recording of the list this is (painted screens: a painting is copied once in each)
 };
+std::atomic<uint64_t> list_recordings{0};
 
 Map* map_for(DeviceState& device, UINT width, UINT height, UINT layers) {
     std::lock_guard lock(device.maps_mutex);
@@ -1061,6 +1328,8 @@ template <class Parameter> void layout_created(DeviceState& state, uint64_t layo
     // Where t0 and t1 (pixel shader, space 0) sit: the display shader reads its screen from t1, the variant from t0.
     std::array<std::pair<uint32_t, uint32_t>, 2> bindings{};
     std::array<bool, 2> have{};
+    std::array<std::pair<uint32_t, uint32_t>, 16> textures; // t0-t15, for painted screens
+    textures.fill({UINT32_MAX, 0});
     for (UINT i = 0; i < count && i < 64; ++i) {
         const auto& p = params[i];
         if (p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
@@ -1078,9 +1347,16 @@ template <class Parameter> void layout_created(DeviceState& state, uint64_t layo
                     bindings[reg] = {i, offset + reg - r.BaseShaderRegister};
                     have[reg] = true;
                 }
+            for (uint32_t reg = 0; reg < textures.size(); ++reg)
+                if (textures[reg].first == UINT32_MAX && r.BaseShaderRegister <= reg && uint64_t(r.BaseShaderRegister) + r.NumDescriptors > reg)
+                    textures[reg] = {i, offset + reg - r.BaseShaderRegister};
         }
     }
-    if (!found.empty()) { std::unique_lock lock(state.layouts_mutex); state.srv_ranges[layout] = std::move(found); }
+    if (!found.empty()) {
+        std::unique_lock lock(state.layouts_mutex);
+        state.srv_ranges[layout] = std::move(found);
+        state.texture_bindings[layout] = textures;
+    }
     if (have[1]) { // every cockpit display layout has t1; t0 is checked when used
         std::unique_lock lock(state.layouts_mutex);
         state.display_bindings[layout] = have[0] ? bindings : std::array<std::pair<uint32_t, uint32_t>, 2>{{{UINT32_MAX, 0}, bindings[1]}};
@@ -1111,6 +1387,8 @@ void texture_destroyed(ID3D12Resource* native) {
     { std::lock_guard view_lock(view_mips_mutex); view_mips.erase(native); }
     std::erase_if(signatures, [&](const auto& p) { return p.second.resource == native; });
     if (track_descriptors.load(std::memory_order_relaxed)) forget_texture_ids(native);
+    forget_painted_views(native);
+    forget_painting_copy(native);
     for (auto& slot : slot_resources) { auto expected = native; slot.compare_exchange_strong(expected, nullptr); }
 }
 struct __declspec(uuid("5C0E6A2D-3B1F-4E8A-9D47-0F2B8C61A3E9")) ReleaseNotifier final : IUnknown {
@@ -1200,11 +1478,12 @@ void view_created(ID3D12Resource* native, const D3D12_SHADER_RESOURCE_VIEW_DESC*
         state->native->CreateShaderResourceView(native, default_view ? nullptr : &srv, slot);
         readable = read_bytes(reinterpret_cast<const void*>(slot.ptr), s.bytes.data(), descriptor_size);
     }
-    bool first_view = false;
+    bool first_view = false, recorded = false;
     {
         std::unique_lock lock(textures_mutex);
         if (readable && signatures.size() < 16384) {
             signatures[s] = {native, format};
+            recorded = true;
             static std::atomic<int> logged{0};
             if (logged++ < 40) log("texture_candidate resource=%p w=%llu h=%u mips=%u format=%u default_view=%d", native, r.Width, r.Height,
                 unsigned(r.MipLevels), unsigned(format), default_view);
@@ -1212,6 +1491,10 @@ void view_created(ID3D12Resource* native, const D3D12_SHADER_RESOURCE_VIEW_DESC*
         first_view = known_textures.insert(native).second;
     }
     if (first_view) notify_on_destroy(native);
+    // A virtual painting (gauges have five mip levels), seen as a material sees it: all its mip levels. The sim also makes
+    // a view per mip level of such textures (to fill the smaller levels); those are no material's.
+    const bool whole = default_view || (srv.Texture2D.MostDetailedMip == 0 && (srv.Texture2D.MipLevels == UINT(-1) || srv.Texture2D.MipLevels >= r.MipLevels));
+    if (recorded && whole && full_mip_chain(r)) add_painted_view(s, native, format);
 } catch (...) {}
 
 // Command lists: the state each one has bound (what ReShade kept per list). Looked up on every hooked call, so first a
@@ -1269,10 +1552,11 @@ ListState* list_state(ID3D12GraphicsCommandList* list) {
 
 void bind_pipeline(ListState& state, ID3D12PipelineState* pipeline) {
     state.pso = reinterpret_cast<uint64_t>(pipeline); state.display = find_pipeline(state.pso);
+    state.painted = state.display ? nullptr : find_painted(state.pso);
 }
 void restart(ListState& state, DeviceState* device, ID3D12PipelineState* initial) {
     const auto list = state.native;
-    state = ListState{}; state.native = list; state.device = device; state.generation = generation;
+    state = ListState{}; state.native = list; state.device = device; state.generation = generation; state.recording = ++list_recordings;
     if (device && initial && enabled.load(std::memory_order_relaxed)) bind_pipeline(state, initial);
 }
 // A new list (possibly at the address of a destroyed one): nothing bound yet, and which device it belongs to.
@@ -1333,6 +1617,21 @@ void pass_ended(ID3D12GraphicsCommandList* list) {
 }
 
 extern std::atomic<int> capture_requested; // screen capture (below)
+// width, height: the map's size for a draw with no render target (painted decals); 0: the render target's.
+bool draw_map(ListState& state, const glass::Draw& draw, DisplayPipeline* pipeline, unsigned slot, UINT width = 0, UINT height = 0);
+// Render sizes the upscaler was last called with (packed w << 32 | h): what a painted decal's map is drawn at, as it has no
+// render target to tell its size by (it draws into the G-buffer through UAVs).
+std::array<std::atomic<uint64_t>, 4> upscaler_render_sizes{};
+std::atomic<uint32_t> upscaler_render_size_next{0};
+void note_upscaler_render_size(unsigned w, unsigned h) {
+    const uint64_t size = (uint64_t(w) << 32) | h;
+    for (const auto& s : upscaler_render_sizes) if (s.load(std::memory_order_relaxed) == size) return;
+    upscaler_render_sizes[upscaler_render_size_next++ % upscaler_render_sizes.size()] = size;
+}
+bool upscaler_render_size(unsigned w, unsigned h) {
+    const uint64_t size = (uint64_t(w) << 32) | h;
+    return size && std::any_of(upscaler_render_sizes.begin(), upscaler_render_sizes.end(), [&](const auto& s) { return s.load(std::memory_order_relaxed) == size; });
+}
 // Returns true when it issued the game's draw itself (the original call is then skipped).
 bool replay(ListState& state, const glass::Draw& draw) noexcept try {
     Internal internal; // the draws below go through the hooked functions
@@ -1393,17 +1692,30 @@ bool replay(ListState& state, const glass::Draw& draw) noexcept try {
             log("screen_draw slot=%d texture=%p %s count=%u first=%u base_vertex=%d instances=%u", slot, texture.resource, draw.indexed ? "indexed" : "plain",
                 draw.count, draw.first, draw.base_vertex, draw.instances);
     }
-    auto pso = variant(state.display, unsigned(slot));
+    return draw_map(state, draw, state.display, unsigned(slot));
+} catch (...) { note(stats.unsupported_draw, "exception"); return false; }
+
+// The game's draw, then the map of the screen in `slot` against the depth it wrote. Returns true when the game's draw was
+// issued here.
+bool draw_map(ListState& state, const glass::Draw& draw, DisplayPipeline* pipeline, unsigned slot, UINT width, UINT height) try {
+    Internal internal; // the draws below go through the hooked functions
+    auto& device = *state.device;
+    auto pso = variant(pipeline, slot);
     if (!pso) return false;
-    const auto target = rtv_resource(state.targets[0]);
-    if (!target) { note(stats.unsupported_draw, "target_unknown"); return false; }
-    const auto desc = target->GetDesc();
+    D3D12_RESOURCE_DESC desc{};
+    if (width) { desc.Width = width; desc.Height = height; desc.DepthOrArraySize = 1; }
+    else {
+        const auto target = rtv_resource(state.targets[0]);
+        if (!target) { note(stats.unsupported_draw, "target_unknown"); return false; }
+        desc = target->GetDesc();
+    }
     // VR draws all views at once into a layered target; the map gets the same layers.
-    const UINT layers = state.display->vr ? std::clamp<UINT>(desc.DepthOrArraySize, 1, 8) : 1;
+    const UINT layers = pipeline->vr ? std::clamp<UINT>(desc.DepthOrArraySize, 1, 8) : 1;
     auto map = map_for(device, UINT(desc.Width), desc.Height, layers);
     if (!map) { note(stats.unsupported_draw, "map_allocation"); return false; }
     auto native = state.native;
     const auto rtv = map->rtv->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE* depth = state.depth.ptr ? &state.depth : nullptr; // none: a painted screen without a depth test
     {
         std::lock_guard lock(device.maps_mutex);
         if (!map->initialised) {
@@ -1417,13 +1729,13 @@ bool replay(ListState& state, const glass::Draw& draw) noexcept try {
     else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
     // Viewport, scissor, root arguments and mesh buffers stay exactly as the game bound them.
     native->SetPipelineState(pso);
-    native->OMSetRenderTargets(1, &rtv, FALSE, &state.depth);
+    native->OMSetRenderTargets(1, &rtv, FALSE, depth);
     if (draw.indexed) native->DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
     else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
     // Screen capture: the screen texture's colour as the sim draws it (it can differ from what the fix reads later).
     // Only at the upscaler's render size: the sim also draws the screens into smaller targets (reflections).
     if (capture_requested.load(std::memory_order_relaxed) > 0 && layers == 1 && desc.Width == last_render_w.load() && desc.Height == last_render_h.load()) {
-        if (auto colour = colour_variant(state.display)) {
+        if (auto colour = colour_variant(pipeline)) {
             D3D12_CPU_DESCRIPTOR_HANDLE colour_rtv{};
             {
                 std::lock_guard lock(device.draw_colour_mutex);
@@ -1450,14 +1762,14 @@ bool replay(ListState& state, const glass::Draw& draw) noexcept try {
             }
             if (colour_rtv.ptr) {
                 native->SetPipelineState(colour);
-                native->OMSetRenderTargets(1, &colour_rtv, FALSE, &state.depth);
+                native->OMSetRenderTargets(1, &colour_rtv, FALSE, depth);
                 if (draw.indexed) native->DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
                 else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
             }
         }
     }
     native->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pso));
-    native->OMSetRenderTargets(state.target_count, state.targets.data(), FALSE, &state.depth);
+    native->OMSetRenderTargets(state.target_count, state.targets.data(), FALSE, depth);
     transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, map_resting);
     map->views = map->layers;
     map->recorded_present = present_count.load(std::memory_order_relaxed);
@@ -1465,6 +1777,213 @@ bool replay(ListState& state, const glass::Draw& draw) noexcept try {
     if (layers > 1) LOG_ONCE("milestone first VR cockpit screen recorded (render target %ux%u, %u views)", UINT(desc.Width), desc.Height, layers);
     return true;
 } catch (...) { note(stats.unsupported_draw, "exception"); return false; }
+
+// Painted screens: is the descriptor at `address` a view of a virtual painting?
+bool painted_texture(const PaintedViews& views, uintptr_t address, Texture& texture) {
+    if (track_descriptors.load(std::memory_order_relaxed)) {
+        ID3D12Resource* resource = nullptr;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        if (!tracked_texture(address, resource, format)) return false;
+        for (const auto& v : views.views) if (v.resource == resource) { texture = {resource, format}; return true; }
+        return false;
+    }
+    Signature s{};
+    if (!read_bytes(reinterpret_cast<const void*>(address), s.bytes.data(), descriptor_size)) return false;
+    for (const auto& v : views.views) if (v.signature == s) { texture = {v.resource, v.format}; return true; }
+    return false;
+}
+
+// The painting's copy (see PaintingCopy), made the first time and brought up to date at the first decal drawn with it in
+// each command list (outside a render pass). The painting itself when no copy can be made.
+Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
+    PaintingCopy* entry = nullptr;
+    const auto find = [&] {
+        const int n = painting_copy_count.load(std::memory_order_acquire);
+        for (int c = 0; c < n && !entry; ++c) if (painting_copies[c].painting.load(std::memory_order_acquire) == painting.resource) entry = &painting_copies[c];
+    };
+    find();
+    if (!entry) {
+        auto desc = painting.resource->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 || desc.MipLevels > 16) return painting;
+        desc.Alignment = 0; desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        std::lock_guard lock(painting_copies_mutex);
+        find();
+        if (!entry) {
+            // A free entry whose copy has the same size and format (the aircraft loaded again), else a new one.
+            const int n = painting_copy_count.load(std::memory_order_acquire);
+            for (int c = 0; c < n && !entry; ++c) {
+                const auto& d = painting_copies[c].desc;
+                if (!painting_copies[c].painting.load() && d.Width == desc.Width && d.Height == desc.Height && d.MipLevels == desc.MipLevels && d.Format == desc.Format)
+                    entry = &painting_copies[c];
+            }
+            if (!entry) {
+                if (n >= max_painting_copies) { LOG_ONCE("painted screens: %d paintings copied, more are read as they are", max_painting_copies); return painting; }
+                ComPtr<ID3D12Resource> made;
+                const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+                {
+                    Internal internal;
+                    if (FAILED(state.device->native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, map_resting, nullptr, IID_PPV_ARGS(&made)))) {
+                        LOG_ONCE("painted screens: no copy made of painting %p (%llux%u mips=%u)", painting.resource, uint64_t(desc.Width), desc.Height, unsigned(desc.MipLevels));
+                        return painting;
+                    }
+                }
+                entry = &painting_copies[n];
+                entry->copy = made;
+                entry->desc = desc;
+            }
+            for (auto& s : entry->states) s.store(0, std::memory_order_relaxed);
+            entry->copied_recording = UINT64_MAX; entry->copied_once = false; entry->waiting_logged = false;
+            entry->readback_present = 0; entry->next_readback = 0; entry->alpha_only = -1;
+            // The composite reads the copy over the mip levels the game's views of the painting cover.
+            {
+                std::lock_guard view_lock(view_mips_mutex);
+                if (const auto found = view_mips.find(painting.resource); found != view_mips.end()) view_mips[entry->copy.Get()] = found->second;
+            }
+            entry->painting.store(painting.resource, std::memory_order_release);
+            if (entry == &painting_copies[n]) painting_copy_count.store(n + 1, std::memory_order_release);
+            log("painted screens: painting %p (%llux%u mips=%u) gets a copy of its own %p", painting.resource, uint64_t(desc.Width), desc.Height, unsigned(desc.MipLevels),
+                entry->copy.Get());
+        }
+    }
+    const Texture copy{entry->copy.Get(), painting.format};
+    const UINT mips = std::min<UINT>(entry->desc.MipLevels, UINT(entry->states.size()));
+    std::array<uint32_t, 16> states{};
+    for (UINT m = 0; m < mips; ++m) states[m] = entry->states[m].load(std::memory_order_relaxed);
+    if (!states[0]) { // no barrier of the sim's seen yet: the copy stays as it was
+        if (!entry->waiting_logged.exchange(true)) log("painted screens: painting %p: no shader-readable state seen yet, its copy waits", painting.resource);
+        return copy;
+    }
+    if (entry->copied_recording.exchange(state.recording, std::memory_order_relaxed) == state.recording) return copy;
+    Internal internal;
+    std::array<D3D12_RESOURCE_BARRIER, 17> to_copy{}, back{};
+    UINT barriers = 0, copied = 0;
+    const auto add = [&](ID3D12Resource* resource, UINT sub, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        to_copy[barriers].Type = back[barriers].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_copy[barriers].Transition = {resource, sub, from, to};
+        back[barriers].Transition = {resource, sub, to, from};
+        ++barriers;
+    };
+    add(copy.resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, map_resting, D3D12_RESOURCE_STATE_COPY_DEST);
+    for (UINT m = 0; m < mips; ++m)
+        if (states[m] && !(states[m] & D3D12_RESOURCE_STATE_COPY_SOURCE)) add(painting.resource, m, D3D12_RESOURCE_STATES(states[m]), D3D12_RESOURCE_STATE_COPY_SOURCE);
+    auto native = state.native;
+    native->ResourceBarrier(barriers, to_copy.data());
+    for (UINT m = 0; m < mips; ++m) {
+        if (!states[m]) continue;
+        D3D12_TEXTURE_COPY_LOCATION to{copy.resource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{painting.resource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        to.SubresourceIndex = from.SubresourceIndex = m;
+        native->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        ++copied;
+    }
+    // Level 0 of the copy into a readback buffer (see painting_readbacks), until it shows where the picture is.
+    const uint64_t now = present_count.load(std::memory_order_relaxed);
+    if (entry->alpha_only.load() < 0 && rgba8(entry->desc.Format) && !entry->readback_present.load() && now >= entry->next_readback.load()) {
+        if (!entry->readback) {
+            UINT64 size = 0;
+            state.device->native->GetCopyableFootprints(&entry->desc, 0, 1, 0, &entry->readback_footprint, nullptr, nullptr, &size);
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+            const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, size, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+            if (FAILED(state.device->native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&entry->readback))))
+                entry->readback = nullptr;
+        }
+        if (entry->readback) {
+            transition(native, copy.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            back[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            D3D12_TEXTURE_COPY_LOCATION to{entry->readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT}, from{copy.resource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            to.PlacedFootprint = entry->readback_footprint;
+            native->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            entry->readback_present = std::max<uint64_t>(now, 1);
+        }
+    }
+    native->ResourceBarrier(barriers, back.data());
+    if (!entry->copied_once.exchange(true))
+        log("painted screens: painting %p copied for the upscaler into %p (state 0x%x, %u of %u mip levels)", painting.resource, copy.resource, states[0], copied, mips);
+    return copy;
+} catch (...) { return painting; }
+
+// A painted-screen candidate's draw (see "Painted screens"): looked at for a virtual painting in the texture registers its
+// pixel shader declares; one found gets mapped like a screen. Returns true when the game's draw was issued here.
+bool replay_painted(ListState& state, const glass::Draw& draw) noexcept try {
+    const auto views = painted_views.load(std::memory_order_acquire);
+    if (!views || views->views.empty()) return false; // no virtual painting loaded: nothing to look for
+    auto& pipeline = *state.painted;
+    // Where to look: the register this pipeline last showed a painting in; until then, all its texture registers, in every
+    // draw of one frame in 16 (one in 128 once 4096 looks found none, as for most translucent materials: reading
+    // descriptors isn't free). Whole frames, a different one per pipeline: a pipeline drawing many decals in a fixed order
+    // has each of them looked at.
+    const int known = pipeline.painted_register.load(std::memory_order_relaxed);
+    uint32_t registers = known >= 0 ? 1u << known : pipeline.textures;
+    if (const uint32_t misses = pipeline.painted_misses.load(std::memory_order_relaxed); known < 0 && misses) { // its first draw is always looked at
+        const uint64_t period = misses >= 4096 ? 128 : 16;
+        if ((present_count.load(std::memory_order_relaxed) + pipeline.phase) % period) return false;
+    }
+    std::array<std::pair<uint32_t, uint32_t>, 16> bindings;
+    {
+        std::shared_lock lock(state.device->layouts_mutex);
+        const auto found = state.device->texture_bindings.find(state.layout);
+        if (found == state.device->texture_bindings.end()) return false;
+        bindings = found->second;
+    }
+    Texture texture;
+    int reg = -1;
+    for (; registers && reg < 0; registers &= registers - 1) {
+        const int r = std::countr_zero(registers);
+        const auto [param, offset] = bindings[size_t(r)];
+        if (param >= state.tables.size() || !state.tables[param]) continue;
+        if (const auto address = descriptor_address(state.tables[param], offset); address && painted_texture(*views, address, texture)) reg = r;
+    }
+    if (reg < 0) {
+        if (known < 0) pipeline.painted_misses.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (known != reg) pipeline.painted_register.store(reg, std::memory_order_relaxed);
+    ++stats.painted_draws;
+    const auto skip = [](const char* reason) {
+        static std::atomic<int> logged{0};
+        ++stats.painted_skipped;
+        if (logged++ < 4) log("painted skip reason=%s", reason);
+        return false;
+    };
+    if (state.in_pass || (!state.target_count && !pipeline.rov) || !draw.count || !draw.instances) return skip("render_pass_or_targets");
+    if (!state.depth.ptr && pipeline.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) return skip("depth_unbound");
+    if (state.layout != reinterpret_cast<uint64_t>(pipeline.root.Get())) return skip("root_layout");
+    UINT width = 0, height = 0;
+    if (pipeline.rov) {
+        // A decal with no render target: the map at the size the scissor covers, if the upscaler renders at that size.
+        if (!state.scissor_known || state.scissor.left || state.scissor.top) return skip("decal_size_unknown");
+        width = UINT(state.scissor.right); height = UINT(state.scissor.bottom);
+        if (!upscaler_render_size(width, height)) return skip("decal_not_at_render_size");
+    } else {
+        // No VR (layered targets): the plain map shader has no per-view layer. Any size otherwise, as for display draws
+        // (the composite only uses the map at the upscaler's render size).
+        const auto target = rtv_resource(state.targets[0]);
+        if (!target) return skip("target_unknown");
+        if (target->GetDesc().DepthOrArraySize != 1) return skip("layered_target");
+    }
+    // The mesh: where its indices start in the game's buffers (each readout is a node of its own).
+    const uint64_t mesh = (uint64_t(draw.first) * 0x9E3779B97F4A7C15ull ^ uint64_t(int64_t(draw.base_vertex)) * 0xC2B2AE3D27D4EB4Full ^
+        (uint64_t(draw.count) << 1) ^ (draw.indexed ? 1u : 0u)) | 1;
+    // The painting's copy (see PaintingCopy): the same picture, readable after the upscaler.
+    ID3D12Resource* const painting = texture.resource;
+    texture = painting_copy(state, texture);
+    const int slot = slot_of(texture.resource, texture.format, mesh);
+    if (slot < 0) return skip("slots_full");
+    {
+        static std::mutex draws_mutex;
+        static std::set<std::pair<ID3D12Resource*, uint64_t>> draws;
+        std::lock_guard lock(draws_mutex);
+        if (draws.size() < 64 && draws.emplace(texture.resource, mesh).second) {
+            std::pair<uint64_t, uint64_t> hashes{};
+            { std::shared_lock hashes_lock(hashes_mutex); if (const auto found = pipeline_hashes.find(state.pso); found != pipeline_hashes.end()) hashes = found->second; }
+            log("painted_draw slot=%d texture=%p (painting %p%s) t%d pso=%p vs=%016llx ps=%016llx rov=%d %s count=%u first=%u base_vertex=%d instances=%u map=%ux%u", slot,
+                texture.resource, painting, texture.resource == painting ? ", not copied" : "", reg, reinterpret_cast<void*>(state.pso), hashes.first,
+                hashes.second, pipeline.rov, draw.indexed ? "indexed" : "plain", draw.count, draw.first, draw.base_vertex, draw.instances, width, height);
+        }
+    }
+    const bool recorded = draw_map(state, draw, &pipeline, unsigned(slot), width, height);
+    if (recorded && stats.painted_replays++ == 0) log("milestone first painted screen recorded (a virtual painting drawn by a translucent material)");
+    return recorded;
+} catch (...) { ++stats.painted_skipped; return false; }
 
 // VR probe window (in presents), started when the upscaler runs at a size with no cockpit map (VR or another view).
 std::atomic<uint64_t> probe_until{0};
@@ -1524,6 +2043,7 @@ void probe_screen_draw(const ListState& state, uint32_t count, uint32_t instance
 // (GPU-written RGBA8 with mip maps, like every cockpit screen texture), to find screens drawn with another shader. Every
 // pass, not just the 3D scene's (the iFly 737 draws its MCP, CDU and radio digits over their screens in a later one).
 std::atomic<uint64_t> screen_probe_until{0};
+std::atomic<uint32_t> screen_probe_run{0}; // each run logs up to 256 draws of its own
 void screen_probe(const ListState& state, uint32_t count, uint32_t instances) noexcept try {
     if (!state.device || !state.layout || !state.target_count) return;
     std::vector<DeviceState::SrvRange> ranges;
@@ -1555,8 +2075,10 @@ void screen_probe(const ListState& state, uint32_t count, uint32_t instances) no
             if (desc.MipLevels < 2) continue; // scene render targets have one mip; cockpit screens have several
             static std::mutex logged_mutex;
             static std::set<std::pair<uint64_t, ID3D12Resource*>> logged;
+            static uint32_t logged_run = 0;
             {
                 std::lock_guard lock(logged_mutex);
+                if (const auto run = screen_probe_run.load(); run != logged_run) { logged.clear(); logged_run = run; }
                 if (logged.size() >= 256 || !logged.insert({state.pso, resource}).second) continue;
             }
             bool slot = false;
@@ -1566,11 +2088,76 @@ void screen_probe(const ListState& state, uint32_t count, uint32_t instances) no
                 std::shared_lock lock(hashes_mutex);
                 if (const auto found = pipeline_hashes.find(state.pso); found != pipeline_hashes.end()) hashes = found->second;
             }
-            log("screen_probe pso=%p vs=%016llx ps=%016llx t%u space%u texture=%p %llux%u mips=%u format=%u screen_slot=%d count=%u instances=%u layout=%p targets=%u%s",
+            // painted: 1 when this pipeline is a painted-screen candidate (2: and it has shown a painting), -1 when not.
+            const auto painted = find_painted(state.pso);
+            log("screen_probe pso=%p vs=%016llx ps=%016llx t%u space%u texture=%p %llux%u mips=%u format=%u screen_slot=%d painted=%d count=%u instances=%u layout=%p targets=%u%s",
                 reinterpret_cast<void*>(state.pso), hashes.first, hashes.second, r.reg + k, r.space, resource, uint64_t(desc.Width), desc.Height,
-                unsigned(desc.MipLevels), unsigned(desc.Format), slot, count, instances, reinterpret_cast<void*>(state.layout), state.target_count,
-                describe_targets(state).c_str());
+                unsigned(desc.MipLevels), unsigned(desc.Format), slot, painted ? (painted->painted_register.load() >= 0 ? 2 : 1) : -1, count, instances,
+                reinterpret_cast<void*>(state.layout), state.target_count, describe_targets(state).c_str());
         }
+    }
+} catch (...) {}
+
+// Painted probe (runs with the screen probe): every draw, also inside render passes and indirect ones, whose pixel shader
+// declares a texture register (t0-t15) that holds a virtual painting (a screen texture candidate with a full mip chain):
+// how a painted screen is drawn, and what keeps it from being fixed (listed: the view is in the painted screens' table;
+// candidate: the pipeline is a painted-screen candidate). A pipeline the fix didn't see created: all of t0-t15
+// (declared=-1).
+void painted_probe(const ListState& state, const glass::Draw& draw, int indirect = -1) noexcept try {
+    if (!state.device || !state.layout) return;
+    PipelineInfo info;
+    bool known = false;
+    std::pair<uint64_t, uint64_t> hashes{};
+    {
+        std::shared_lock lock(hashes_mutex);
+        if (const auto found = pipeline_infos.find(state.pso); found != pipeline_infos.end()) { info = found->second; known = true; }
+        if (const auto h = pipeline_hashes.find(state.pso); h != pipeline_hashes.end()) hashes = h->second;
+    }
+    uint32_t registers = known ? info.textures & 0xffff : 0xffff;
+    if (!registers) return;
+    std::array<std::pair<uint32_t, uint32_t>, 16> bindings;
+    {
+        std::shared_lock lock(state.device->layouts_mutex);
+        const auto found = state.device->texture_bindings.find(state.layout);
+        if (found == state.device->texture_bindings.end()) return;
+        bindings = found->second;
+    }
+    const auto views = painted_views.load(std::memory_order_acquire);
+    for (; registers; registers &= registers - 1) {
+        const int r = std::countr_zero(registers);
+        const auto [param, offset] = bindings[size_t(r)];
+        if (param >= state.tables.size() || !state.tables[param]) continue;
+        const auto address = descriptor_address(state.tables[param], offset);
+        if (!address) continue;
+        Signature s{};
+        if (!read_bytes(reinterpret_cast<const void*>(address), s.bytes.data(), descriptor_size)) continue;
+        ID3D12Resource* resource = nullptr;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        {
+            std::shared_lock lock(textures_mutex);
+            if (const auto found = signatures.find(s); found != signatures.end()) { resource = found->second.resource; format = found->second.format; }
+        }
+        if (!resource && track_descriptors.load(std::memory_order_relaxed) && !tracked_texture(address, resource, format)) resource = nullptr;
+        if (!resource) continue;
+        const auto d = resource->GetDesc();
+        if (!full_mip_chain(d)) continue;
+        static std::mutex logged_mutex;
+        static std::set<std::pair<uint64_t, ID3D12Resource*>> logged;
+        static uint32_t logged_run = 0;
+        {
+            std::lock_guard lock(logged_mutex);
+            if (const auto run = screen_probe_run.load(); run != logged_run) { logged.clear(); logged_run = run; }
+            if (logged.size() >= 64 || !logged.insert({state.pso, resource}).second) continue;
+        }
+        const bool listed = views && std::any_of(views->views.begin(), views->views.end(), [&](const PaintedView& v) { return v.signature == s || v.resource == resource; });
+        const UINT targets = state.in_pass ? state.pass_targets : state.target_count;
+        const auto rt = targets ? rtv_resource({state.in_pass ? SIZE_T(state.pass_rt0) : state.targets[0].ptr}) : nullptr;
+        const auto t = rt ? rt->GetDesc() : D3D12_RESOURCE_DESC{};
+        log("painted_probe pso=%p vs=%016llx ps=%016llx t%d declared=%d texture=%p %llux%u mips=%u format=%u listed=%d candidate=%d blended=%d cockpit_inputs=%d depth=%d stencil=%d "
+            "%s count=%u first=%u base_vertex=%d instances=%u indirect=%d in_pass=%d targets=%u (pipeline %u) rt0=%llux%u",
+            reinterpret_cast<void*>(state.pso), hashes.first, hashes.second, r, known ? 1 : -1, resource, uint64_t(d.Width), d.Height, unsigned(d.MipLevels), unsigned(format), listed,
+            find_painted(state.pso) != nullptr, info.blended, info.cockpit_inputs, info.depth, info.stencil, draw.indexed ? "indexed" : "plain", draw.count, draw.first,
+            draw.base_vertex, draw.instances, indirect, int(state.in_pass), targets, info.targets, uint64_t(t.Width), t.Height);
     }
 } catch (...) {}
 
@@ -1758,13 +2345,19 @@ void command_signature_created(const D3D12_COMMAND_SIGNATURE_DESC& desc, ID3D12C
 }
 // Indirect draws at render size are only listed by the pixel probe (see pixel_probe).
 void indirect_recorded(ID3D12GraphicsCommandList* list, ID3D12CommandSignature* signature, UINT max_count) {
-    if (!enabled.load(std::memory_order_relaxed) || duplicate_fix.load(std::memory_order_relaxed) || !signature || !pixel_probing()) return;
+    if (!enabled.load(std::memory_order_relaxed) || duplicate_fix.load(std::memory_order_relaxed) || !signature) return;
+    const bool painted = present_count.load(std::memory_order_relaxed) < screen_probe_until.load(std::memory_order_relaxed);
+    if (!pixel_probing() && !painted) return;
     IndirectCommand command;
     UINT size = sizeof(command);
     if (FAILED(signature->GetPrivateData(__uuidof(IndirectCommand), &size, &command)) || size != sizeof(command)) command = {};
     if (command.type == Indirect::dispatch) return;
     // Logged like a draw: draw count in count, stride in first.
-    if (auto state = list_state(list)) pixel_probe(*state, {command.type == Indirect::draw_indexed, max_count, 1, command.stride, 0, 0}, int(command.type));
+    const glass::Draw draw{command.type == Indirect::draw_indexed, max_count, 1, command.stride, 0, 0};
+    if (auto state = list_state(list)) {
+        if (painted) painted_probe(*state, draw, int(command.type));
+        if (pixel_probing()) pixel_probe(*state, draw, int(command.type));
+    }
 }
 
 // Called before the sim's draw runs. Returns true when the fix issued the draw itself (the screen's map is drawn right
@@ -1776,9 +2369,16 @@ bool draw_recorded(ID3D12GraphicsCommandList* list, const glass::Draw& draw) {
     if (!state) return false;
     const auto now = present_count.load(std::memory_order_relaxed);
     if (pixel_probing()) pixel_probe(*state, draw);
-    if (!state->display && now < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(*state, draw.count, draw.instances);
+    if (!state->display && now < screen_probe_until.load(std::memory_order_relaxed)) {
+        screen_probe(*state, draw.count, draw.instances);
+        painted_probe(*state, draw);
+    }
     if (!state->display && now < probe_until.load(std::memory_order_relaxed)) probe_screen_draw(*state, draw.count, draw.instances);
-    if (!state->display) return false;
+    if (!state->display) {
+        if (state->painted && painted_screens.load(std::memory_order_relaxed) && state->generation == generation.load(std::memory_order_relaxed))
+            return replay_painted(*state, draw);
+        return false;
+    }
     ++stats.display_draws;
     return state->generation == generation.load(std::memory_order_relaxed) && replay(*state, draw);
 }
@@ -1795,7 +2395,7 @@ bool create_composite(DeviceState& d) {
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 11, 0, uav_base + 11}}; // u11: screen capture (what the brightness match reads)
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 22};
+    params[0].Constants = {0, 0, 23};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {5, ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -2431,6 +3031,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         note(stats.composite_skipped, "upscaler_list_not_direct"); return;
     }
     const unsigned render_w = u.render_w, render_h = u.render_h;
+    note_upscaler_render_size(render_w, render_h); // also with no screen in the map yet (painted decals need it)
     const float jitter_x = u.jitter_x, jitter_y = u.jitter_y;
     ID3D12Resource* colour = u.colour;
     ID3D12Resource* output = u.output;
@@ -2546,15 +3147,22 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         first_layer.Texture2DArray = {0, 1, 0, 1, 0, 0};
         d.native->CreateShaderResourceView(colour, &first_layer, at(1));
     } else d.native->CreateShaderResourceView(colour, &srv, at(1));
+    uint32_t inverted_slots = 0;
     for (unsigned i = 0; i < slot_count; ++i) {
         auto resource = slot_resources[i].load();
         srv.Format = resource ? slot_formats[i] : DXGI_FORMAT_R8G8B8A8_UNORM;
         // The game's own mip range (the fit pass samples like the sim); full-size sampling reads level 0 in the shader.
         srv.Texture2D.MostDetailedMip = resource ? slot_first_mip[i] : 0;
         srv.Texture2D.MipLevels = !resource ? 1 : slot_mip_count[i];
+        // A painting with its picture in alpha only: that alpha as a grey picture, read inverted (see PaintingCopy).
+        const bool alpha_only = resource && alpha_only_copy(resource);
+        if (alpha_only) inverted_slots |= 1u << i;
+        srv.Shader4ComponentMapping = alpha_only ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 3, 3,
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         d.native->CreateShaderResourceView(resource, &srv, at(2 + i));
         srv.Texture2D.MostDetailedMip = 0;
     }
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{out_format, D3D12_UAV_DIMENSION_TEXTURE2D};
     if (out.DepthOrArraySize > 1) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC first_layer{out_format, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
@@ -2633,19 +3241,19 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     d.native->CreateShaderResourceView(depth, &depth_view, at(uav_base + 10));
 
     struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp, angle_soften;
-        UINT history_info, frame_index, bounds_reset, diag_index; float edge_trim; } constants{
+        UINT history_info, frame_index, bounds_reset, diag_index; float edge_trim; UINT inverted_slots; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
         jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u) | (temporal ? 64u : 0u) | (soft_smoothing ? 128u : 0u) | (stable_edges ? 256u : 0u) | (mip0_only ? 512u : 0u) | (calm_glass ? 4096u : 0u) | (depth ? 16384u : 0u) | (direction == 1 ? 32768u : 0u) | debug_flags.load(),
         smoothing_percent / 50.0f, layer, glass_percent / 100.0f, edge_fade_percent / 100.0f,
         edge_stretch_percent / 100.0f, detail_clamp_percent / 100.0f,
-        angle_soften_percent / 100.0f, history_info, frame_index, bounds_reset.exchange(0), d.diag_index, edge_trim_percent / 100.0f};
+        angle_soften_percent / 100.0f, history_info, frame_index, bounds_reset.exchange(0), d.diag_index, edge_trim_percent / 100.0f, inverted_slots};
     d.diag_calls[d.diag_index & 63] = {present_count.load(std::memory_order_relaxed), map->recorded_present.load(), pending, map->views.load(), output, GetCurrentThreadId()};
 
     auto native = state->native;
     ID3D12DescriptorHeap* heaps[]{d.heap.Get()};
     native->SetDescriptorHeaps(1, heaps);
     native->SetComputeRootSignature(d.root.Get());
-    native->SetComputeRoot32BitConstants(0, 22, &constants, 0);
+    native->SetComputeRoot32BitConstants(0, 23, &constants, 0);
     native->SetComputeRootDescriptorTable(1, gpu);
     native->SetComputeRootUnorderedAccessView(2, d.sums->GetGPUVirtualAddress());
     // DLSS leaves its colour input compute-readable and the output as UAV; FSR reports the states it restores.
@@ -2681,7 +3289,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
                 map->fit_input = nullptr;
         }
         constants.flags |= map->fit_input ? 65536u : 0u;
-        native->SetComputeRoot32BitConstants(0, 22, &constants, 0);
+        native->SetComputeRoot32BitConstants(0, 23, &constants, 0);
     }
     {
         D3D12_UNORDERED_ACCESS_VIEW_DESC fit_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D};
@@ -2707,7 +3315,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         uav_barrier(native);
         d.accumulators_zeroed = true;
         constants.flags |= 1;
-        native->SetComputeRoot32BitConstants(0, 22, &constants, 0);
+        native->SetComputeRoot32BitConstants(0, 23, &constants, 0);
     }
     native->SetPipelineState(d.passes[1].Get());
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
@@ -3169,6 +3777,7 @@ void load_settings() {
     mip0_only = GetPrivateProfileIntW(L"experimental", L"full_size_sampling", 1, settings_path().c_str()) != 0;
     calm_glass = GetPrivateProfileIntW(L"experimental", L"calm_glass", 0, settings_path().c_str()) != 0;
     occlusion_check = GetPrivateProfileIntW(L"experimental", L"occlusion_check", 1, settings_path().c_str()) != 0;
+    painted_screens = GetPrivateProfileIntW(L"experimental", L"painted_screens", 1, settings_path().c_str()) != 0;
     {
         wchar_t key[64]{};
         GetPrivateProfileStringW(L"hotkeys", L"settings_window", L"", key, 64, settings_path().c_str());
@@ -3200,16 +3809,17 @@ void save_settings() {
     WritePrivateProfileStringW(L"experimental", L"full_size_sampling", mip0_only.load() ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"calm_glass", std::to_wstring(calm_glass.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"occlusion_check", std::to_wstring(occlusion_check.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"painted_screens", std::to_wstring(painted_screens.load()).c_str(), settings_path().c_str());
     const auto key = glass::hotkey_name(settings_window_key);
     WritePrivateProfileStringW(L"hotkeys", L"settings_window", std::wstring(key.begin(), key.end()).c_str(), settings_path().c_str());
 }
 // The settings in effect, for the log (at start and when the file is re-read).
 std::string settings_text() {
     char text[768];
-    snprintf(text, sizeof(text), "enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d",
+    snprintf(text, sizeof(text), "enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d painted_screens=%d",
         enabled.load(), jitter_positive.load(), smoothing_percent.load(), int(extra_smoothing.load()), glass_percent.load(), detail_clamp_percent.load(),
         edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), dark_screen_fix.load(), seam_fix.load(), int(mip0_only.load()),
-        stable_edges.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
+        stable_edges.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load(), painted_screens.load());
     return text;
 }
 
@@ -3319,6 +3929,7 @@ void capture_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue) {
 // or the offline test host, which has no swapchain) it is driven by the background thread instead.
 std::mutex frame_mutex;
 std::atomic<uint64_t> last_present_tick{0};
+void painting_readbacks(bool gpu_done = false) noexcept;
 void frame_tick(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue) {
     std::lock_guard lock(frame_mutex);
     const auto now = ++present_count;
@@ -3328,6 +3939,7 @@ void frame_tick(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue) {
     measure_cost(queue, main_state, now);
     pixel_probe_resolve(queue, now);
     pixel_probe_flush(now);
+    painting_readbacks();
 }
 
 // The swapchain the sim presents with (its queue is on the sim's device). Presents of other swapchains are not frames.
@@ -3490,6 +4102,42 @@ void install_upscaler_hooks() {
 }
 
 // Every 10 s: what is missing, in plain words (status file and log), and the counters when they changed.
+// What the paintings' copies read back hold (see PaintingCopy), once the GPU is surely done with them (gpu_done: the
+// offline test host waits for each frame): whether the picture is in colour or in alpha only. All black (a painting
+// not drawn into yet): looked at again half a second later.
+void painting_readbacks(bool gpu_done) noexcept try {
+    const uint64_t now = present_count.load(std::memory_order_relaxed);
+    const int n = painting_copy_count.load(std::memory_order_acquire);
+    for (int c = 0; c < n; ++c) {
+        auto& e = painting_copies[c];
+        const uint64_t at = e.readback_present.load();
+        if (!at || (!gpu_done && now < at + 30) || !e.readback) continue;
+        const auto& fp = e.readback_footprint;
+        const UINT width = fp.Footprint.Width, height = fp.Footprint.Height, pitch = fp.Footprint.RowPitch;
+        const D3D12_RANGE range{0, SIZE_T(pitch) * height};
+        const uint8_t* data = nullptr;
+        if (SUCCEEDED(e.readback->Map(0, &range, reinterpret_cast<void**>(const_cast<uint8_t**>(&data)))) && data) {
+            uint32_t colour = 0, alpha = 0;
+            for (UINT y = 0; y < height; ++y)
+                for (UINT x = 0; x < width; ++x) {
+                    uint32_t p;
+                    std::memcpy(&p, data + SIZE_T(y) * pitch + SIZE_T(x) * 4, 4);
+                    colour |= p & 0xffffff; alpha |= p >> 24;
+                }
+            const D3D12_RANGE none{0, 0};
+            e.readback->Unmap(0, &none);
+            if (colour || alpha) {
+                e.alpha_only = colour ? 0 : 1;
+                log("painted screens: painting %p (%ux%u) holds its picture %s", e.painting.load(), width, height,
+                    colour ? "in colour" : "in alpha only (colour all black): it is read as 1 - alpha, a grey picture");
+            }
+        }
+        e.next_readback = now + 30;
+        e.readback_present = 0;
+        if (e.alpha_only.load() >= 0) e.readback = nullptr; // decided: the buffer isn't needed any more
+    }
+} catch (...) {}
+
 void periodic_checks(uint64_t now) {
     scan_modules();
     if (!reshade_addon && !duplicate_fix && GetModuleHandleW(L"glass-cockpit-dlss-fix.addon64")) {
@@ -3577,9 +4225,10 @@ void periodic_checks(uint64_t now) {
         stats.unsupported_draw.load(), uint64_t(enabled.load())};
     if (current != last) {
         last = current;
-        log("stats overlay=%d jitter_positive=%d dlss_calls=%llu dlss_upscales=%llu fsr_calls=%llu screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu shader_pending=%llu unknown_texture=%llu unsupported=%llu",
+        log("stats overlay=%d jitter_positive=%d dlss_calls=%llu dlss_upscales=%llu fsr_calls=%llu screen_draws=%llu recorded=%llu overlay_frames=%llu skipped=%llu shader_pending=%llu unknown_texture=%llu unsupported=%llu painted=%llu/%llu/%llu",
             enabled.load(), jitter_positive.load(), stats.evaluations.load(), stats.dlss_upscales.load(), stats.fsr_dispatches.load(), stats.display_draws.load(), stats.replays.load(), stats.composites.load(),
-            stats.composite_skipped.load(), stats.variant_pending.load(), stats.unknown_texture.load(), stats.unsupported_draw.load());
+            stats.composite_skipped.load(), stats.variant_pending.load(), stats.unknown_texture.load(), stats.unsupported_draw.load(),
+            stats.painted_draws.load(), stats.painted_replays.load(), stats.painted_skipped.load()); // painted screens: found / mapped / left alone
     }
 }
 
@@ -3762,6 +4411,7 @@ using ListReset = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12
 using ListClearState = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
 using ListDraw = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
 using ListDrawIndexed = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+using ListResourceBarrier = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
 using ListCopyTextureRegion = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT,
     const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
 using ListSetPipelineState = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
@@ -3783,6 +4433,7 @@ ListClearState original_clear_state = nullptr;
 ListDraw original_draw = nullptr;
 ListDrawIndexed original_draw_indexed = nullptr;
 ListCopyTextureRegion original_copy_texture_region = nullptr;
+ListResourceBarrier original_resource_barrier = nullptr;
 ListSetPipelineState original_set_pipeline_state = nullptr;
 ListSetRootSignature original_set_root_signature = nullptr;
 ListSetRootTable original_set_root_table = nullptr;
@@ -3819,6 +4470,10 @@ void STDMETHODCALLTYPE copy_texture_region_hook(ID3D12GraphicsCommandList* list,
     if (!passthrough() && dest && source && dest->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && source->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
         texture_copied(source->pResource, dest->pResource, dest->SubresourceIndex);
     original_copy_texture_region(list, dest, x, y, z, source, box);
+}
+void STDMETHODCALLTYPE resource_barrier_hook(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
+    if (!passthrough()) barriers_recorded(count, barriers);
+    original_resource_barrier(list, count, barriers);
 }
 void STDMETHODCALLTYPE set_pipeline_state_hook(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline) {
     original_set_pipeline_state(list, pipeline);
@@ -3868,6 +4523,7 @@ Variants<ListClearState> clear_state_variants;
 Variants<ListDraw> draw_variants;
 Variants<ListDrawIndexed> draw_indexed_variants;
 Variants<ListCopyTextureRegion> copy_texture_region_variants;
+Variants<ListResourceBarrier> resource_barrier_variants;
 Variants<ListSetPipelineState> set_pipeline_state_variants;
 Variants<ListSetRootSignature> set_root_signature_variants;
 Variants<ListSetRootTable> set_root_table_variants;
@@ -3908,6 +4564,10 @@ template <int V> void STDMETHODCALLTYPE copy_texture_region_variant(ID3D12Graphi
     if (!passthrough() && dest && source && dest->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && source->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
         texture_copied(source->pResource, dest->pResource, dest->SubresourceIndex);
     { Internal internal; copy_texture_region_variants.original[V](self, dest, x, y, z, source, box); }
+}
+template <int V> void STDMETHODCALLTYPE resource_barrier_variant(ID3D12GraphicsCommandList* self, UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
+    if (!passthrough()) barriers_recorded(count, barriers);
+    { Internal internal; resource_barrier_variants.original[V](self, count, barriers); }
 }
 template <int V> void STDMETHODCALLTYPE set_pipeline_state_variant(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pipeline) {
     { Internal internal; set_pipeline_state_variants.original[V](self, pipeline); }
@@ -3996,6 +4656,9 @@ void install_list_variants(ID3D12GraphicsCommandList* list) noexcept try {
         if (original_set_scissor_rects)
             hook_variant("set_scissor_rects", set_scissor_rects_variants, VARIANT_DETOURS(set_scissor_rects_variant), hooked(list_set_scissor_rects_slot()),
                 entry(list_set_scissor_rects_slot()), offset);
+        if (original_resource_barrier)
+            hook_variant("resource_barrier", resource_barrier_variants, VARIANT_DETOURS(resource_barrier_variant), hooked(list_resource_barrier_slot()),
+                entry(list_resource_barrier_slot()), offset);
         if (original_execute_indirect)
             hook_variant("execute_indirect", execute_indirect_variants, VARIANT_DETOURS(execute_indirect_variant), hooked(list_execute_indirect_slot()),
                 entry(list_execute_indirect_slot()), offset);
@@ -4025,7 +4688,8 @@ bool list_functions_hooked(void** vtable) {
         variant_known(set_root_table_variants, vtable, list_set_graphics_root_table_slot()) &&
         variant_known(set_render_targets_variants, vtable, list_set_render_targets_slot()) &&
         (!original_set_scissor_rects || variant_known(set_scissor_rects_variants, vtable, list_set_scissor_rects_slot())) &&
-        (!original_execute_indirect || variant_known(execute_indirect_variants, vtable, list_execute_indirect_slot()));
+        (!original_execute_indirect || variant_known(execute_indirect_variants, vtable, list_execute_indirect_slot())) &&
+        (!original_resource_barrier || variant_known(resource_barrier_variants, vtable, list_resource_barrier_slot()));
 }
 
 // A runtime may also switch a list's vtable after creating it (e.g. to one for recording, at Reset): every list vtable
@@ -4099,7 +4763,7 @@ void install_d3d12_hooks(ID3D12Device* device) {
     // Only the pixel probe needs these (indirect draws listed, the game's scissor rectangle restored).
     bool probes = hook_slot(device, create_command_signature_slot(), reinterpret_cast<void*>(&create_command_signature_hook), original_create_command_signature);
     // The command list functions, found through a list of our own.
-    bool lists = false, passes = false;
+    bool lists = false, passes = false, barriers = false;
     {
         Internal internal;
         ComPtr<ID3D12CommandAllocator> allocator;
@@ -4119,6 +4783,8 @@ void install_d3d12_hooks(ID3D12Device* device) {
                 hook_slot(list.Get(), list_set_render_targets_slot(), reinterpret_cast<void*>(&set_render_targets_hook), original_set_render_targets);
             probes = probes && hook_slot(list.Get(), list_set_scissor_rects_slot(), reinterpret_cast<void*>(&set_scissor_rects_hook), original_set_scissor_rects) &&
                 hook_slot(list.Get(), list_execute_indirect_slot(), reinterpret_cast<void*>(&execute_indirect_hook), original_execute_indirect);
+            // Only painted screens need this (the states the sim leaves its paintings in).
+            barriers = hook_slot(list.Get(), list_resource_barrier_slot(), reinterpret_cast<void*>(&resource_barrier_hook), original_resource_barrier);
             ComPtr<ID3D12GraphicsCommandList4> list4;
             if (SUCCEEDED(list.As(&list4))) {
                 hooked_list4_vtable = *reinterpret_cast<void***>(list4.Get());
@@ -4139,7 +4805,8 @@ void install_d3d12_hooks(ID3D12Device* device) {
         if (SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))))
             queues = hook_slot(queue.Get(), queue_execute_slot(), reinterpret_cast<void*>(&queue_execute_hook), original_queue_execute);
     }
-    log("d3d12 hooks pipelines=%d device=%d command_lists=%d render_passes=%d pixel_probe=%d queue=%d variants=%d%s", pipelines, devices, lists, passes, probes, int(queues), variant_hooks.load(),
+    log("d3d12 hooks pipelines=%d device=%d command_lists=%d render_passes=%d pixel_probe=%d barriers=%d queue=%d variants=%d%s", pipelines, devices, lists, passes, probes,
+        int(barriers), int(queues), variant_hooks.load(),
         pipelines && devices && lists ? "" : " - ERROR the fix cannot follow the sim's drawing without these; send the log");
 }
 
@@ -4356,7 +5023,7 @@ Status status() {
     s.addon = reshade_addon;
     s.settings_window_key = settings_window_key;
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
-    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing, stable_edges, int(mip0_only.load()), calm_glass, edge_trim_percent, occlusion_check}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
+    s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing, stable_edges, int(mip0_only.load()), calm_glass, edge_trim_percent, occlusion_check, painted_screens}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);
@@ -4376,6 +5043,7 @@ void set_enabled(bool on) {
 }
 void set_tint(bool on) { tint = on; log("setting tint=%d", int(on)); }
 void request_screen_probe() {
+    ++screen_probe_run;
     screen_probe_until = present_count.load() + 600;
     log("screen_probe started: looking for draws that read cockpit-screen-like textures with other shaders");
 }
@@ -4446,9 +5114,10 @@ void set_experimental(const Experimental& e, const Experimental* edited_from) {
         if (changed(&Experimental::full_size)) mip0_only = e.full_size != 0;
         if (changed(&Experimental::calm_glass)) calm_glass = e.calm_glass ? 1 : 0;
         if (changed(&Experimental::occlusion_check)) occlusion_check = e.occlusion_check ? 1 : 0;
+        if (changed(&Experimental::painted_screens)) painted_screens = e.painted_screens ? 1 : 0;
     });
-    log("setting seam_fix=%d full_size_sampling=%d stable_edges=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d", seam_fix.load(), int(mip0_only.load()), stable_edges.load(),
-        dark_screen_fix.load(), detail_clamp_percent.load(), edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
+    log("setting seam_fix=%d full_size_sampling=%d stable_edges=%d dark_screen_fix=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d painted_screens=%d", seam_fix.load(), int(mip0_only.load()), stable_edges.load(),
+        dark_screen_fix.load(), detail_clamp_percent.load(), edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load(), painted_screens.load());
 }
 void set_settings_window_key(uint32_t key) {
     if (!key || hotkey_problem(key)) return;
@@ -4492,3 +5161,6 @@ extern "C" __declspec(dllexport) int GlassFixPixelProbe(int request) {
     const int hits = pixel_probe_hits.load();
     return hits < 0 ? -1 : (hits & 0xffff) | (pixel_probe_display_hits.load() << 16);
 }
+extern "C" __declspec(dllexport) void GlassFixScreenProbe() { glass::request_screen_probe(); }
+// Logs what the painted screens' copies read back hold (the GPU is done with them).
+extern "C" __declspec(dllexport) void GlassFixPaintingReadbacks() { painting_readbacks(true); }

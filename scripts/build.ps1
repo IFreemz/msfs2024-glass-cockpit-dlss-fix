@@ -35,7 +35,7 @@ Push-Location $build
 try {
     & $compiler /nologo /c /TC /W3 /MD /O2 (Join-Path $minhook 'src\buffer.c') (Join-Path $minhook 'src\hook.c') (Join-Path $minhook 'src\trampoline.c') (Join-Path $minhook 'src\hde\hde64.c')
     if ($LASTEXITCODE) { throw 'MinHook compilation failed' }
-    # Shaders -> one generated header (32 display-slot variants of the map shader, flat/brightness/VR/screen-t0, + compute passes).
+    # Shaders -> one generated header (32 display-slot variants of the map shader, flat/brightness/VR/screen-t0/plain, + compute passes).
     $headers = @()
     foreach ($slot in 0..31) {
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -WX -O3 -Fh "map_ps_$slot.h" -Vn "map_ps_$slot" (Join-Path $root 'src\display_map.hlsl')
@@ -56,6 +56,9 @@ try {
         & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D VR=1 -D SCREEN_T0=1 -WX -O3 -Fh "map_ps_vr_t0_$slot.h" -Vn "map_ps_vr_t0_$slot" (Join-Path $root 'src\display_map.hlsl')
         if ($LASTEXITCODE) { throw "VR screen-t0 map shader $slot failed" }
         $headers += "map_ps_vr_t0_$slot.h"
+        & $dxc -T ps_6_6 -HV 2021 -E main -D "DISPLAY_SLOT=$slot" -D PLAIN=1 -WX -O3 -Fh "map_ps_p_$slot.h" -Vn "map_ps_p_$slot" (Join-Path $root 'src\display_map.hlsl')
+        if ($LASTEXITCODE) { throw "Plain map shader $slot failed" }
+        $headers += "map_ps_p_$slot.h"
     }
     # Screen capture: the screen texture's colour at the moment the sim draws it (flat; standard and screen-t0 variants).
     & $dxc -T ps_6_6 -HV 2021 -E main -D DISPLAY_SLOT=0 -D COLOUR=1 -WX -O3 -Fh 'map_colour_ps.h' -Vn 'map_colour_ps' (Join-Path $root 'src\display_map.hlsl')
@@ -121,6 +124,27 @@ try {
             & $dxc -T ps_6_6 -HV 2021 -E main -D VR=1 -D SCREEN_T0=1 -D "REFERENCE=$reference" -WX -O3 -Fo (Join-Path $testHost "$($prefix)_ps.cso") (Join-Path $root 'tests\fixture_ps.hlsl')
             if ($LASTEXITCODE) { throw 'VR screen-t0 test pixel shader failed' }
         }
+        # Painted screen (--painted): a translucent material the fix doesn't know drawing a virtual painting, and its reference.
+        foreach ($reference in 0, 1) {
+            $prefix = if ($reference) { 'reference_painted' } else { 'fixture_painted' }
+            & $dxc -T ps_6_6 -HV 2021 -E main -D PAINTED=1 -D "REFERENCE=$reference" -WX -O3 -Fo (Join-Path $testHost "$($prefix)_ps.cso") (Join-Path $root 'tests\fixture_ps.hlsl')
+            if ($LASTEXITCODE) { throw 'Painted test pixel shader failed' }
+        }
+        # Painted decal (--painted --rov): no render target, the colour written through a rasterizer-ordered UAV.
+        & $dxc -T ps_6_6 -HV 2021 -E main -D PAINTED=1 -D ROV=1 -D REFERENCE=0 -WX -O3 -Fo (Join-Path $testHost 'fixture_painted_rov_ps.cso') (Join-Path $root 'tests\fixture_ps.hlsl')
+        if ($LASTEXITCODE) { throw 'Painted decal test pixel shader failed' }
+        # The HTML renderer stand-in that draws the painting from a gauge texture (--painted --rov --source).
+        & $dxc -T vs_6_6 -HV 2021 -E vs_main -WX -O3 -Fo (Join-Path $testHost 'fixture_blit_vs.cso') (Join-Path $root 'tests\fixture_blit.hlsl')
+        if ($LASTEXITCODE) { throw 'Blit test vertex shader failed' }
+        & $dxc -T ps_6_6 -HV 2021 -E ps_main -WX -O3 -Fo (Join-Path $testHost 'fixture_blit_ps.cso') (Join-Path $root 'tests\fixture_blit.hlsl')
+        if ($LASTEXITCODE) { throw 'Blit test pixel shader failed' }
+        # The same with the painting's picture in alpha only (--painted --rov --source --alpha): decal, reference and blit.
+        & $dxc -T ps_6_6 -HV 2021 -E main -D PAINTED=1 -D ROV=1 -D ALPHA=1 -D REFERENCE=0 -WX -O3 -Fo (Join-Path $testHost 'fixture_painted_alpha_rov_ps.cso') (Join-Path $root 'tests\fixture_ps.hlsl')
+        if ($LASTEXITCODE) { throw 'Painted decal (alpha) test pixel shader failed' }
+        & $dxc -T ps_6_6 -HV 2021 -E main -D PAINTED=1 -D ALPHA=1 -D REFERENCE=1 -WX -O3 -Fo (Join-Path $testHost 'reference_painted_alpha_ps.cso') (Join-Path $root 'tests\fixture_ps.hlsl')
+        if ($LASTEXITCODE) { throw 'Painted reference (alpha) test pixel shader failed' }
+        & $dxc -T ps_6_6 -HV 2021 -E ps_main -D ALPHA=1 -WX -O3 -Fo (Join-Path $testHost 'fixture_blit_alpha_ps.cso') (Join-Path $root 'tests\fixture_blit.hlsl')
+        if ($LASTEXITCODE) { throw 'Blit (alpha) test pixel shader failed' }
         foreach ($reference in 0, 1) {
             $prefix = if ($reference) { 'reference_vr' } else { 'fixture_vr' }
             & $dxc -T ps_6_6 -HV 2021 -E main -D VR=1 -D "REFERENCE=$reference" -WX -O3 -Fo (Join-Path $testHost "$($prefix)_ps.cso") (Join-Path $root 'tests\fixture_ps.hlsl')
