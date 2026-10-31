@@ -770,8 +770,8 @@ bool is_painting(ID3D12Resource* resource) {
 // the fix reads that copy after the upscaler. The copy needs the state the painting is in there: the last shader-readable state
 // the sim's barriers left each of its mip levels in (the decal reads it with a pixel shader). Some paintings hold their
 // picture in alpha only, their colour all black (the Fenix A320's readouts): the decal lays that black over the lit
-// backing of the readouts as far as the alpha goes, so the digits are where the alpha is low. Read back once, such a copy
-// is read as 1 - alpha, a grey picture (the brightness match then finds the colour).
+// backing of the readouts as far as the alpha goes, so the digits are where the alpha is low. Read back, such a copy is
+// read as 1 - alpha, a grey picture (the brightness match then finds the colour).
 struct PaintingCopy {
     std::atomic<ID3D12Resource*> painting{nullptr}; // null: free (its painting was destroyed)
     ComPtr<ID3D12Resource> copy; // kept for the fix's lifetime: the GPU or a slot may still read it
@@ -779,9 +779,10 @@ struct PaintingCopy {
     std::array<std::atomic<uint32_t>, 16> states{}; // per mip level; 0: none seen yet
     std::atomic<uint64_t> copied_recording{UINT64_MAX}; // the list recording it was last copied in (see ListState::recording)
     std::atomic<bool> copied_once{false}, waiting_logged{false};
-    std::atomic<int> alpha_only{-1}; // the picture is in alpha only: 1, in colour: 0, not read back yet (or all black): -1
-    // The copy's level 0 read back (see painting_readbacks) until it shows where the picture is; released then. Only
-    // 8-bit RGBA/BGRA paintings (alpha in the top byte); others are read as they are, in colour.
+    std::atomic<int> alpha_only{-1}; // the picture is in alpha only: 1, in colour: 0, not known yet (or all black): -1
+    std::atomic<int> seen{-1}; // a readback that disagreed with alpha_only (waits for the next one to agree), else -1
+    // The copy's level 0 read back (see painting_readbacks): every half second until it shows where the picture is, then
+    // every ten seconds. Only 8-bit RGBA/BGRA paintings (alpha in the top byte); others are read as they are, in colour.
     ComPtr<ID3D12Resource> readback;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT readback_footprint{};
     std::atomic<uint64_t> readback_present{0}, next_readback{0}; // readback_present: when the pending one was recorded (0: none)
@@ -1833,7 +1834,7 @@ Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
             }
             for (auto& s : entry->states) s.store(0, std::memory_order_relaxed);
             entry->copied_recording = UINT64_MAX; entry->copied_once = false; entry->waiting_logged = false;
-            entry->readback_present = 0; entry->next_readback = 0; entry->alpha_only = -1;
+            entry->readback_present = 0; entry->next_readback = 0; entry->alpha_only = -1; entry->seen = -1;
             // The composite reads the copy over the mip levels the game's views of the painting cover.
             {
                 std::lock_guard view_lock(view_mips_mutex);
@@ -1875,9 +1876,9 @@ Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
         native->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
         ++copied;
     }
-    // Level 0 of the copy into a readback buffer (see painting_readbacks), until it shows where the picture is.
+    // Level 0 of the copy into a readback buffer (see painting_readbacks).
     const uint64_t now = present_count.load(std::memory_order_relaxed);
-    if (entry->alpha_only.load() < 0 && rgba8(entry->desc.Format) && !entry->readback_present.load() && now >= entry->next_readback.load()) {
+    if (rgba8(entry->desc.Format) && !entry->readback_present.load() && now >= entry->next_readback.load()) {
         if (!entry->readback) {
             UINT64 size = 0;
             state.device->native->GetCopyableFootprints(&entry->desc, 0, 1, 0, &entry->readback_footprint, nullptr, nullptr, &size);
@@ -4101,10 +4102,11 @@ void install_upscaler_hooks() {
     install_ffx();
 }
 
-// Every 10 s: what is missing, in plain words (status file and log), and the counters when they changed.
 // What the paintings' copies read back hold (see PaintingCopy), once the GPU is surely done with them (gpu_done: the
-// offline test host waits for each frame): whether the picture is in colour or in alpha only. All black (a painting
-// not drawn into yet): looked at again half a second later.
+// offline test host waits for each frame): whether the picture is in colour or in alpha only. That can change (the Fenix
+// A320's clock painting has read back in colour at times and in alpha only at others; decided once, the clock stayed
+// unfixed), so the copies are looked at again every ten seconds, and a readback is only taken when the next one agrees.
+// All black (not drawn into yet) tells nothing.
 void painting_readbacks(bool gpu_done) noexcept try {
     const uint64_t now = present_count.load(std::memory_order_relaxed);
     const int n = painting_copy_count.load(std::memory_order_acquire);
@@ -4117,27 +4119,36 @@ void painting_readbacks(bool gpu_done) noexcept try {
         const D3D12_RANGE range{0, SIZE_T(pitch) * height};
         const uint8_t* data = nullptr;
         if (SUCCEEDED(e.readback->Map(0, &range, reinterpret_cast<void**>(const_cast<uint8_t**>(&data)))) && data) {
-            uint32_t colour = 0, alpha = 0;
+            uint32_t coloured = 0, covered = 0;
             for (UINT y = 0; y < height; ++y)
                 for (UINT x = 0; x < width; ++x) {
                     uint32_t p;
                     std::memcpy(&p, data + SIZE_T(y) * pitch + SIZE_T(x) * 4, 4);
-                    colour |= p & 0xffffff; alpha |= p >> 24;
+                    coloured += (p & 0xffffff) != 0; covered += (p >> 24) != 0;
                 }
             const D3D12_RANGE none{0, 0};
             e.readback->Unmap(0, &none);
-            if (colour || alpha) {
-                e.alpha_only = colour ? 0 : 1;
-                log("painted screens: painting %p (%ux%u) holds its picture %s", e.painting.load(), width, height,
-                    colour ? "in colour" : "in alpha only (colour all black): it is read as 1 - alpha, a grey picture");
+            const int verdict = coloured ? 0 : covered ? 1 : -1;
+            if (verdict >= 0 && verdict == e.alpha_only.load()) e.seen = -1;
+            else if (verdict >= 0 && e.seen.exchange(verdict) == verdict) { // the second readback in a row that says so
+                const int before = e.alpha_only.exchange(verdict);
+                e.seen = -1;
+                static std::atomic<int> logged{0};
+                if (logged++ < 32)
+                    log("painted screens: painting %p (%ux%u, %u pixels with colour, %u with alpha) %s its picture %s", e.painting.load(), width, height, coloured,
+                        covered, before < 0 ? "holds" : "now holds", verdict ? "in alpha only (colour all black): it is read as 1 - alpha, a grey picture" : "in colour");
+                // Read the other way now: the slots showing the copy start their brightness match over.
+                if (before >= 0)
+                    for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() == e.copy.Get()) bounds_reset.fetch_or(1u << i);
             }
         }
-        e.next_readback = now + 30;
+        // Undecided, or a disagreeing readback to confirm: half a second; otherwise a look every ten seconds.
+        e.next_readback = gpu_done ? now : now + (e.alpha_only.load() < 0 || e.seen.load() >= 0 ? 30 : 600);
         e.readback_present = 0;
-        if (e.alpha_only.load() >= 0) e.readback = nullptr; // decided: the buffer isn't needed any more
     }
 } catch (...) {}
 
+// Every 10 s: what is missing, in plain words (status file and log), and the counters when they changed.
 void periodic_checks(uint64_t now) {
     scan_modules();
     if (!reshade_addon && !duplicate_fix && GetModuleHandleW(L"glass-cockpit-dlss-fix.addon64")) {

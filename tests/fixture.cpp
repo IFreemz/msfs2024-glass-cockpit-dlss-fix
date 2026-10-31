@@ -276,7 +276,9 @@ int main(int argc, char** argv) {
         require(!gauge_source || rov, "--source is for --painted --rov");
         if (gauge_source) std::printf("display: the painting drawn from a gauge texture each frame, black again before the upscaler\n");
         // --alpha (with --source): the painting holds the gauge's picture in alpha only, its colour black (the Fenix A320's
-        // readouts painting): the alpha is black laid over the lit backing (1 - grey), so the fix must read 1 - alpha.
+        // readouts painting): the alpha is black laid over the lit backing (1 - grey), so the fix must read 1 - alpha. On
+        // the first frame it holds the picture in colour instead (a painting the sim has just made can hold anything): the
+        // fix must not take that for good.
         require(!alpha_only || gauge_source, "--alpha is for --painted --rov --source");
         if (alpha_only) std::printf("display: the painting's picture in alpha only\n");
         if (painted) std::printf("display: painted screen (%s, virtual painting in t0%s)\n", rov ? "decal through a rasterizer-ordered UAV" : "translucent material",
@@ -434,10 +436,12 @@ int main(int argc, char** argv) {
         auto sum_desc = rd; sum_desc.VS = {reference_vs.data(), reference_vs.size()}; sum_desc.DepthStencilState.DepthEnable = FALSE;
         for (auto& b : sum_desc.BlendState.RenderTarget) { b.BlendEnable = TRUE; b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_ONE; }
         ComPtr<ID3D12PipelineState> accumulate_pso; check(device->CreateGraphicsPipelineState(&sum_desc, IID_PPV_ARGS(&accumulate_pso)));
-        // --source: the HTML renderer stand-in (gauge in t0 drawn over a whole mip of the painting).
-        ComPtr<ID3D12PipelineState> blit_pso;
+        // --source: the HTML renderer stand-in (gauge in t0 drawn over a whole mip of the painting); with --alpha, also the
+        // colour one for the first frame.
+        ComPtr<ID3D12PipelineState> blit_pso, blit_colour_pso;
         if (gauge_source) {
             const auto blit_vs = load(here / "fixture_blit_vs.cso"), blit_ps = load(here / (alpha_only ? "fixture_blit_alpha_ps.cso" : "fixture_blit_ps.cso"));
+            const auto blit_colour_ps = load(here / "fixture_blit_ps.cso");
             D3D12_GRAPHICS_PIPELINE_STATE_DESC bd{};
             bd.pRootSignature = rs.Get(); bd.VS = {blit_vs.data(), blit_vs.size()}; bd.PS = {blit_ps.data(), blit_ps.size()};
             bd.SampleMask = UINT_MAX; bd.SampleDesc.Count = 1; bd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -445,6 +449,8 @@ int main(int argc, char** argv) {
             bd.RasterizerState = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE}; bd.RasterizerState.DepthClipEnable = TRUE;
             bd.BlendState = pd.BlendState; bd.BlendState.RenderTarget[0].BlendEnable = FALSE;
             check(device->CreateGraphicsPipelineState(&bd, IID_PPV_ARGS(&blit_pso)));
+            bd.PS = {blit_colour_ps.data(), blit_colour_ps.size()};
+            check(device->CreateGraphicsPipelineState(&bd, IID_PPV_ARGS(&blit_colour_pso)));
         }
 
         // Mesh, constants.
@@ -690,9 +696,9 @@ int main(int argc, char** argv) {
             auto at = painting_rtvs->GetCPUDescriptorHandleForHeapStart(); at.ptr += 10 * rinc_painting;
             device->CreateRenderTargetView(intermediate.Get(), nullptr, at);
         }
-        // --source: the gauge copied into the intermediate texture and the painting drawn from that (paint = true), or both
-        // emptied to black (paint = false).
-        auto paint = [&](bool from_gauge) {
+        // --source: the gauge copied into the intermediate texture and the painting drawn from that (paint = true; colour:
+        // in colour even with --alpha), or both emptied to black (paint = false).
+        auto paint = [&](bool from_gauge, bool colour = false) {
             constexpr auto readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             auto intermediate_rtv = painting_rtvs->GetCPUDescriptorHandleForHeapStart(); intermediate_rtv.ptr += 10 * rinc_painting;
             if (from_gauge) {
@@ -711,7 +717,7 @@ int main(int argc, char** argv) {
             if (from_gauge) {
                 list->SetGraphicsRootSignature(rs.Get());
                 ID3D12DescriptorHeap* heaps[]{gpu_heap.Get()}; list->SetDescriptorHeaps(1, heaps);
-                list->SetPipelineState(blit_pso.Get());
+                list->SetPipelineState(colour ? blit_colour_pso.Get() : blit_pso.Get());
                 list->SetGraphicsRootDescriptorTable(5, intermediate_table);
                 list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             }
@@ -1366,7 +1372,7 @@ int main(int argc, char** argv) {
             const int variant = f.camera == 1 ? 1 : (f.glare ? 2 : 0);
             std::array<std::vector<std::array<float, 4>>, 2> refs;
             for (UINT eye = 0; eye < views; ++eye) refs[eye] = render_reference(variant, eye);
-            if (gauge_source) paint(true); // the HTML renderer draws the painting from the gauge
+            if (gauge_source) paint(true, &f == &frames[0]); // the HTML renderer draws the painting from the gauge (first: in colour)
             list->ClearRenderTargetView(rtv(0), black.Color, 0, nullptr);
             list->ClearDepthStencilView(dsv(0), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
             if (f.draw) {
