@@ -594,29 +594,33 @@ void solve(uint3 id : SV_DispatchThreadID)
     // (its picture would be a small part of what the sim shows there, as when the A400M's digits blink off): then the score
     // means nothing. Otherwise back to the upscaler after about 2 seconds of that (a moment's dip while the camera moves
     // isn't another picture). A dropped screen that matched well before comes back at 0.15, with that gain: such a screen
-    // rarely scores more. A screen that never matched well still needs the whole picture to match (the iFly EFB).
+    // rarely scores more. A screen that never matched well still needs the whole picture to match (the iFly EFB scores under
+    // 0.1). From 0.35 down the fit gives way to the held gain gradually: the A2A Legacy's radios sit right at 0.25, and a hard
+    // limit there switched between the two gains every few frames, which showed as flicker.
     float3 good_gain = previous_a.w != 0 ? previous_detail.yzw : 0;
     bool matched_before = any(good_gain > 0);
-    bool hold = (previous_a.w > 0 || (previous_a.w < 0 && q > 0.15)) && q <= 0.25 && matched_before;
+    bool holding = (previous_a.w > 0 || (previous_a.w < 0 && q > 0.15)) && q < 0.35 && matched_before;
+    bool hold = holding && q <= 0.25;
     // The gain held follows the match slowly, in steps too small for one bad frame to matter: a knob can dim a screen without
     // changing its texture or its mesh's brightness (A2A Legacy radios), and a gain frozen from another knob position showed
     // the digits brighter at the lowest setting than at the highest. About a second to double or halve.
-    if (hold && pooled_variance > 3e-6)
+    if (holding && pooled_variance > 3e-6)
     {
         double weighted = 0;
         [unroll] for (uint c = 0; c < 3; ++c) weighted += good_gain[c] * variance[c];
         float held = float(weighted / pooled_variance);
         if (held > 0) good_gain *= exp(0.02 * log(clamp(float(pooled_covariance / pooled_variance) / held, 0.5, 2.0)));
     }
-    if (hold)
+    if (holding)
         [unroll] for (uint c = 0; c < 3; ++c)
         {
-            a[c] = mx[c] > 1e-5 ? min(good_gain[c], max(float(my[c] / mx[c]), 0)) : good_gain[c];
+            float held_gain = mx[c] > 1e-5 ? min(good_gain[c], max(float(my[c] / mx[c]), 0)) : good_gain[c];
+            a[c] = lerp(a[c], held_gain, saturate((0.35 - q) / 0.1));
             b[c] = float(my[c] - a[c] * mx[c]);
         }
     double held_variance = 0;
     [unroll] for (uint c = 0; c < 3; ++c) held_variance += good_gain[c] * good_gain[c] * variance[c];
-    bool matches = previous_a.w < 0 ? q > (matched_before ? 0.15 : 0.25) : q > 0.15 || (hold && (q > 0.08 || held_variance < 0.1 * pooled_scene_variance));
+    bool matches = previous_a.w < 0 ? q > (matched_before ? 0.15 : 0.2) : q > 0.15 || (hold && (q > 0.08 || held_variance < 0.1 * pooled_scene_variance));
     float low_calls = matches || previous_a.w <= 1 ? (matches ? 0 : 1) : previous_a.w;
     bool keep = matches || (hold && low_calls < 120);
     float3 gain = lerp(previous_a.rgb, a, w);
