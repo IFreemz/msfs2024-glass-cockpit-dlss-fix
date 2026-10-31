@@ -1,5 +1,6 @@
 // State shared between the fix, its status file (status_report.cpp) and the add-on's ReShade overlay tab (status_panel.cpp).
 #pragma once
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -19,6 +20,12 @@ struct Experimental {
     bool operator==(const Experimental&) const = default;
 };
 
+// Hotkeys: a virtual-key code plus modifier bits, written in the .ini ([hotkeys]) as e.g. "Ctrl+Shift+F9", or "None" for
+// no hotkey. Each action has its own; the settings window's is the standalone version's only, and always set.
+constexpr uint32_t key_ctrl = 0x100, key_shift = 0x200, key_alt = 0x400;
+enum Hotkey : int { hotkey_fix, hotkey_tint, hotkey_settings_window, hotkey_count };
+constexpr uint32_t default_hotkeys[hotkey_count]{key_ctrl | key_shift | 0x78, key_ctrl | key_shift | 0x7A, key_ctrl | key_shift | 0x75}; // F9, F11, F6
+
 struct Status {
     bool addon = false; // the ReShade add-on (settings also in its overlay tab), not the standalone dxgi.dll
     std::string gpu, driver, dlss_version, fsr_version;
@@ -26,7 +33,7 @@ struct Status {
     bool enabled = false, tint = false, jitter_positive = false, active = false, extra_smoothing = false;
     Experimental experimental;
     int line_smoothing = 0, glass_strength = 100;
-    uint32_t settings_window_key = 0; // standalone: the settings window's hotkey (hotkey_name)
+    std::array<uint32_t, hotkey_count> hotkeys{}; // by Hotkey (hotkey_name); 0: none
     uint64_t dlss_calls = 0, dlss_upscales = 0, fsr_calls = 0, screen_draws = 0, recorded = 0, overlay_frames = 0, skipped = 0;
     unsigned screens = 0, render_w = 0, render_h = 0, out_w = 0, out_h = 0;
     const char* upscaler = "DLSS"; // the one the fix was last drawn after
@@ -49,13 +56,14 @@ void set_glass_strength(int percent);
 // null applies all (Reset).
 void set_experimental(const Experimental& e, const Experimental* edited_from);
 
-// Hotkeys: a virtual-key code plus modifier bits. Written in the .ini as e.g. "Ctrl+Shift+F6".
-constexpr uint32_t key_ctrl = 0x100, key_shift = 0x200, key_alt = 0x400, default_settings_window_key = key_ctrl | key_shift | 0x75; // VK_F6
-std::string hotkey_name(uint32_t key);
+std::string hotkey_name(uint32_t key); // "None" for 0
 uint32_t parse_hotkey(const std::string& text); // 0: not a key this understands
-// Why a hotkey can't be used (taken by the fix itself, closes the sim, needs a modifier), or null if it can.
+// Why a hotkey can't be used (closes the sim, needs a modifier), or null if it can.
 const char* hotkey_problem(uint32_t key);
-void set_settings_window_key(uint32_t key);
+const char* hotkey_action(Hotkey which); // "fix on/off", "green tint", "settings window"
+// Sets a hotkey (0: none; the settings window always has one). Returns why it wasn't changed (a hotkey_problem, or it is
+// already another of the fix's hotkeys), or an empty string.
+std::string set_hotkey(Hotkey which, uint32_t key);
 
 // One line on what the fix is doing ("Working: fixing 4 screens ..."), and the report to paste into bug reports.
 std::string status_summary(const Status& s);

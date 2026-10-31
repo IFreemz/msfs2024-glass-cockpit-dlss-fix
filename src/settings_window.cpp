@@ -32,7 +32,7 @@ std::atomic<bool> thread_started{false};
 std::atomic<HWND> window{nullptr};
 constexpr UINT toggle_message = WM_APP + 1;
 constexpr UINT_PTR refresh_timer = 1, capture_release_timer = 2, capture_poll_timer = 3;
-constexpr int client_w = 800, client_h = 734; // DIPs
+constexpr int client_w = 800, client_h = 774; // DIPs
 
 // Colours (dark theme).
 constexpr COLORREF background = RGB(23, 24, 27), card = RGB(34, 35, 39), card_border = RGB(46, 48, 54), row_hover = RGB(40, 42, 47);
@@ -71,7 +71,8 @@ glass::Status status;
 void read_status() { status = glass::status(); }
 
 enum Id : int {
-    id_none = 0, id_enabled, id_smoothing, id_extra, id_tint, id_key, id_bug_reports, id_advanced, id_jitter, id_glass, id_reset_advanced,
+    id_none = 0, id_enabled, id_smoothing, id_extra, id_tint, id_key_fix, id_key_tint, id_key_window, id_bug_reports, id_advanced, id_jitter,
+    id_glass, id_reset_advanced,
     id_occlusion, id_stable, id_full_size, id_seam, id_calm, id_dark, id_soft, id_temporal,
     id_edge_trim, id_detail_clamp, id_edge_fade, id_angle, id_edge_stretch, id_reset_experimental,
     id_pixel_probe, id_screen_probe, id_capture, id_log_folder, id_copy_report, id_settings_file, id_website, id_jason,
@@ -91,16 +92,22 @@ const Widget* widget(Id id) {
 Id hover = id_none, pressed = id_none, dragging = id_none;
 int drag_value = 0;
 bool bug_reports_open = false, advanced_open = false, capturing = false; // one of the two sections open at a time
+glass::Hotkey capture_target = glass::hotkey_settings_window; // the hotkey being recorded while capturing
+uint32_t captured_key = 0; // the hotkey just recorded: the fix's hotkeys stay paused until it is let go
 std::wstring help_note; // a message about the hotkey, shown in the help panel until the mouse moves on
 
 const wchar_t* const default_help = L"Hover over an option to see what it does. Changes apply instantly and are saved to glass-cockpit-dlss-fix.ini.";
-const wchar_t* const tip_enabled = L"Turns the fix on and off, e.g. to compare with the sim's own picture (also Ctrl+Shift+F9).";
+const wchar_t* const tip_enabled = L"Turns the fix on and off, e.g. to compare with the sim's own picture (also with its hotkey).";
 const wchar_t* const tip_bug_reports = L"Tools for a bug report: pictures of the screens, the logs and a short report of what the fix is doing.";
 const wchar_t* const tip_smoothing = L"Smooths stair steps and shimmer on thin lines, like DLSS did. 0 = sharpest, 35 = default, 50 = like DLSS.";
 const wchar_t* const tip_extra = L"Lets Line smoothing go up to 100 % for stubborn shimmer (e.g. in VR). Above 50 the whole screen picture gets softer than with DLSS alone.";
-const wchar_t* const tip_tint = L"Tints every fixed screen green: shows which screens the fix covers (also Ctrl+Shift+F11).";
-const wchar_t* const tip_key = L"The key combination that opens and closes this window. Click, then press the new combination (click again to cancel). The sim sees those keys too. "
-    L"Change it if it clashes with another mod's hotkey.";
+const wchar_t* const tip_tint = L"Tints every fixed screen green: shows which screens the fix covers (also with its hotkey).";
+const wchar_t* const tip_key_fix = L"The key combination that turns the fix on and off in the sim. Click, then press the new combination (click again to "
+    L"cancel); Backspace leaves it without one. Change it if it clashes with another mod's hotkey or a binding of the sim's.";
+const wchar_t* const tip_key_tint = L"The key combination that turns the green tint on and off in the sim. Click, then press the new combination (click "
+    L"again to cancel); Backspace leaves it without one. Change it if it clashes with another mod's hotkey or a binding of the sim's.";
+const wchar_t* const tip_key_window = L"The key combination that opens and closes this window. Click, then press the new combination (click again to "
+    L"cancel). The sim sees those keys too. Change it if it clashes with another mod's hotkey.";
 const wchar_t* const tip_advanced = L"Settings only needed for troubleshooting: only change these if asked to in a bug report.";
 const wchar_t* const tip_jitter = L"Only needed if the screen text shimmers while the camera is still.";
 const wchar_t* const tip_glass = L"How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens. 100 = all (default). "
@@ -307,16 +314,24 @@ void paint(HWND hwnd, HDC target) {
         // Left column.
         const int lx = 16, lw = 376, rx = 408, rw = 376, top = 116;
         p.card_begin(lx, top, lw, 32 + 4 * 32 + 8, L"DISPLAY");
-        p.toggle(id_enabled, L"Fix enabled", L"Ctrl+Shift+F9", tip_enabled);
+        const std::wstring fix_key = wide(glass::hotkey_name(status.hotkeys[glass::hotkey_fix])), tint_key = wide(glass::hotkey_name(status.hotkeys[glass::hotkey_tint]));
+        p.toggle(id_enabled, L"Fix enabled", status.hotkeys[glass::hotkey_fix] ? fix_key.c_str() : nullptr, tip_enabled);
         p.slider(id_smoothing, L"Line smoothing", status.extra_smoothing ? 100 : 50, L"%", tip_smoothing);
         p.toggle(id_extra, L"Extra smoothing (up to 100 %)", nullptr, tip_extra);
-        p.toggle(id_tint, L"Green tint on fixed screens", L"Ctrl+Shift+F11", tip_tint);
+        p.toggle(id_tint, L"Green tint on fixed screens", status.hotkeys[glass::hotkey_tint] ? tint_key.c_str() : nullptr, tip_tint);
 
         int y = top + 32 + 4 * 32 + 8 + 8;
-        p.card_begin(lx, y, lw, 32 + 36 + 6, L"WINDOW HOTKEY");
-        text(scale(lx + 16), scale(y + 32), scale(170), scale(30), L"Open / close this window", body_font, text_colour);
-        p.button(id_key, capturing ? L"Press keys... (Esc cancels)" : wide(glass::hotkey_name(status.settings_window_key)).c_str(), lx + 186, y + 32, lw - 202, 30, tip_key, capturing);
-        y += 32 + 36 + 6 + 8;
+        p.card_begin(lx, y, lw, 32 + 3 * 36 + 6, L"HOTKEYS");
+        const auto hotkey_row = [&](Id id, glass::Hotkey which, const wchar_t* label, const wchar_t* tip, int row) {
+            const bool recording = capturing && capture_target == which;
+            text(scale(lx + 16), scale(y + 32 + row * 36), scale(170), scale(30), label, body_font, text_colour);
+            p.button(id, recording ? L"Press keys... (Esc cancels)" : wide(glass::hotkey_name(status.hotkeys[which])).c_str(), lx + 186, y + 32 + row * 36, lw - 202, 30,
+                tip, recording);
+        };
+        hotkey_row(id_key_fix, glass::hotkey_fix, L"Fix on / off", tip_key_fix, 0);
+        hotkey_row(id_key_tint, glass::hotkey_tint, L"Green tint on / off", tip_key_tint, 1);
+        hotkey_row(id_key_window, glass::hotkey_settings_window, L"Open / close this window", tip_key_window, 2);
+        y += 32 + 3 * 36 + 6 + 8;
 
         // Bug reports and Advanced: collapsed until clicked, one open at a time (so the window keeps its size).
         const auto section = [&](Id id, bool open, int open_h, const wchar_t* title, const wchar_t* tip) {
@@ -468,21 +483,26 @@ void copy_to_clipboard(HWND owner, const std::string& text) {
 void stop_capturing(HWND hwnd, bool wait_for_release) {
     capturing = false;
     KillTimer(hwnd, capture_poll_timer);
-    // The new combination is still held: the hotkey stays paused until it's let go, or it would close the window at once.
+    // The new combination is still held: the hotkeys stay paused until it's let go, or it would fire at once.
     if (wait_for_release) SetTimer(hwnd, capture_release_timer, 50, nullptr);
-    else glass::settings_window_capturing = false;
+    else glass::hotkeys_paused = false;
 }
 void click(HWND hwnd, Id id) {
     switch (id) {
     case id_bug_reports: bug_reports_open = !bug_reports_open; if (bug_reports_open) advanced_open = false; break;
     case id_advanced: advanced_open = !advanced_open; if (advanced_open) bug_reports_open = false; break;
-    case id_key:
-        if (capturing) { stop_capturing(hwnd, false); break; }
+    case id_key_fix: case id_key_tint: case id_key_window: {
+        const auto which = glass::Hotkey(id - id_key_fix);
+        const bool same = capturing && capture_target == which;
+        if (capturing) stop_capturing(hwnd, false);
+        if (same) break;
         capturing = true;
-        glass::settings_window_capturing = true;
+        capture_target = which;
+        glass::hotkeys_paused = true;
         help_note.clear();
         SetTimer(hwnd, capture_poll_timer, 15, nullptr); // the keys go to the sim: they're read from the keyboard's state
         break;
+    }
     case id_reset_advanced: glass::set_jitter_positive(true); glass::set_glass_strength(100); break;
     case id_reset_experimental: glass::set_experimental({}, nullptr); break;
     case id_capture: glass::request_capture(); break;
@@ -518,14 +538,17 @@ void key_pressed(HWND hwnd, UINT vk) {
     if (GetAsyncKeyState(VK_CONTROL) & 0x8000) key |= glass::key_ctrl;
     if (GetAsyncKeyState(VK_SHIFT) & 0x8000) key |= glass::key_shift;
     if (GetAsyncKeyState(VK_MENU) & 0x8000) key |= glass::key_alt;
+    if (key == VK_BACK) key = 0; // Backspace alone: no hotkey
     const std::string name = glass::hotkey_name(key);
-    if (name.find('?') != std::string::npos || glass::parse_hotkey(name) != key) {
-        help_note = L"That key can't be used for the hotkey: try another key with Ctrl, Shift or Alt.";
-    } else if (const char* problem = glass::hotkey_problem(key)) {
-        help_note = wide(name) + L" can't be used: " + wide(problem) + L".";
+    if (key && (name.find('?') != std::string::npos || glass::parse_hotkey(name) != key)) {
+        help_note = L"That key can't be used for a hotkey: try another key with Ctrl, Shift or Alt.";
+    } else if (const std::string problem = glass::set_hotkey(capture_target, key); !problem.empty()) {
+        help_note = wide(problem);
     } else {
-        glass::set_settings_window_key(key);
-        help_note = L"This window now opens and closes with " + wide(name) + L".";
+        const std::wstring action = capture_target == glass::hotkey_settings_window ? L"This window now opens and closes" :
+            capture_target == glass::hotkey_fix ? L"The fix now turns on and off" : L"The green tint now turns on and off";
+        help_note = key ? action + L" with " + wide(name) + L"." : L"No hotkey for it now: use its switch in this window.";
+        captured_key = key ? key : VK_BACK;
         stop_capturing(hwnd, true);
         read_status();
     }
@@ -562,8 +585,8 @@ void show(HWND hwnd, bool visible) {
 std::string shown_state() {
     char buffer[512];
     const auto& e = status.experimental;
-    snprintf(buffer, sizeof(buffer), "%d%d%d%d%d %d %d %u|%d%d%d%d%d%d%d%d %d %d %d %d %d|", status.active, status.enabled, status.tint, status.extra_smoothing,
-        status.jitter_positive, status.line_smoothing, status.glass_strength, status.settings_window_key, e.occlusion_check, e.stable_edges, e.full_size,
+    snprintf(buffer, sizeof(buffer), "%d%d%d%d%d %d %d %u %u %u|%d%d%d%d%d%d%d%d %d %d %d %d %d|", status.active, status.enabled, status.tint, status.extra_smoothing,
+        status.jitter_positive, status.line_smoothing, status.glass_strength, status.hotkeys[0], status.hotkeys[1], status.hotkeys[2], e.occlusion_check, e.stable_edges, e.full_size,
         e.seam_fix, e.calm_glass, e.dark_screens, e.soft_smoothing, e.temporal_aa, e.edge_trim, e.detail_clamp, e.edge_fade, e.angle_softening, e.edge_stretch);
     return buffer + glass::status_summary(status) + "|" + status.capture;
 }
@@ -605,8 +628,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
             primed = capturing; // the keys held when recording started don't count
             if (!capturing) primed = false;
         } else if (w == capture_release_timer) {
-            const uint32_t key = status.settings_window_key;
-            if (!(GetAsyncKeyState(int(key & 0xFF)) & 0x8000)) { KillTimer(hwnd, capture_release_timer); glass::settings_window_capturing = false; }
+            if (!(GetAsyncKeyState(int(captured_key & 0xFF)) & 0x8000)) { KillTimer(hwnd, capture_release_timer); glass::hotkeys_paused = false; }
         }
         return 0;
     case WM_PAINT: {

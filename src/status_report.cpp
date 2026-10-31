@@ -43,6 +43,7 @@ constexpr KeyName key_names[] = {
 
 namespace glass {
 std::string hotkey_name(uint32_t key) {
+    if (!key) return "None";
     std::string text;
     if (key & key_ctrl) text += "Ctrl+";
     if (key & key_shift) text += "Shift+";
@@ -87,17 +88,24 @@ uint32_t parse_hotkey(const std::string& text) {
 const char* hotkey_problem(uint32_t key) {
     const uint32_t vk = key & 0xFF, mods = key & (key_ctrl | key_shift | key_alt);
     if (!vk) return "not a key";
-    if (mods == (key_ctrl | key_shift) && (vk == 0x78 || vk == 0x7A)) return "Ctrl+Shift+F9 and F11 are the fix's own hotkeys";
     if (mods == key_alt && vk == 0x73) return "Alt+F4 closes the sim";
     if (mods == key_alt && (vk == 0x09 || vk == 0x20 || vk == 0x0D)) return "Windows uses Alt+Tab, Alt+Space and Alt+Enter";
     const bool alone_ok = (vk >= 0x7C && vk <= 0x87) || vk == 0x13 || vk == 0x91; // F13-F24, Pause, Scroll Lock
     if (!mods && !alone_ok) return "add Ctrl, Shift or Alt, so it doesn't fire while you type or fly";
     return nullptr;
 }
+const char* hotkey_action(Hotkey which) {
+    switch (which) {
+    case hotkey_fix: return "fix on/off";
+    case hotkey_tint: return "green tint";
+    case hotkey_settings_window: return "settings window";
+    default: return "?";
+    }
+}
 
 std::string status_summary(const Status& s) {
     if (s.active) return format("Working: fixing %u screen%s (%s %ux%u -> %ux%u)", s.screens, s.screens == 1 ? "" : "s", s.upscaler, s.render_w, s.render_h, s.out_w, s.out_h);
-    if (!s.enabled) return "Off (Ctrl+Shift+F9 to turn on)";
+    if (!s.enabled) return s.hotkeys[hotkey_fix] ? "Off (" + hotkey_name(s.hotkeys[hotkey_fix]) + " to turn on)" : "Off";
     if (s.problem) return std::string("Not working: ") + s.problem;
     return "Waiting for a glass cockpit with DLSS or FSR selected";
 }
