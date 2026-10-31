@@ -32,6 +32,7 @@ size_t list_begin_render_pass_slot() { return offsetof(ID3D12GraphicsCommandList
 size_t list_end_render_pass_slot() { return offsetof(ID3D12GraphicsCommandList4Vtbl, EndRenderPass) / sizeof(void*); }
 size_t list_set_scissor_rects_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, RSSetScissorRects) / sizeof(void*); }
 size_t list_execute_indirect_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, ExecuteIndirect) / sizeof(void*); }
+size_t list_resource_barrier_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, ResourceBarrier) / sizeof(void*); }
 
 // Command queue: the lists the sim submits.
 size_t queue_execute_slot() { return offsetof(ID3D12CommandQueueVtbl, ExecuteCommandLists) / sizeof(void*); }
