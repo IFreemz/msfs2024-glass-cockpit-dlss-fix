@@ -1059,6 +1059,9 @@ int main(int argc, char** argv) {
                 // The sim recycling screen textures (A220): every 12 frames the screen texture is destroyed and a new one
                 // made (it takes the same slot), shown at another brightness. "swap" = error on the 2 frames after each swap.
                 {"still-swap", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, true},
+                // The same with dirt and the glass layer on, at the same brightness (the iniBuilds A380 swaps a screen's texture
+                // every few seconds): swap_curve = the error on the frame of a swap and each frame after it.
+                {"still-glass-swap", 35, 0, 0, 0, 1, 100, 0, 1, false, false, 0, false, 1, false, false, true},
                 // Edge trim: the fake DLSS output is magenta, so the trimmed band shows. "trim" = flicker of the pixels near the
                 // screen's edge (the band must not crawl with the jitter) and the share of them left to the upscaler.
                 {"still-trim-0", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0},
@@ -1135,6 +1138,7 @@ int main(int argc, char** argv) {
                 std::vector<float> flicker_map(size_t(output_w) * output_h, 0.0f); // per pixel: summed frame-to-frame change beyond the ideal's
                 int swapped_at = -100;
                 double swap_error = 0; uint64_t swap_n = 0;
+                std::array<double, 6> swap_curve{}; std::array<uint64_t, 6> swap_curve_n{};
                 double trim_flicker = 0, trimmed = 0; uint64_t trim_n = 0, trim_flicker_n = 0;
                 std::vector<uint8_t> trim_zone; // pixels on the screen within 8 output pixels of its edge
                 double error = 0, flicker = 0, after_change = 0, edge_error = 0, edge_flicker = 0, join_error = 0, join_flicker = 0;
@@ -1153,7 +1157,7 @@ int main(int argc, char** argv) {
                         device->CreateShaderResourceView(screen_t0 ? display.Get() : alpha.Get(), nullptr, cpu0);
                         device->CreateShaderResourceView(screen_t0 ? alpha.Get() : display.Get(), nullptr, cpu1);
                         device->CopyDescriptorsSimple(2, gpu_slot, cpu0, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-                        const float k = (t / 12) % 2 ? 0.35f : 1.0f;
+                        const float k = (t / 12) % 2 && !m.glass ? 0.35f : 1.0f;
                         material[2] = {gain[0] * k, gain[1] * k, gain[2] * k, 0};
                         upload(materials[0].Get(), material.data(), sizeof(material));
                         swapped_at = t;
@@ -1287,6 +1291,7 @@ int main(int argc, char** argv) {
                         if (t >= measure_from && t < change_at) { error += e / 3; ++error_n; if (!previous_out.empty()) { flicker += f / 3; ++flicker_n; } }
                         if (t >= change_at && t < change_at + 3) { after_change += e / 3; ++change_n; }
                         if (m.swap && t >= swapped_at && t < swapped_at + 2) { swap_error += e / 3; ++swap_n; }
+                        if (m.swap && t >= measure_from && t - swapped_at >= 0 && t - swapped_at < int(swap_curve.size())) { swap_curve[size_t(t - swapped_at)] += e / 3; ++swap_curve_n[size_t(t - swapped_at)]; }
                     }
                     if (t == change_at - 1) {
                         save(out, std::string(m.name));
@@ -1301,7 +1306,8 @@ int main(int argc, char** argv) {
                     flicker / std::max<uint64_t>(flicker_n, 1), after_change / std::max<uint64_t>(change_n, 1), edge_error / std::max<uint64_t>(edge_n, 1),
                     edge_flicker / std::max<uint64_t>(edge_flicker_n, 1));
                 if (m.swap) {
-                    std::printf(" swap_error=%.4f", swap_error / std::max<uint64_t>(swap_n, 1));
+                    std::printf(" swap_error=%.4f swap_curve=", swap_error / std::max<uint64_t>(swap_n, 1));
+                    for (size_t k = 0; k < swap_curve.size(); ++k) std::printf("%s%.4f", k ? "," : "", swap_curve[k] / std::max<uint64_t>(swap_curve_n[k], 1));
                     material[2] = {gain[0], gain[1], gain[2], 0};
                     upload(materials[0].Get(), material.data(), sizeof(material));
                 }

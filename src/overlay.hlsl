@@ -582,10 +582,11 @@ void solve(uint3 id : SV_DispatchThreadID)
     // off goes dark with it. Below 0.08 the sim shows another picture, unless the texture is nearly blank at that gain
     // (its picture would be a small part of what the sim shows there, as when the A400M's digits blink off): then the score
     // means nothing. Otherwise back to the upscaler after about 2 seconds of that (a moment's dip while the camera moves
-    // isn't another picture, and such a screen rarely scores enough to come back). A screen not matched yet, or dropped,
-    // still needs the whole picture to match (the iFly EFB).
+    // isn't another picture). A dropped screen that matched well before comes back at 0.15, with that gain: such a screen
+    // rarely scores more. A screen that never matched well still needs the whole picture to match (the iFly EFB).
     float3 good_gain = previous_a.w != 0 ? previous_detail.yzw : 0;
-    bool hold = previous_a.w > 0 && q <= 0.25 && any(good_gain > 0);
+    bool matched_before = any(good_gain > 0);
+    bool hold = (previous_a.w > 0 || (previous_a.w < 0 && q > 0.15)) && q <= 0.25 && matched_before;
     if (hold)
         [unroll] for (uint c = 0; c < 3; ++c)
         {
@@ -594,7 +595,7 @@ void solve(uint3 id : SV_DispatchThreadID)
         }
     double held_variance = 0;
     [unroll] for (uint c = 0; c < 3; ++c) held_variance += good_gain[c] * good_gain[c] * variance[c];
-    bool matches = previous_a.w < 0 ? q > 0.25 : q > 0.15 || (hold && (q > 0.08 || held_variance < 0.1 * pooled_scene_variance));
+    bool matches = previous_a.w < 0 ? q > (matched_before ? 0.15 : 0.25) : q > 0.15 || (hold && (q > 0.08 || held_variance < 0.1 * pooled_scene_variance));
     float low_calls = matches || previous_a.w <= 1 ? (matches ? 0 : 1) : previous_a.w;
     bool keep = matches || (hold && low_calls < 120);
     float3 gain = lerp(previous_a.rgb, a, w);
@@ -1153,7 +1154,14 @@ void composite(uint3 id : SV_DispatchThreadID)
             glass = lerp(glass, clamp(output[id.xy].rgb - content, glass - spread, glass + spread), detail);
         }
     }
-    else if (steady_weight > 0.05) glass = steady / steady_weight; // the slot just took another texture: last frame's glass
+    else if (steady_weight > 0.05)
+    {
+        // The slot just took another texture: last frame's glass, and the fine detail from DLSS within the range the steady
+        // glass allows a frame (there is no remainder this frame to tell the local spread).
+        glass = steady / steady_weight;
+        float3 spread = 0.25 * abs(glass) + 0.002;
+        if ((flags & 4) && !(flags & 2048)) glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread);
+    }
     float3 colour = content + glass;
     // Detail clamp: the redrawn screen may not be brighter or darker than what the sim itself drew in the 5x5 render
     // pixels around this one this frame. Content the sim shows survives; texture detail too thin for the sim to show

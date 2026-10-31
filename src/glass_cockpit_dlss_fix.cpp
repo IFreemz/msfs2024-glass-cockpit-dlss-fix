@@ -781,6 +781,7 @@ struct PaintingCopy {
     ComPtr<ID3D12Resource> copy; // kept for the fix's lifetime: the GPU or a slot may still read it
     D3D12_RESOURCE_DESC desc{};
     std::array<std::atomic<uint32_t>, 16> states{}; // per mip level; 0: none seen yet
+    std::atomic<uint32_t> state_changes{0}; // how often a level's read state changed: the barrier below needs the real one
     std::atomic<uint64_t> copied_recording{UINT64_MAX}; // the list recording it was last copied in (see ListState::recording)
     std::atomic<bool> copied_once{false}, waiting_logged{false};
     std::atomic<int> alpha_only{-1}; // the picture is in alpha only: 1, in colour: 0, not read back yet (or all black): -1
@@ -788,9 +789,11 @@ struct PaintingCopy {
     // 8-bit RGBA/BGRA paintings (alpha in the top byte); others are read as they are, in colour.
     ComPtr<ID3D12Resource> readback;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT readback_footprint{};
-    std::atomic<uint64_t> readback_present{0}, next_readback{0}; // readback_present: when the pending one was recorded (0: none)
+    std::atomic<uint64_t> readback_present{0}, next_readback{0}, readback_wait{0}; // readback_present: when the pending one was recorded (0: none)
 };
 constexpr int max_painting_copies = 16;
+constexpr uint32_t max_painting_state_changes = 16;
+constexpr uint64_t max_painting_copy_size = 2048; // a copy's memory and its copy each frame: larger ones are read as they are
 std::array<PaintingCopy, max_painting_copies> painting_copies;
 std::atomic<int> painting_copy_count{0}; // entries made (in use or free)
 std::mutex painting_copies_mutex; // making or reusing an entry
@@ -817,7 +820,9 @@ void barriers_recorded(UINT count, const D3D12_RESOURCE_BARRIER* barriers) noexc
             const UINT mips = std::min<UINT>(entry.desc.MipLevels, UINT(entry.states.size())), sub = b.Transition.Subresource;
             for (UINT m = 0; m < mips; ++m) {
                 if (sub != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && sub != m) continue;
-                if (entry.states[m].exchange(after, std::memory_order_relaxed) == after) continue;
+                const uint32_t before = entry.states[m].exchange(after, std::memory_order_relaxed);
+                if (before == after) continue;
+                if (before) entry.state_changes.fetch_add(1, std::memory_order_relaxed);
                 static std::atomic<int> logged{0};
                 if (logged++ < 16) log("painted screens: painting %p mip %u left in state 0x%x by the sim (subresource %s)", b.Transition.pResource, m, after,
                     sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ? "all" : "one");
@@ -1810,7 +1815,8 @@ Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
     find();
     if (!entry) {
         auto desc = painting.resource->GetDesc();
-        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 || desc.MipLevels > 16) return painting;
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 || desc.MipLevels > 16 ||
+            desc.Width > max_painting_copy_size || desc.Height > max_painting_copy_size) return painting;
         desc.Alignment = 0; desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; desc.Flags = D3D12_RESOURCE_FLAG_NONE;
         std::lock_guard lock(painting_copies_mutex);
         find();
@@ -1838,8 +1844,9 @@ Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
                 entry->desc = desc;
             }
             for (auto& s : entry->states) s.store(0, std::memory_order_relaxed);
+            entry->state_changes = 0;
             entry->copied_recording = UINT64_MAX; entry->copied_once = false; entry->waiting_logged = false;
-            entry->readback_present = 0; entry->next_readback = 0; entry->alpha_only = -1;
+            entry->readback_present = 0; entry->next_readback = 0; entry->readback_wait = 0; entry->alpha_only = -1;
             // The composite reads the copy over the mip levels the game's views of the painting cover.
             {
                 std::lock_guard view_lock(view_mips_mutex);
@@ -1850,6 +1857,12 @@ Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
             log("painted screens: painting %p (%llux%u mips=%u) gets a copy of its own %p", painting.resource, uint64_t(desc.Width), desc.Height, unsigned(desc.MipLevels),
                 entry->copy.Get());
         }
+    }
+    // The barriers were recorded on any thread, in any order, so they only tell the state here if it is always the same one.
+    // If not, no copy: the painting itself reads black after the upscaler, so the brightness match leaves it to the upscaler.
+    if (entry->state_changes.load(std::memory_order_relaxed) > max_painting_state_changes) {
+        LOG_ONCE("painted screens: painting %p changes between read states, it isn't copied", painting.resource);
+        return painting;
     }
     const Texture copy{entry->copy.Get(), painting.format};
     const UINT mips = std::min<UINT>(entry->desc.MipLevels, UINT(entry->states.size()));
@@ -4124,8 +4137,8 @@ void painting_readbacks(bool gpu_done) noexcept try {
         const uint8_t* data = nullptr;
         if (SUCCEEDED(e.readback->Map(0, &range, reinterpret_cast<void**>(const_cast<uint8_t**>(&data)))) && data) {
             uint32_t colour = 0, alpha = 0;
-            for (UINT y = 0; y < height; ++y)
-                for (UINT x = 0; x < width; ++x) {
+            for (UINT y = 0; y < height && !colour; ++y)
+                for (UINT x = 0; x < width && !colour; ++x) {
                     uint32_t p;
                     std::memcpy(&p, data + SIZE_T(y) * pitch + SIZE_T(x) * 4, 4);
                     colour |= p & 0xffffff; alpha |= p >> 24;
@@ -4138,7 +4151,9 @@ void painting_readbacks(bool gpu_done) noexcept try {
                     colour ? "in colour" : "in alpha only (colour all black): it is read as 1 - alpha, a grey picture");
             }
         }
-        e.next_readback = now + 30;
+        // Twice as long each time, up to a minute: a painting that stays black (a screen switched off) costs next to nothing.
+        e.readback_wait = std::min<uint64_t>(std::max<uint64_t>(e.readback_wait.load() * 2, 30), 3600);
+        e.next_readback = now + e.readback_wait.load();
         e.readback_present = 0;
         if (e.alpha_only.load() >= 0) e.readback = nullptr; // decided: the buffer isn't needed any more
     }
