@@ -740,6 +740,8 @@ template <class Change> void change_painted_views(Change&& change) {
     if (!change(next->views)) return;
     painted_views.store(next.get(), std::memory_order_release);
     painted_views_storage.push_back(std::move(next));
+    // Readers hold a snapshot for one look at a draw: only the last ones need to stay (the sim recycles such textures).
+    if (painted_views_storage.size() > 64) painted_views_storage.erase(painted_views_storage.begin());
 }
 void add_painted_view(const Signature& signature, ID3D12Resource* resource, DXGI_FORMAT format) {
     change_painted_views([&](std::vector<PaintedView>& views) {
@@ -752,7 +754,8 @@ void add_painted_view(const Signature& signature, ID3D12Resource* resource, DXGI
         if (views.size() >= max_painted_views) { LOG_ONCE("painted screens: %llu painting views, no more", uint64_t(max_painted_views)); return false; }
         const bool known = std::any_of(views.begin(), views.end(), [&](const PaintedView& v) { return v.resource == resource; });
         views.push_back({signature, resource, format});
-        if (!known) { // each painting once (a painting can be viewed in more than one format)
+        static std::atomic<int> logged{0};
+        if (!known && logged++ < 64) { // each painting once (a painting can be viewed in more than one format)
             const auto d = resource->GetDesc();
             log("painted screens: virtual painting resource=%p %llux%u mips=%u format=%u (%llu views of paintings)", resource, d.Width, d.Height,
                 unsigned(d.MipLevels), unsigned(format), uint64_t(views.size()));
@@ -1896,7 +1899,7 @@ Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
     }
     // Level 0 of the copy into a readback buffer (see painting_readbacks), until it shows where the picture is.
     const uint64_t now = present_count.load(std::memory_order_relaxed);
-    if (entry->alpha_only.load() < 0 && rgba8(entry->desc.Format) && !entry->readback_present.load() && now >= entry->next_readback.load()) {
+    if (entry->alpha_only.load() != 1 && rgba8(entry->desc.Format) && !entry->readback_present.load() && now >= entry->next_readback.load()) {
         if (!entry->readback) {
             UINT64 size = 0;
             state.device->native->GetCopyableFootprints(&entry->desc, 0, 1, 0, &entry->readback_footprint, nullptr, nullptr, &size);
@@ -4145,17 +4148,17 @@ void painting_readbacks(bool gpu_done) noexcept try {
                 }
             const D3D12_RANGE none{0, 0};
             e.readback->Unmap(0, &none);
-            if (colour || alpha) {
-                e.alpha_only = colour ? 0 : 1;
+            // In colour isn't final, in alpha only is: a painting can start out in colour (the Fenix A320's clock).
+            if ((colour || alpha) && e.alpha_only.exchange(colour ? 0 : 1) != (colour ? 0 : 1))
                 log("painted screens: painting %p (%ux%u) holds its picture %s", e.painting.load(), width, height,
                     colour ? "in colour" : "in alpha only (colour all black): it is read as 1 - alpha, a grey picture");
-            }
         }
-        // Twice as long each time, up to a minute: a painting that stays black (a screen switched off) costs next to nothing.
-        e.readback_wait = std::min<uint64_t>(std::max<uint64_t>(e.readback_wait.load() * 2, 30), 3600);
+        // Twice as long each time: a painting that stays black (a screen switched off) is read in full about once a
+        // minute at most; one in colour stops at its first coloured pixel, so it is looked at every 10 s or so.
+        e.readback_wait = std::min<uint64_t>(std::max<uint64_t>(e.readback_wait.load() * 2, 30), e.alpha_only.load() == 0 ? 600 : 3600);
         e.next_readback = now + e.readback_wait.load();
         e.readback_present = 0;
-        if (e.alpha_only.load() >= 0) e.readback = nullptr; // decided: the buffer isn't needed any more
+        if (e.alpha_only.load() == 1) e.readback = nullptr; // final: the buffer isn't needed any more
     }
 } catch (...) {}
 
