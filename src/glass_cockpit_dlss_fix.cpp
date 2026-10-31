@@ -764,6 +764,18 @@ void painting_barrier(ID3D12Resource* resource, UINT sub, uint32_t after) noexce
         break;
     }
 }
+// A painting black for a while (a screen switched off, a material the sim fills in later): left alone between looks at it, so
+// it costs no copy each frame and no slot. A screen that comes on is fixed within about 10 s.
+bool painting_stays_black(ID3D12Resource* painting) {
+    const uint64_t now = present_count.load(std::memory_order_relaxed);
+    const int n = painting_copy_count.load(std::memory_order_acquire);
+    for (int c = 0; c < n; ++c) {
+        const auto& e = painting_copies[c];
+        if (e.painting.load(std::memory_order_acquire) == painting)
+            return e.alpha_only.load() < 0 && e.readback_wait.load() >= 240 && (e.readback_present.load() || now < e.next_readback.load());
+    }
+    return false;
+}
 // A destroyed painting: its entry is free again, and no slot names its copy any more.
 void forget_painting_copy(ID3D12Resource* painting) {
     const int n = painting_copy_count.load(std::memory_order_acquire);
@@ -1777,6 +1789,7 @@ bool replay_painted(ListState& state, const glass::Draw& draw) noexcept try {
         if (!target.handle) return skip("target_unknown");
         if (reinterpret_cast<ID3D12Resource*>(target.handle)->GetDesc().DepthOrArraySize != 1) return skip("layered_target");
     }
+    if (painting_stays_black(texture.resource)) return false;
     // The mesh: where its indices start in the game's buffers (each readout is a node of its own).
     const uint64_t mesh = (uint64_t(draw.first) * 0x9E3779B97F4A7C15ull ^ uint64_t(int64_t(draw.base_vertex)) * 0xC2B2AE3D27D4EB4Full ^
         (uint64_t(draw.count) << 1) ^ (draw.indexed ? 1u : 0u)) | 1;
@@ -3648,8 +3661,9 @@ void painting_readbacks(bool gpu_done) noexcept try {
         const uint8_t* data = nullptr;
         if (SUCCEEDED(e.readback->Map(0, &range, reinterpret_cast<void**>(const_cast<uint8_t**>(&data)))) && data) {
             uint32_t colour = 0, alpha = 0;
-            for (UINT y = 0; y < height && !colour; ++y)
-                for (UINT x = 0; x < width && !colour; ++x) {
+            const UINT step = width > 1024 ? 2 : 1;
+            for (UINT y = 0; y < height && !colour; y += step)
+                for (UINT x = 0; x < width && !colour; x += step) {
                     uint32_t p;
                     std::memcpy(&p, data + SIZE_T(y) * pitch + SIZE_T(x) * 4, 4);
                     colour |= p & 0xffffff; alpha |= p >> 24;
@@ -3661,9 +3675,9 @@ void painting_readbacks(bool gpu_done) noexcept try {
                 log("painted screens: painting %p (%ux%u) holds its picture %s", e.painting.load(), width, height,
                     colour ? "in colour" : "in alpha only (colour all black): it is read as 1 - alpha, a grey picture");
         }
-        // Twice as long each time: a painting that stays black (a screen switched off) is read in full about once a
-        // minute at most; one in colour stops at its first coloured pixel, so it is looked at every 10 s or so.
-        e.readback_wait = std::min<uint64_t>(std::max<uint64_t>(e.readback_wait.load() * 2, 30), e.alpha_only.load() == 0 ? 600 : 3600);
+        // Twice as long each time, up to about 10 s (one in colour stops at its first coloured pixel; a black one is read in
+        // full, every other row of the largest).
+        e.readback_wait = std::min<uint64_t>(std::max<uint64_t>(e.readback_wait.load() * 2, 30), 600);
         e.next_readback = now + e.readback_wait.load();
         e.readback_present = 0;
         if (e.alpha_only.load() == 1) e.readback = nullptr; // final: the buffer isn't needed any more
