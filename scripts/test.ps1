@@ -34,7 +34,8 @@ try {
     # the fix must copy the painting while the decal reads it.
     & .\FlightSimulator2024.exe --painted --rov --source
     if ($LASTEXITCODE) { throw "Offline painted decal from a gauge test failed ($LASTEXITCODE)" }
-    # The same with the painting's picture in alpha only, its colour black (how the Fenix's readouts painting holds it).
+    # The same with the painting's picture in alpha only, its colour black (how the Fenix's readouts painting holds it),
+    # lit across by a shadow edge, as the sun lights the Fenix's FCU.
     & .\FlightSimulator2024.exe --painted --rov --source --alpha
     if ($LASTEXITCODE) { throw "Offline painted decal in alpha only test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --fsr --vr --track

@@ -37,6 +37,7 @@ cbuffer Constants : register(b0)
     uint diag_index;         // diagnostics: this upscaler call's number (screen pixels in the map are counted per call)
     float edge_trim;         // experimental: leave the outer edge_trim render pixels of each screen to the upscaler
     uint inverted_slots;     // painted screens: slots read as 1 - texture (a painting whose alpha is black coverage, read as grey)
+    uint painted_slots;      // painted screens: their slots (texture not decoded from sRGB, sampled like the sim; see decode)
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -99,6 +100,10 @@ float3 srgb_to_linear(float3 c)
     // Matches the conversion in the game's display shader.
     return select(c <= 0.04045, c / 12.92, pow(c * 0.947867 + 0.0521327, 2.4));
 }
+// The screen texture as the sim's shader takes it: decoded from sRGB like the display shader does, but as it is for a
+// painted screen (the materials that draw virtual paintings, e.g. the Fenix A320's decal, don't decode it). Decoded
+// anyway, a painted screen's half tones came out far too dark: a dark rim around every segment of the Fenix's digits.
+float3 decode(uint slot, float3 c) { return (painted_slots >> slot) & 1 ? c : srgb_to_linear(c); }
 
 // Full-size sampling (flags bit 9): the redrawn screens are read at full size only (their smaller mip levels flicker
 // when the view moves). Instead, a footprint holding many texels gets more taps, n x n, at most ~1.5 texels apart.
@@ -159,12 +164,12 @@ float3 sample_area(uint slot, float2 uv, float2 fx, float2 fy, uint n, bool soft
 float3 sample_display(uint slot, float2 uv, float2 dx, float2 dy)
 {
     uint n = sim_sampling || !(flags & 512) ? 2 : taps_for(slot, dx, dy);
-    if (n > 2) return srgb_to_linear(saturate(sample_area(slot, uv, dx, dy, n, false))) * pixel_brightness;
+    if (n > 2) return decode(slot, saturate(sample_area(slot, uv, dx, dy, n, false))) * pixel_brightness;
     static const float2 offsets[4] = { float2(0.125, 0.375), float2(0.375, -0.125), float2(-0.125, -0.375), float2(-0.375, 0.125) };
     float3 sum = 0;
     [unroll] for (uint i = 0; i < 4; ++i)
         sum += texture_tap(slot, uv + offsets[i].x * dx + offsets[i].y * dy, dx * 0.5, dy * 0.5);
-    return srgb_to_linear(saturate(sum * 0.25)) * pixel_brightness;
+    return decode(slot, saturate(sum * 0.25)) * pixel_brightness;
 }
 
 // Smooth lines: what DLSS converges to on a still screen, without its history. DLSS averages each pixel over the area of
@@ -180,7 +185,7 @@ float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy)
     bool soft = (flags & 128) != 0;
     float spread = soft ? 2.0 : 1.0;
     float2 fx = dx * width.x * spread, fy = dy * width.y * spread;
-    return srgb_to_linear(saturate(sample_area(slot, uv, fx, fy, (flags & 512) ? max(taps_for(slot, fx, fy), 4) : 4, soft))) * pixel_brightness;
+    return decode(slot, saturate(sample_area(slot, uv, fx, fy, (flags & 512) ? max(taps_for(slot, fx, fy), 4) : 4, soft))) * pixel_brightness;
 }
 
 uint map_slot(float4 m)
@@ -707,7 +712,7 @@ static const float temporal_blend = 0.1; // share of the new frame
 // Brightness of the screen texture at uv over one pixel's footprint: the change reference stored with the history.
 float texture_brightness(uint slot, float2 uv, float2 dx, float2 dy)
 {
-    return dot(srgb_to_linear(texture_tap(slot, uv, dx, dy)), luma);
+    return dot(decode(slot, texture_tap(slot, uv, dx, dy)), luma);
 }
 
 uint history_slice(bool current) { return layer * 2 + ((history_info & 1) ^ (current ? 0 : 1)); }
@@ -774,8 +779,26 @@ bool history_colour_at(float2 q, uint slot, float2 dx, float2 dy, out float4 val
     return inner_weight > 0.999;
 }
 
+// A painted screen at the mip level the sim's material reads (from one render pixel's footprint; dx, dy: per output
+// pixel), with the display shader's four taps at output pixel spacing. Its painting is far larger than the readouts on
+// screen and holds detail the sim never shows there (the Fenix A320's LCD segments: the gaps between them, their
+// shading), which full-size sampling and line smoothing brought out as light and dark patches in every digit. Seen
+// larger than its painting, it is read at full size anyway, as sharp as the other screens.
+float3 sample_painted(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    const bool was = sim_sampling;
+    sim_sampling = true;
+    const float2 gx = dx / map_per_output.x * 0.5, gy = dy / map_per_output.y * 0.5; // half footprint: SampleBias -1
+    static const float2 offsets[4] = { float2(0.125, 0.375), float2(0.375, -0.125), float2(-0.125, -0.375), float2(-0.375, 0.125) };
+    float3 sum = 0;
+    [unroll] for (uint i = 0; i < 4; ++i) sum += texture_tap(slot, uv + offsets[i].x * dx + offsets[i].y * dy, gx, gy);
+    sim_sampling = was;
+    return decode(slot, saturate(sum * 0.25)) * pixel_brightness;
+}
+
 float3 sample_lines(uint slot, float2 uv, float2 dx, float2 dy)
 {
+    if ((painted_slots >> slot) & 1) return sample_painted(slot, uv, dx, dy);
     return (flags & 8) ? sample_display_smooth(slot, uv, dx, dy) : sample_display(slot, uv, dx, dy);
 }
 
@@ -790,7 +813,7 @@ float3 temporal_content(uint2 p, uint slot, float2 uv, float2 dx, float2 dy)
     [unroll] for (uint k = 0; k < 4; ++k)
     {
         float2 o = float2(k & 1 ? 0.6 : -0.6, k & 2 ? 0.6 : -0.6);
-        float3 n = sample_display(slot, uv + o.x * dx + o.y * dy, dx, dy);
+        float3 n = (painted_slots >> slot) & 1 ? sample_painted(slot, uv + o.x * dx + o.y * dy, dx, dy) : sample_display(slot, uv + o.x * dx + o.y * dy, dx, dy);
         low = min(low, n); high = max(high, n);
     }
     float reference = texture_brightness(slot, uv, dx, dy);
@@ -1129,6 +1152,41 @@ void composite(uint3 id : SV_DispatchThreadID)
         if (join_gain.w > 0) content = lerp(content, sample_lines(join_slot, join_uv, join_dx, join_dy) * join_gain.rgb, join_share);
         pixel_brightness = own_brightness;
     }
+    // Painted screens: their readouts are lit, not only emissive (the sun and the shadows across the Fenix A320's FCU),
+    // so the light changes across a readout, and with it the colour (whiter in the sun). The light this frame around
+    // this pixel, per channel: the slope of the sim's picture against the brightness match over the 8x8 render pixels
+    // around (Gaussian weighted least squares; the intercept is glass, added light such as glare). Where the readout has
+    // little contrast around, the ratio of the two above the slot's black level instead, and with little lit around
+    // either, 1. The glass layer below is then what the light doesn't explain.
+    const bool painted = ((painted_slots >> slot) & 1) != 0;
+    float3 light = 1;
+    if (painted)
+    {
+        float3 sm = 0, sy = 0, smm = 0, smy = 0;
+        float sw = 0;
+        [loop] for (int j = 0; j < 64; ++j)
+        {
+            int2 q = cell + int2(j % 8 - 3, j / 8 - 3);
+            if (any(q < 0) || any(q >= int2(map_size))) continue;
+            float4 rv = residual[q];
+            if ((uint(rv.w + 0.5) & 63) != slot + 1) continue;
+            float3 y = scene.Load(int3(q, 0)).rgb;
+            if (!all(isfinite(y))) continue;
+            float3 model = y - rv.rgb; // the brightness match there
+            float2 t = float2(q) - location;
+            float w = exp(-dot(t, t) / (2 * 1.7 * 1.7));
+            sw += w; sm += w * model; sy += w * y; smm += w * model * model; smy += w * model * y;
+        }
+        if (sw > 1e-3)
+        {
+            float3 mean_m = sm / sw, mean_y = sy / sw;
+            float3 variance = max(smm / sw - mean_m * mean_m, 0), covariance = smy / sw - mean_m * mean_y;
+            float3 prior = 0.02 * gain.rgb * gain.rgb; // a readout 2 % lit around, at light 1
+            float3 ratio = (smy / sw - offset.rgb * mean_m + prior) / (smm / sw + prior);
+            light = clamp((covariance + prior * ratio) / (variance + prior), 0.1, 10);
+        }
+        content *= light;
+    }
 
     // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder around this pixel: its soft average and
     // spread over the 5x5 render pixels around it (Gaussian weights, same display only, not at symbol outlines). A soft
@@ -1150,6 +1208,12 @@ void composite(uint3 id : SV_DispatchThreadID)
         if (tag & 128) { count += 1; continue; }
         float2 t = float2(q) - location;
         float w = exp(-dot(t, t) / (2 * 1.7 * 1.7));
+        // A painted screen's: less the part the light explains (see above).
+        if (painted && (tag & 63) == slot + 1)
+        {
+            float3 y = scene.Load(int3(q, 0)).rgb;
+            if (all(isfinite(y))) rv.rgb -= (light - 1) * (y - rv.rgb);
+        }
         if (tag & 64) { outline_weight += w; outline_sum += w * rv.rgb; outline_m2 += w * rv.rgb * rv.rgb; continue; }
         smooth += w * rv.rgb; m2 += w * rv.rgb * rv.rgb; smooth_weight += w; count += 1;
     }
@@ -1167,7 +1231,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     // Steady glass (debug bit 13 off): the centre from the averaged glass layer of the 4 render pixels around.
     float3 steady = 0;
     float steady_weight = 0;
-    if (!(flags & 8192))
+    if (!(flags & 8192) && !painted) // a painted screen's averages the light (see above) into its glass
         [unroll] for (uint k = 0; k < 4; ++k)
         {
             int2 q = cell + int2(k & 1, k >> 1);
