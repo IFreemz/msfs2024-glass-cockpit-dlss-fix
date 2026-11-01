@@ -37,7 +37,7 @@ cbuffer Constants : register(b0)
     uint diag_index;         // diagnostics: this upscaler call's number (screen pixels in the map are counted per call)
     float edge_trim;         // experimental: leave the outer edge_trim render pixels of each screen to the upscaler
     uint inverted_slots;     // painted screens: slots read as 1 - texture (a painting whose alpha is black coverage, read as grey)
-    uint linear_slots;       // painted screens: slots whose texture is used as it is, not decoded from sRGB (see decode)
+    uint painted_slots;      // painted screens: their slots (texture not decoded from sRGB, sampled like the sim; see decode)
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -103,7 +103,7 @@ float3 srgb_to_linear(float3 c)
 // The screen texture as the sim's shader takes it: decoded from sRGB like the display shader does, but as it is for a
 // painted screen (the materials that draw virtual paintings, e.g. the Fenix A320's decal, don't decode it). Decoded
 // anyway, a painted screen's half tones came out far too dark: a dark rim around every segment of the Fenix's digits.
-float3 decode(uint slot, float3 c) { return (linear_slots >> slot) & 1 ? c : srgb_to_linear(c); }
+float3 decode(uint slot, float3 c) { return (painted_slots >> slot) & 1 ? c : srgb_to_linear(c); }
 
 // Full-size sampling (flags bit 9): the redrawn screens are read at full size only (their smaller mip levels flicker
 // when the view moves). Instead, a footprint holding many texels gets more taps, n x n, at most ~1.5 texels apart.
@@ -779,8 +779,26 @@ bool history_colour_at(float2 q, uint slot, float2 dx, float2 dy, out float4 val
     return inner_weight > 0.999;
 }
 
+// A painted screen at the mip level the sim's material reads (from one render pixel's footprint; dx, dy: per output
+// pixel), with the display shader's four taps at output pixel spacing. Its painting is far larger than the readouts on
+// screen and holds detail the sim never shows there (the Fenix A320's LCD segments: the gaps between them, their
+// shading), which full-size sampling and line smoothing brought out as light and dark patches in every digit. Seen
+// larger than its painting, it is read at full size anyway, as sharp as the other screens.
+float3 sample_painted(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    const bool was = sim_sampling;
+    sim_sampling = true;
+    const float2 gx = dx / map_per_output.x * 0.5, gy = dy / map_per_output.y * 0.5; // half footprint: SampleBias -1
+    static const float2 offsets[4] = { float2(0.125, 0.375), float2(0.375, -0.125), float2(-0.125, -0.375), float2(-0.375, 0.125) };
+    float3 sum = 0;
+    [unroll] for (uint i = 0; i < 4; ++i) sum += texture_tap(slot, uv + offsets[i].x * dx + offsets[i].y * dy, gx, gy);
+    sim_sampling = was;
+    return decode(slot, saturate(sum * 0.25)) * pixel_brightness;
+}
+
 float3 sample_lines(uint slot, float2 uv, float2 dx, float2 dy)
 {
+    if ((painted_slots >> slot) & 1) return sample_painted(slot, uv, dx, dy);
     return (flags & 8) ? sample_display_smooth(slot, uv, dx, dy) : sample_display(slot, uv, dx, dy);
 }
 
@@ -795,7 +813,7 @@ float3 temporal_content(uint2 p, uint slot, float2 uv, float2 dx, float2 dy)
     [unroll] for (uint k = 0; k < 4; ++k)
     {
         float2 o = float2(k & 1 ? 0.6 : -0.6, k & 2 ? 0.6 : -0.6);
-        float3 n = sample_display(slot, uv + o.x * dx + o.y * dy, dx, dy);
+        float3 n = (painted_slots >> slot) & 1 ? sample_painted(slot, uv + o.x * dx + o.y * dy, dx, dy) : sample_display(slot, uv + o.x * dx + o.y * dy, dx, dy);
         low = min(low, n); high = max(high, n);
     }
     float reference = texture_brightness(slot, uv, dx, dy);
