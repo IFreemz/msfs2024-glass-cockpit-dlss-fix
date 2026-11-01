@@ -5,7 +5,8 @@
 // VR=1 takes the VR vertex shader's interpolants (stand-in for the VR display shader).
 // SCREEN_T0=1: stand-in for the variant with the screen in t0, material in b4 and a texture-free alpha test.
 // PAINTED=1: stand-in for a translucent material drawing a virtual painting (the Fenix A320's readouts with "FCU readouts:
-// New"): a shader the fix doesn't know, the painting in t0, another material texture in t1, no alpha test.
+// New"): a shader the fix doesn't know, the painting in t0, another material texture in t1, no alpha test. Like the sim's
+// decal (ph_base_gbuffer), it takes the painting's texels as they are: no sRGB decoding.
 // ALPHA=1 (with PAINTED): the painting holds its picture in alpha only, its colour black (the Fenix A320's readouts): the
 // alpha is black laid over the lit backing, so the picture shows where the alpha is low (1 - alpha, as grey); the
 // reference reads the gauge's colour as that grey.
@@ -69,7 +70,11 @@ float4 main(CockpitVertex input) : SV_Target0
     float2 uv = glass_uv + material[5].xy, dx = ddx_coarse(uv), dy = ddy_coarse(uv);
     float3 sum = screen_tap(uv + 0.125 * dx + 0.375 * dy) + screen_tap(uv - 0.125 * dx - 0.375 * dy)
                + screen_tap(uv + 0.375 * dx - 0.125 * dy) + screen_tap(uv - 0.375 * dx + 0.125 * dy);
+#if PAINTED
+    float3 c = sum * 0.25;
+#else
     float3 c = srgb_to_linear(sum * 0.25);
+#endif
     float2 d = (glass_uv - material[4].xy) / max(material[4].z, 1e-3);
     float glare = material[4].w * exp(-dot(d, d));
     // Smooth fine "dirt": a few octaves of sine noise in glass space.

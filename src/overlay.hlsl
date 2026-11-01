@@ -37,6 +37,7 @@ cbuffer Constants : register(b0)
     uint diag_index;         // diagnostics: this upscaler call's number (screen pixels in the map are counted per call)
     float edge_trim;         // experimental: leave the outer edge_trim render pixels of each screen to the upscaler
     uint inverted_slots;     // painted screens: slots read as 1 - texture (a painting whose alpha is black coverage, read as grey)
+    uint linear_slots;       // painted screens: slots whose texture is used as it is, not decoded from sRGB (see decode)
 };
 
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
@@ -99,6 +100,10 @@ float3 srgb_to_linear(float3 c)
     // Matches the conversion in the game's display shader.
     return select(c <= 0.04045, c / 12.92, pow(c * 0.947867 + 0.0521327, 2.4));
 }
+// The screen texture as the sim's shader takes it: decoded from sRGB like the display shader does, but as it is for a
+// painted screen (the materials that draw virtual paintings, e.g. the Fenix A320's decal, don't decode it). Decoded
+// anyway, a painted screen's half tones came out far too dark: a dark rim around every segment of the Fenix's digits.
+float3 decode(uint slot, float3 c) { return (linear_slots >> slot) & 1 ? c : srgb_to_linear(c); }
 
 // Full-size sampling (flags bit 9): the redrawn screens are read at full size only (their smaller mip levels flicker
 // when the view moves). Instead, a footprint holding many texels gets more taps, n x n, at most ~1.5 texels apart.
@@ -159,12 +164,12 @@ float3 sample_area(uint slot, float2 uv, float2 fx, float2 fy, uint n, bool soft
 float3 sample_display(uint slot, float2 uv, float2 dx, float2 dy)
 {
     uint n = sim_sampling || !(flags & 512) ? 2 : taps_for(slot, dx, dy);
-    if (n > 2) return srgb_to_linear(saturate(sample_area(slot, uv, dx, dy, n, false))) * pixel_brightness;
+    if (n > 2) return decode(slot, saturate(sample_area(slot, uv, dx, dy, n, false))) * pixel_brightness;
     static const float2 offsets[4] = { float2(0.125, 0.375), float2(0.375, -0.125), float2(-0.125, -0.375), float2(-0.375, 0.125) };
     float3 sum = 0;
     [unroll] for (uint i = 0; i < 4; ++i)
         sum += texture_tap(slot, uv + offsets[i].x * dx + offsets[i].y * dy, dx * 0.5, dy * 0.5);
-    return srgb_to_linear(saturate(sum * 0.25)) * pixel_brightness;
+    return decode(slot, saturate(sum * 0.25)) * pixel_brightness;
 }
 
 // Smooth lines: what DLSS converges to on a still screen, without its history. DLSS averages each pixel over the area of
@@ -180,7 +185,7 @@ float3 sample_display_smooth(uint slot, float2 uv, float2 dx, float2 dy)
     bool soft = (flags & 128) != 0;
     float spread = soft ? 2.0 : 1.0;
     float2 fx = dx * width.x * spread, fy = dy * width.y * spread;
-    return srgb_to_linear(saturate(sample_area(slot, uv, fx, fy, (flags & 512) ? max(taps_for(slot, fx, fy), 4) : 4, soft))) * pixel_brightness;
+    return decode(slot, saturate(sample_area(slot, uv, fx, fy, (flags & 512) ? max(taps_for(slot, fx, fy), 4) : 4, soft))) * pixel_brightness;
 }
 
 uint map_slot(float4 m)
@@ -707,7 +712,7 @@ static const float temporal_blend = 0.1; // share of the new frame
 // Brightness of the screen texture at uv over one pixel's footprint: the change reference stored with the history.
 float texture_brightness(uint slot, float2 uv, float2 dx, float2 dy)
 {
-    return dot(srgb_to_linear(texture_tap(slot, uv, dx, dy)), luma);
+    return dot(decode(slot, texture_tap(slot, uv, dx, dy)), luma);
 }
 
 uint history_slice(bool current) { return layer * 2 + ((history_info & 1) ^ (current ? 0 : 1)); }

@@ -2459,7 +2459,7 @@ bool create_composite(DeviceState& d) {
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 11, 0, uav_base + 11}}; // u11: screen capture (what the brightness match reads)
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 23};
+    params[0].Constants = {0, 0, 24};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {5, ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -3225,7 +3225,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         first_layer.Texture2DArray = {0, 1, 0, 1, 0, 0};
         d.native->CreateShaderResourceView(colour, &first_layer, at(1));
     } else d.native->CreateShaderResourceView(colour, &srv, at(1));
-    uint32_t inverted_slots = 0;
+    uint32_t inverted_slots = 0, linear_slots = 0;
     for (unsigned i = 0; i < slot_count; ++i) {
         auto resource = slot_resources[i].load();
         srv.Format = resource ? slot_formats[i] : DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -3235,6 +3235,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         // A painting with its picture in alpha only: that alpha as a grey picture, read inverted (see PaintingCopy).
         const bool alpha_only = resource && alpha_only_copy(resource);
         if (alpha_only) inverted_slots |= 1u << i;
+        if (resource && slot_meshes[i].load()) linear_slots |= 1u << i; // a painted screen's texture isn't decoded from sRGB
         srv.Shader4ComponentMapping = alpha_only ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 3, 3,
             D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         d.native->CreateShaderResourceView(resource, &srv, at(2 + i));
@@ -3319,19 +3320,19 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     d.native->CreateShaderResourceView(depth, &depth_view, at(uav_base + 10));
 
     struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp, angle_soften;
-        UINT history_info, frame_index, bounds_reset, diag_index; float edge_trim; UINT inverted_slots; } constants{
+        UINT history_info, frame_index, bounds_reset, diag_index; float edge_trim; UINT inverted_slots, linear_slots; } constants{
         render_w, render_h, out_w, out_h, float(render_w) / out_w, float(render_h) / out_h,
         jitter_positive ? jitter_x : -jitter_x, jitter_positive ? jitter_y : -jitter_y, 0.25f, (tint ? 2u : 0u) | (output_readable ? 4u : 0u) | (smoothing_percent > 0 ? 8u : 0u) | (dark_screen_fix ? 16u : 0u) | (seam_fix ? 32u : 0u) | (temporal ? 64u : 0u) | (soft_smoothing ? 128u : 0u) | (stable_edges ? 256u : 0u) | (mip0_only ? 512u : 0u) | (calm_glass ? 4096u : 0u) | (depth ? 16384u : 0u) | (direction == 1 ? 32768u : 0u) | debug_flags.load(),
         smoothing_percent / 50.0f, layer, glass_percent / 100.0f, edge_fade_percent / 100.0f,
         edge_stretch_percent / 100.0f, detail_clamp_percent / 100.0f,
-        angle_soften_percent / 100.0f, history_info, frame_index, bounds_reset.exchange(0), d.diag_index, edge_trim_percent / 100.0f, inverted_slots};
+        angle_soften_percent / 100.0f, history_info, frame_index, bounds_reset.exchange(0), d.diag_index, edge_trim_percent / 100.0f, inverted_slots, linear_slots};
     d.diag_calls[d.diag_index & 63] = {present_count.load(std::memory_order_relaxed), map->recorded_present.load(), pending, map->views.load(), output, GetCurrentThreadId()};
 
     auto native = state->native;
     ID3D12DescriptorHeap* heaps[]{d.heap.Get()};
     native->SetDescriptorHeaps(1, heaps);
     native->SetComputeRootSignature(d.root.Get());
-    native->SetComputeRoot32BitConstants(0, 23, &constants, 0);
+    native->SetComputeRoot32BitConstants(0, 24, &constants, 0);
     native->SetComputeRootDescriptorTable(1, gpu);
     native->SetComputeRootUnorderedAccessView(2, d.sums->GetGPUVirtualAddress());
     // DLSS leaves its colour input compute-readable and the output as UAV; FSR reports the states it restores.
@@ -3367,7 +3368,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
                 map->fit_input = nullptr;
         }
         constants.flags |= map->fit_input ? 65536u : 0u;
-        native->SetComputeRoot32BitConstants(0, 23, &constants, 0);
+        native->SetComputeRoot32BitConstants(0, 24, &constants, 0);
     }
     {
         D3D12_UNORDERED_ACCESS_VIEW_DESC fit_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D};
@@ -3393,7 +3394,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         uav_barrier(native);
         d.accumulators_zeroed = true;
         constants.flags |= 1;
-        native->SetComputeRoot32BitConstants(0, 23, &constants, 0);
+        native->SetComputeRoot32BitConstants(0, 24, &constants, 0);
     }
     native->SetPipelineState(d.passes[1].Get());
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
@@ -4191,6 +4192,7 @@ void painting_readbacks(bool gpu_done) noexcept try {
         auto& e = painting_copies[c];
         const uint64_t at = e.readback_present.load();
         if (!at || (!gpu_done && now < at + 30) || !e.readback) continue;
+        if (!e.painting.load()) { e.readback_present = 0; continue; } // its painting is gone: the entry waits to be reused
         const auto& fp = e.readback_footprint;
         const UINT width = fp.Footprint.Width, height = fp.Footprint.Height, pitch = fp.Footprint.RowPitch;
         const D3D12_RANGE range{0, SIZE_T(pitch) * height};
