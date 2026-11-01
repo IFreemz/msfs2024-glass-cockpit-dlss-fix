@@ -3235,7 +3235,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         // A painting with its picture in alpha only: that alpha as a grey picture, read inverted (see PaintingCopy).
         const bool alpha_only = resource && alpha_only_copy(resource);
         if (alpha_only) inverted_slots |= 1u << i;
-        if (resource && slot_meshes[i].load()) painted_slots |= 1u << i; // read like the sim's material does (see sample_painted)
+        if (resource && slot_meshes[i].load() && !separate_matches(resource)) painted_slots |= 1u << i; // read like the sim's material does (see sample_painted)
         srv.Shader4ComponentMapping = alpha_only ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 3, 3,
             D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         d.native->CreateShaderResourceView(resource, &srv, at(2 + i));
