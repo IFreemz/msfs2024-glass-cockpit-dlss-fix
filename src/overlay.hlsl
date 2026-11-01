@@ -1152,6 +1152,41 @@ void composite(uint3 id : SV_DispatchThreadID)
         if (join_gain.w > 0) content = lerp(content, sample_lines(join_slot, join_uv, join_dx, join_dy) * join_gain.rgb, join_share);
         pixel_brightness = own_brightness;
     }
+    // Painted screens: their readouts are lit, not only emissive (the sun and the shadows across the Fenix A320's FCU),
+    // so the light changes across a readout, and with it the colour (whiter in the sun). The light this frame around
+    // this pixel, per channel: the slope of the sim's picture against the brightness match over the 8x8 render pixels
+    // around (Gaussian weighted least squares; the intercept is glass, added light such as glare). Where the readout has
+    // little contrast around, the ratio of the two above the slot's black level instead, and with little lit around
+    // either, 1. The glass layer below is then what the light doesn't explain.
+    const bool painted = ((painted_slots >> slot) & 1) != 0;
+    float3 light = 1;
+    if (painted)
+    {
+        float3 sm = 0, sy = 0, smm = 0, smy = 0;
+        float sw = 0;
+        [loop] for (int j = 0; j < 64; ++j)
+        {
+            int2 q = cell + int2(j % 8 - 3, j / 8 - 3);
+            if (any(q < 0) || any(q >= int2(map_size))) continue;
+            float4 rv = residual[q];
+            if ((uint(rv.w + 0.5) & 63) != slot + 1) continue;
+            float3 y = scene.Load(int3(q, 0)).rgb;
+            if (!all(isfinite(y))) continue;
+            float3 model = y - rv.rgb; // the brightness match there
+            float2 t = float2(q) - location;
+            float w = exp(-dot(t, t) / (2 * 1.7 * 1.7));
+            sw += w; sm += w * model; sy += w * y; smm += w * model * model; smy += w * model * y;
+        }
+        if (sw > 1e-3)
+        {
+            float3 mean_m = sm / sw, mean_y = sy / sw;
+            float3 variance = max(smm / sw - mean_m * mean_m, 0), covariance = smy / sw - mean_m * mean_y;
+            float3 prior = 0.02 * gain.rgb * gain.rgb; // a readout 2 % lit around, at light 1
+            float3 ratio = (smy / sw - offset.rgb * mean_m + prior) / (smm / sw + prior);
+            light = clamp((covariance + prior * ratio) / (variance + prior), 0.1, 10);
+        }
+        content *= light;
+    }
 
     // Glass layer (dirt, glare, reflections, shadows) = this frame's remainder around this pixel: its soft average and
     // spread over the 5x5 render pixels around it (Gaussian weights, same display only, not at symbol outlines). A soft
@@ -1173,6 +1208,12 @@ void composite(uint3 id : SV_DispatchThreadID)
         if (tag & 128) { count += 1; continue; }
         float2 t = float2(q) - location;
         float w = exp(-dot(t, t) / (2 * 1.7 * 1.7));
+        // A painted screen's: less the part the light explains (see above).
+        if (painted && (tag & 63) == slot + 1)
+        {
+            float3 y = scene.Load(int3(q, 0)).rgb;
+            if (all(isfinite(y))) rv.rgb -= (light - 1) * (y - rv.rgb);
+        }
         if (tag & 64) { outline_weight += w; outline_sum += w * rv.rgb; outline_m2 += w * rv.rgb * rv.rgb; continue; }
         smooth += w * rv.rgb; m2 += w * rv.rgb * rv.rgb; smooth_weight += w; count += 1;
     }
@@ -1190,7 +1231,7 @@ void composite(uint3 id : SV_DispatchThreadID)
     // Steady glass (debug bit 13 off): the centre from the averaged glass layer of the 4 render pixels around.
     float3 steady = 0;
     float steady_weight = 0;
-    if (!(flags & 8192))
+    if (!(flags & 8192) && !painted) // a painted screen's averages the light (see above) into its glass
         [unroll] for (uint k = 0; k < 4; ++k)
         {
             int2 q = cell + int2(k & 1, k >> 1);

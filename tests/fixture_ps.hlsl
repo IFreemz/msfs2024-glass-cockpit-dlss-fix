@@ -9,7 +9,8 @@
 // decal (ph_base_gbuffer), it takes the painting's texels as they are: no sRGB decoding.
 // ALPHA=1 (with PAINTED): the painting holds its picture in alpha only, its colour black (the Fenix A320's readouts): the
 // alpha is black laid over the lit backing, so the picture shows where the alpha is low (1 - alpha, as grey); the
-// reference reads the gauge's colour as that grey.
+// reference reads the gauge's colour as that grey. The readouts are lit, not only emissive: a soft diagonal shadow edge
+// across the screen, the sunlit side brighter and whiter, the shaded side darker (the sun on the Fenix's FCU).
 #include "../src/cockpit_vertex.hlsli"
 
 cbuffer RenderState : register(b1) { float4 render_state; };
@@ -82,6 +83,9 @@ float4 main(CockpitVertex input) : SV_Target0
     float3 glass = material[5].z * dirt * float3(0.9, 0.85, 0.8) + glare * float3(1.0, 0.9, 0.7);
     if (material[5].w > 0 && glass_uv.x > material[5].w) glass *= 0.25; // shadow edge
     c *= instance_data[min(input.instance, 15u) * 4].rgb * input.color;
+#if ALPHA
+    c *= lerp(float3(0.5, 0.48, 0.45), float3(1.5, 1.6, 1.9), smoothstep(-0.05, 0.05, glass_uv.x - 0.6 * glass_uv.y - 0.15));
+#endif
     const float4 result = float4(c * material[2].rgb + material[3].rgb + glass, (REFERENCE ? 0.5 : 1.0) * coverage);
 #if ROV
     scene_out[uint2(input.position.xy)] = result;
