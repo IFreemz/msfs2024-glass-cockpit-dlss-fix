@@ -900,7 +900,7 @@ int main(int argc, char** argv) {
             using Image = std::vector<std::array<float, 4>>;
             bool join = false;
             // The display as drawn: one quad, or (join) its two halves with their own textures.
-            bool band = false, inset = false, atlas = false, windows = false, dim = false, unpowered = false, mixed = false;
+            bool band = false, inset = false, atlas = false, windows = false, dim = false, unpowered = false, mixed = false, faint = false;
             auto window_material = buffer(device.Get(), 512, D3D12_HEAP_TYPE_UPLOAD);
             auto draw_display = [&] {
                 if (windows) {
@@ -931,6 +931,14 @@ int main(int argc, char** argv) {
                         if (dim && q == 2) list->SetGraphicsRootConstantBufferView(2, (unpowered ? objects_off : objects[0])->GetGPUVirtualAddress());
                     }
                     if (unpowered) list->SetGraphicsRootConstantBufferView(2, objects[0]->GetGPUVirtualAddress());
+                    return;
+                }
+                if (faint) {
+                    list->SetGraphicsRootConstantBufferView(2, objects_faint->GetGPUVirtualAddress());
+                    list->SetGraphicsRootConstantBufferView(4, material_faint->GetGPUVirtualAddress());
+                    list->DrawIndexedInstanced(6, 1, 0, 1, 0);
+                    list->SetGraphicsRootConstantBufferView(2, objects[0]->GetGPUVirtualAddress());
+                    list->SetGraphicsRootConstantBufferView(4, materials[0]->GetGPUVirtualAddress());
                     return;
                 }
                 if (!join) { list->DrawIndexedInstanced(6, 1, 0, 1, 0); return; }
@@ -1072,6 +1080,12 @@ int main(int argc, char** argv) {
                 // The same with dirt and the glass layer on, at the same brightness (the iniBuilds A380 swaps a screen's texture
                 // every few seconds): swap_curve = the error on the frame of a swap and each frame after it.
                 {"still-glass-swap", 35, 0, 0, 0, 1, 100, 0, 1, false, false, 0, false, 1, false, false, true},
+                // The same with the screen going between meshes 50x apart in brightness, looking the same (the A380's textures go
+                // between meshes at 1, 360 and more). "-upscaler": the fake DLSS output is magenta, so a frame left to it shows.
+                {"still-glass-swap-level", 35, 0, 0, 0, 1, 100, 0, 1, false, false, 0, false, 1, false, false, true},
+                {"still-glass-swap-level-upscaler", 35, 0, 0, 0, 1, 100, 0, 1, false, false, 0, false, 1, false, false, true},
+                // Swapping a texture shared by meshes at different brightness.
+                {"still-glass-swap-dim", 35, 0, 0, 0, 1, 100, 0, 1, false, false, 0, false, 1, false, true, true, 0, false, 0, false, false, true},
                 // Edge trim: the fake DLSS output is magenta, so the trimmed band shows. "trim" = flicker of the pixels near the
                 // screen's edge (the band must not crawl with the jitter) and the share of them left to the upscaler.
                 {"still-trim-0", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0},
@@ -1139,7 +1153,7 @@ int main(int argc, char** argv) {
                 set_occlusion(m.occlusion || occlusion_everywhere);
                 occluder = {};
                 double occluder_error = 0, ring_trimmed = 0, blank_dropped = 0; uint64_t occluder_n = 0, ring_n = 0, blank_n = 0;
-                dlss_magenta = std::strstr(m.name, "trim") != nullptr || m.blank || m.windows;
+                dlss_magenta = std::strstr(m.name, "trim") != nullptr || std::strstr(m.name, "upscaler") != nullptr || m.blank || m.windows;
                 set_full_size(m.full_size);
                 set_temporal(0);
                 join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas; windows = m.windows; dim = m.dim; mixed = std::strstr(m.name, "mixed") != nullptr;
@@ -1176,6 +1190,12 @@ int main(int argc, char** argv) {
                         const float k = (t / 12) % 2 && !m.glass ? 0.35f : 1.0f;
                         material[2] = {gain[0] * k, gain[1] * k, gain[2] * k, 0};
                         upload(materials[0].Get(), material.data(), sizeof(material));
+                        faint = std::strstr(m.name, "swap-level") != nullptr && (t / 12) % 2;
+                        if (faint) {
+                            auto bright = material;
+                            for (int c = 0; c < 3; ++c) bright[2][c] = gain[c] * 50;
+                            upload(material_faint.Get(), bright.data(), sizeof(bright));
+                        }
                         swapped_at = t;
                     }
                     const auto c = constants(m.speed * t, m.scale);
@@ -1326,6 +1346,7 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k < swap_curve.size(); ++k) std::printf("%s%.4f", k ? "," : "", swap_curve[k] / std::max<uint64_t>(swap_curve_n[k], 1));
                     material[2] = {gain[0], gain[1], gain[2], 0};
                     upload(materials[0].Get(), material.data(), sizeof(material));
+                    faint = false;
                 }
                 if (m.occluder) std::printf(" occluder_error=%.4f", occluder_error / std::max<uint64_t>(occluder_n, 1));
                 if (m.occluder && dlss_magenta) std::printf(" ring_trimmed=%.3f", ring_trimmed / std::max<uint64_t>(ring_n, 1));
