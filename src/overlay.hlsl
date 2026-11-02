@@ -91,7 +91,9 @@ float map_level(float4 m) { return exp2((m.w - round(m.w)) * 64); }
 float brightness_ratio(float4 m, uint slot)
 {
     if (slot >= slot_count) return 1;
-    float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4));
+    // A slot that just took another texture: the reference is still the old texture's mesh, so against this frame's meshes
+    // (they come in during the fit pass; until then 1, the same for a texture on one mesh).
+    float reference = asfloat(edge_bounds.Load(((bounds_reset & (1u << slot)) ? brightness_next : brightness_base) + slot * 4));
     return reference > 0 ? clamp(map_level(m) / reference, 0, 16) : 1;
 }
 
@@ -363,7 +365,9 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     // A slot that just took another texture has the old texture's gain: no remainder from it this frame. Tagged (+128) so
     // the glass layer of these pixels stays last frame's: the glass in front of the screen didn't change with the texture,
     // and without it the screen's background dropped to the plain offset for a frame (iniBuilds A380: a flash at each swap).
-    bool swapped_slot = active && (bounds_reset & (1u << slot));
+    // The same on the frame after, when the new texture's first fit wasn't used: there's no gain yet, and the solve pass's
+    // fit comes after this one, so the screen is back this frame with no remainder to show its glass.
+    bool swapped_slot = active && ((bounds_reset & (1u << slot)) || params[slot * params_per_slot].w == 0);
     float4 gain = active && !swapped_slot ? params[slot * params_per_slot] : 0;
     if (active)
     {
@@ -510,16 +514,15 @@ void solve(uint3 id : SV_DispatchThreadID)
     // changed since the stored match was fitted, the match is rescaled to it (the same picture, no jump).
     float reference = asfloat(edge_bounds.Load(brightness_base + slot * 4)), fitted = asfloat(edge_bounds.Load(brightness_fitted + slot * 4));
     // The slot took another screen texture (the sim recycles them): its brightness match belongs to the old one, and
-    // this call's reference is still the old screen's brightest mesh (it follows a frame behind). With the ratio capped
-    // at 16x, a texture from a mesh much brighter than that (iniBuilds A380: 1 against 3600) was fitted 16x off and then
-    // rescaled by the full 3600x: the screen flashed ~200x too bright. The same for a reference change over 16x. Leave the
-    // screen to the upscaler for this call and start over on the next, with the new reference.
-    // But the sim swaps some screens' textures every few seconds (iniBuilds A380), and that one frame from the upscaler
-    // showed as a flash. So when the new texture's meshes are within the cap of the reference, this frame's fit is sound:
-    // used at once if it matches well (see `fresh` below), and rescaled like any other when the reference follows.
+    // the reference is still the old screen's brightest mesh (it follows a frame behind). So the new texture is read and
+    // drawn against this frame's meshes (see brightness_ratio), whatever the old one's brightness: its fit is sound at once,
+    // used if it matches well (see `fresh` below). The sim swaps some screens' textures every few seconds, and the iniBuilds
+    // A380's go between meshes at 1, 360 and more: a frame from the upscaler at each swap showed as a flash.
+    // A reference change over 16x on the same texture: leave the screen to the upscaler for this call and start over on the
+    // next, with the new reference.
     bool swapped = bounds_reset & (1u << slot);
     float seen = asfloat(edge_bounds.Load(brightness_next + slot * 4));
-    bool fresh = swapped && reference > 0 && seen > 0 && seen <= 16 * reference && 16 * seen >= reference;
+    bool fresh = swapped && seen > 0;
     // The slot's meshes this frame (read back for the log), and how often their brightness didn't explain the picture (below).
     float dimmest_inverse = asfloat(edge_bounds.Load(brightness_dimmest + slot * 4));
     float4 levels = float4(reference, seen, dimmest_inverse > 0 ? 1 / dimmest_inverse : 0, swapped ? 0 : params[slot * params_per_slot + 4].w);
@@ -541,7 +544,7 @@ void solve(uint3 id : SV_DispatchThreadID)
         edge_bounds.Store(brightness_fitted + slot * 4, 0);
         return;
     }
-    if (fresh) { previous_a = 0; fitted = 0; }
+    if (fresh) { previous_a = 0; fitted = 0; reference = seen; }
     float4 previous_detail = params[slot * params_per_slot + 3];
     if (reference > 0 && fitted > 0 && reference != fitted)
     {
