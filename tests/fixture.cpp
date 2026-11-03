@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
         bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false,
-            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false;
+            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false, occluder_test = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
@@ -260,6 +260,7 @@ int main(int argc, char** argv) {
             rov |= !std::strcmp(argv[i], "--rov");
             gauge_source |= !std::strcmp(argv[i], "--source");
             alpha_only |= !std::strcmp(argv[i], "--alpha");
+            occluder_test |= !std::strcmp(argv[i], "--occluder");
         }
         if (hotpatch) redirect_evaluate_like_mfg_unlock();
         if (screen_t0) std::printf("display: variant with the screen texture in t0\n");
@@ -281,6 +282,12 @@ int main(int argc, char** argv) {
         // fix must not take that for good.
         require(!alpha_only || gauge_source, "--alpha is for --painted --rov --source");
         if (alpha_only) std::printf("display: the painting's picture in alpha only\n");
+        // --occluder: something in front of the screen (a hand, the yoke), drawn into colour and depth after it; in VR at
+        // another spot in each eye (the eyes see it from a few centimetres apart). The fix must leave it to the upscaler in
+        // every eye. DLSS gets the depth as the sim gives it in VR: the first call of a frame both eyes' depth in one
+        // texture, that call's eye first, the second call its eye's depth alone.
+        require(!occluder_test || (!painted && !screen_t0 && !fsr && !ngx_proxy && !optiscaler_fsr && !motion), "--occluder is for DLSS on the display shader");
+        if (occluder_test) std::printf("display: an occluder in front of the screen%s\n", vr ? ", at its own spot in each eye" : "");
         if (painted) std::printf("display: painted screen (%s, virtual painting in t0%s)\n", rov ? "decal through a rasterizer-ordered UAV" : "translucent material",
             depthless ? ", no depth test" : "");
         const UINT views = vr ? 2 : 1;
@@ -786,6 +793,9 @@ int main(int argc, char** argv) {
         auto final_views = vr ? texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, UINT16(views)) : nullptr;
         D3D12_CLEAR_VALUE depth_clear{DXGI_FORMAT_D32_FLOAT}; depth_clear.DepthStencil.Depth = 1;
         auto depth = texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear, UINT16(views));
+        // --occluder in VR: the depth inputs of the two upscaler calls (see --occluder): both eyes', the first call's eye first, and one.
+        auto call_depth = occluder_test && vr ? texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, UINT16(views)) : nullptr;
+        auto eye_depth = occluder_test && vr ? texture(device.Get(), render_w, render_h, 1, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST) : nullptr;
         const float magenta[4]{1, 0, 1, 1};
         D3D12_CLEAR_VALUE magenta_clear{DXGI_FORMAT_R11G11B10_FLOAT, {1, 0, 1, 1}};
         auto output = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R11G11B10_FLOAT,
@@ -797,7 +807,7 @@ int main(int argc, char** argv) {
         auto reference = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, &ref_clear);
         auto ref_depth = texture(device.Get(), output_w, output_h, 1, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear);
         ComPtr<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
-        D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0}, dh{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 5, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0}, dh{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         check(device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&rtv_heap))); check(device->CreateDescriptorHeap(&dh, IID_PPV_ARGS(&dsv_heap)));
         const UINT rinc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV), dinc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         auto rtv = [&](UINT i) { auto h = rtv_heap->GetCPUDescriptorHandleForHeapStart(); h.ptr += i * rinc; return h; };
@@ -818,6 +828,15 @@ int main(int argc, char** argv) {
             device->CreateDepthStencilView(depth.Get(), &plain, dsv(0));
         }
         device->CreateDepthStencilView(ref_depth.Get(), nullptr, dsv(1));
+        if (vr) // each eye's layer on its own (--occluder draws into it)
+            for (UINT e = 0; e < views; ++e) {
+                D3D12_RENDER_TARGET_VIEW_DESC one{DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RTV_DIMENSION_TEXTURE2DARRAY};
+                one.Texture2DArray = {0, e, 1, 0};
+                device->CreateRenderTargetView(scene.Get(), &one, rtv(3 + e));
+                D3D12_DEPTH_STENCIL_VIEW_DESC layer{DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2DARRAY};
+                layer.Texture2DArray = {0, e, 1};
+                device->CreateDepthStencilView(depth.Get(), &layer, dsv(2 + e));
+            }
 
         auto bind = [&](ID3D12PipelineState* pso, int variant) {
             const int camera = variant == 1 ? 1 : 0;
@@ -1422,6 +1441,25 @@ int main(int argc, char** argv) {
             const int variant = f.camera == 1 ? 1 : (f.glare ? 2 : 0);
             std::array<std::vector<std::array<float, 4>>, 2> refs;
             for (UINT eye = 0; eye < views; ++eye) refs[eye] = render_reference(variant, eye);
+            // --occluder: where it is in each eye (render pixels): 60 wide over the middle half of the screen's height, a
+            // quarter of the way across the screen in one eye and half way in the other. The ideal picture shows it, not the
+            // screen (and the fake DLSS output there is magenta, like everything that isn't screen).
+            const float occluder_colour[4]{0.2f, 0.12f, 0.05f, 1};
+            std::array<D3D12_RECT, 2> occluders{};
+            if (occluder_test && f.draw)
+                for (UINT eye = 0; eye < views; ++eye) {
+                    UINT x0 = output_w, y0 = output_h, x1 = 0, y1 = 0; // the screen (the reference's alpha is half its coverage)
+                    for (UINT y = 0; y < output_h; ++y) for (UINT x = 0; x < output_w; ++x)
+                        if (refs[eye][size_t(y) * output_w + x][3] > 0.25f) { x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y); }
+                    const float scale = float(output_w) / render_w;
+                    const LONG left = LONG((x0 + (x1 - x0) * (eye ? 0.5f : 0.25f)) / scale);
+                    occluders[eye] = {left, LONG((y0 + (y1 - y0) / 4) / scale), left + 60, LONG((y1 - (y1 - y0) / 4) / scale)};
+                    for (UINT y = 0; y < output_h; ++y) for (UINT x = 0; x < output_w; ++x) {
+                        const float rx = (x + 0.5f) / scale, ry = (y + 0.5f) / scale;
+                        if (rx >= occluders[eye].left && rx < occluders[eye].right && ry >= occluders[eye].top && ry < occluders[eye].bottom)
+                            refs[eye][size_t(y) * output_w + x] = {occluder_colour[0], occluder_colour[1], occluder_colour[2], 0};
+                    }
+                }
             if (gauge_source) paint(true, &f == &frames[0]); // the HTML renderer draws the painting from the gauge (first: in colour)
             list->ClearRenderTargetView(rtv(0), black.Color, 0, nullptr);
             list->ClearDepthStencilView(dsv(0), D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
@@ -1438,8 +1476,29 @@ int main(int argc, char** argv) {
                 list->DrawIndexedInstanced(6, views, 0, 1, 0);
                 if (rov) transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
             }
+            if (occluder_test && f.draw)
+                for (UINT eye = 0; eye < views; ++eye) { // after the screen, in front of it
+                    list->ClearDepthStencilView(vr ? dsv(2 + eye) : dsv(0), D3D12_CLEAR_FLAG_DEPTH, 0, 0, 1, &occluders[eye]);
+                    list->ClearRenderTargetView(vr ? rtv(3 + eye) : rtv(0), occluder_colour, 1, &occluders[eye]);
+                }
             if (gauge_source) paint(false); // and empties it again before the upscaler runs
             transition(list.Get(), scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, vr ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (occluder_test) {
+                // The upscaler's depth input (see --occluder). VR: the first call (the second eye's: the calls go out of layer
+                // order, below) gets both eyes' depth with its eye first, the second call the first eye's alone.
+                transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, vr ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (vr) {
+                    const auto copy_layer = [&](ID3D12Resource* to_texture, UINT to_layer, UINT from_layer) {
+                        D3D12_TEXTURE_COPY_LOCATION to{to_texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, from{depth.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                        to.SubresourceIndex = to_layer; from.SubresourceIndex = from_layer;
+                        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                    };
+                    copy_layer(call_depth.Get(), 0, 1); copy_layer(call_depth.Get(), 1, 0); copy_layer(eye_depth.Get(), 0, 0);
+                    transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                    transition(list.Get(), call_depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    transition(list.Get(), eye_depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                }
+            }
             submit();
           for (UINT call = 0; call < views; ++call) {
             const UINT eye = views - 1 - call; // out of layer order
@@ -1469,6 +1528,7 @@ int main(int argc, char** argv) {
                 list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
             }
             transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (occluder_test) ngx.depth = !vr ? depth.Get() : call == 0 ? call_depth.Get() : eye_depth.Get();
             ngx.jitter_x = f.jx; ngx.jitter_y = f.jy;
             if (fsr) {
                 transition(list.Get(), colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1517,7 +1577,7 @@ int main(int argc, char** argv) {
 
             // Compare with the current reference; "ghost" = what the fake DLSS output alone would show.
             void* mapped = nullptr; check(out_rb.buffer->Map(0, nullptr, &mapped));
-            uint64_t covered = 0, replaced = 0, stray = 0, interior = 0;
+            uint64_t covered = 0, replaced = 0, stray = 0, interior = 0, occluder_n = 0, occluder_changed = 0;
             double error = 0, ghost = 0, max_error = 0;
             std::vector<BYTE> png(size_t(output_w) * output_h * 4);
             for (UINT y = 0; y < output_h; ++y) for (UINT x = 0; x < output_w; ++x) {
@@ -1533,6 +1593,11 @@ int main(int argc, char** argv) {
                 }
                 covered += in_ref; replaced += changed;
                 if (changed && !in_ref) ++stray;
+                if (occluder_test && f.draw) { // inside the occluder, 2 render pixels in from its edge (the jitter moves the fix's view of it)
+                    const auto& o = occluders[eye];
+                    const float rx = (x + 0.5f) * render_w / output_w, ry = (y + 0.5f) * render_h / output_h;
+                    if (rx >= o.left + 2 && rx < o.right - 2 && ry >= o.top + 2 && ry < o.bottom - 2) { ++occluder_n; occluder_changed += changed; }
+                }
                 if (inner && f.draw) {
                     ++interior;
                     double e = 0, g = 0;
@@ -1549,12 +1614,23 @@ int main(int argc, char** argv) {
             const double mean = interior ? error / interior : 0, ghost_mean = interior ? ghost / interior : 0;
             bool pass = true;
             if (f.check == Frame::quality) pass = interior > 10000 && mean < 0.02 && stray < covered / 50;
+            // --occluder: the fix must have left it alone (all but a few pixels at most).
+            if (f.check == Frame::quality && occluder_test) pass = pass && occluder_n > 1000 && occluder_changed * 50 <= occluder_n;
+            char occluder_text[48] = "";
+            if (occluder_test && f.draw) std::snprintf(occluder_text, sizeof(occluder_text), " occluder_changed=%.3f", double(occluder_changed) / std::max<uint64_t>(occluder_n, 1));
             if (f.check == Frame::untouched) pass = replaced == 0;
-            std::printf("%-12s covered=%llu replaced=%llu stray=%llu error=%.4f (dlss_alone=%.4f) max=%.3f %s\n", name.c_str(), covered, replaced, stray,
-                mean, ghost_mean, max_error, f.check == Frame::info ? "(info)" : pass ? "PASS" : "FAIL");
+            std::printf("%-12s covered=%llu replaced=%llu stray=%llu error=%.4f (dlss_alone=%.4f) max=%.3f%s %s\n", name.c_str(), covered, replaced, stray,
+                mean, ghost_mean, max_error, occluder_text, f.check == Frame::info ? "(info)" : pass ? "PASS" : "FAIL");
             all_passed &= pass;
             previous_ref = ref;
           }
+            if (occluder_test) {
+                if (vr) {
+                    transition(list.Get(), call_depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                    transition(list.Get(), eye_depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                } else transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                submit();
+            }
         }
         if (hotpatch) {
             std::printf("redirected DLSS: the other mod's handler ran %u times\n", mfg_handler_calls);

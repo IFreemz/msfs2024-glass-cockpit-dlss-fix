@@ -12,6 +12,10 @@ $cases = @(
     # unloads the add-on and loads it again.
     @{ Args = @('--reload'); Name = 'Offline early device test' }
     @{ Args = @('--vr', '--screen-t0'); Name = 'Offline VR screen-in-t0 variant test' }
+    # Something in front of the screen (a hand, the yoke), in VR at its own spot in each eye, with the depth as the sim gives
+    # it there (one of the two calls gets both eyes' depth in one texture): the fix must leave it to the upscaler in each eye.
+    @{ Args = @('--occluder'); Name = 'Offline occlusion test' }
+    @{ Args = @('--vr', '--occluder'); Name = 'Offline VR occlusion test' }
     # Screen textures identified by descriptor tracking only (how AMD/Intel GPUs run).
     @{ Args = @('--track'); Name = 'Offline descriptor tracking test' }
     # A virtual painting drawn by a translucent material the fix doesn't know (Fenix A320 readouts, "FCU readouts: New").
