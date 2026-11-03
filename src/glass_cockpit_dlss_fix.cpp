@@ -11,7 +11,7 @@
 //    DLSS input colour, sample the clean display texture at output resolution (jitter removed) and write it over the
 //    DLSS output. Dirt, glare and shadows on the glass come from the DLSS output itself, clamped to this frame's
 //    local range so that trails of old screen content are removed.
-// Hotkeys: Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint (shows coverage). Flip jitter direction is in the panel only
+// Hotkeys (changeable in the panel): Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint (shows coverage). Flip jitter direction is in the panel only
 // (a hotkey between those two was too easy to hit by accident).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -98,6 +98,9 @@ DeviceState* main_state = nullptr; // the main device's state (the offline test 
 uint64_t init_tick = 0;
 
 std::atomic<bool> enabled{true}, jitter_positive{true}, tint{false};
+// The hotkeys, by glass::Hotkey (0: none), and their names under [hotkeys] in the settings file.
+std::atomic<uint32_t> hotkeys[glass::hotkey_count]{glass::default_hotkeys[0], glass::default_hotkeys[1]};
+const wchar_t* const hotkey_settings[glass::hotkey_count]{L"fix_on_off", L"green_tint"};
 // Experimental fixes (panel section of the same name): detail clamp and angle softening in percent, edge fade and edge
 // stretcher and edge trim in hundredths of a render pixel.
 constexpr int default_detail_clamp = 0, max_edge_fade = 250, max_edge_stretch = 400, max_edge_trim = 400;
@@ -3580,6 +3583,20 @@ void load_settings() {
     calm_glass = GetPrivateProfileIntW(L"experimental", L"calm_glass", 0, settings_path().c_str()) != 0;
     occlusion_check = GetPrivateProfileIntW(L"experimental", L"occlusion_check", 1, settings_path().c_str()) != 0;
     painted_screens = GetPrivateProfileIntW(L"experimental", L"painted_screens", 1, settings_path().c_str()) != 0;
+    // Hotkeys: one that can't be read or used gets its default. The tint's, if it is the fix's, gets its default, or none
+    // if that is the fix's too.
+    for (int which = 0; which < glass::hotkey_count; ++which) {
+        wchar_t text[64]{};
+        GetPrivateProfileStringW(L"hotkeys", hotkey_settings[which], L"", text, 64, settings_path().c_str());
+        std::string narrow;
+        for (const wchar_t* c = text; *c; ++c) narrow += *c < 128 ? char(*c) : '?';
+        const uint32_t parsed = glass::parse_hotkey(narrow), fallback = glass::default_hotkeys[which];
+        uint32_t key = fallback;
+        if (!_wcsicmp(text, L"None")) key = 0;
+        else if (parsed && !glass::hotkey_problem(parsed)) key = parsed;
+        if (which == glass::hotkey_tint && key && key == hotkeys[glass::hotkey_fix]) key = fallback == hotkeys[glass::hotkey_fix] ? 0 : fallback;
+        hotkeys[which] = key;
+    }
     // Diagnostics: identify screens the way AMD/Intel GPUs do (descriptor tracking only), also on NVIDIA.
     if (GetPrivateProfileIntW(L"debug", L"descriptor_tracking", 0, settings_path().c_str())) {
         force_tracking = true;
@@ -3606,6 +3623,10 @@ void save_settings() {
     WritePrivateProfileStringW(L"experimental", L"calm_glass", std::to_wstring(calm_glass.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"occlusion_check", std::to_wstring(occlusion_check.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"painted_screens", std::to_wstring(painted_screens.load()).c_str(), settings_path().c_str());
+    for (int which = 0; which < glass::hotkey_count; ++which) {
+        const auto key = glass::hotkey_name(hotkeys[which]);
+        WritePrivateProfileStringW(L"hotkeys", hotkey_settings[which], std::wstring(key.begin(), key.end()).c_str(), settings_path().c_str());
+    }
 }
 
 // One measurement window every 10 s: 120 frames, reported ~30 frames later (the GPU has finished them by then).
@@ -3772,14 +3793,23 @@ void on_present(api::effect_runtime* runtime) {
     const auto queue = runtime->get_command_queue();
     measure_cost(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr, runtime->get_device()->get_private_data<DeviceState>(),
         present_count.load(std::memory_order_relaxed));
-    const bool chord = runtime->is_key_down(VK_CONTROL) && runtime->is_key_down(VK_SHIFT);
     pixel_probe_resolve(queue, present_count.load(std::memory_order_relaxed));
     pixel_probe_flush(present_count.load(std::memory_order_relaxed));
     painting_readbacks(false);
-    // Only these two: other add-ons use Ctrl+Shift+F-keys too (GSX opens its menu with Ctrl+Shift+F12), so the capture
-    // and the debug tools are buttons in the Bug reports section instead.
-    if (chord && runtime->is_key_pressed(VK_F9)) glass::set_enabled(!enabled);
-    if (chord && runtime->is_key_pressed(VK_F11)) glass::set_tint(!tint);
+    // Only these two (changeable in the panel): other add-ons use Ctrl+Shift+F-keys too (GSX opens its menu with
+    // Ctrl+Shift+F12), so the capture and the debug tools are buttons in the Bug reports section instead. Each fires with
+    // exactly its modifiers, and not while the panel records a new hotkey.
+    if (!glass::hotkeys_paused.load()) {
+        const bool ctrl = runtime->is_key_down(VK_CONTROL), shift = runtime->is_key_down(VK_SHIFT), alt = runtime->is_key_down(VK_MENU);
+        for (int which = 0; which < glass::hotkey_count; ++which) {
+            const uint32_t key = hotkeys[which].load();
+            if (!key || ctrl != ((key & glass::key_ctrl) != 0) || shift != ((key & glass::key_shift) != 0) || alt != ((key & glass::key_alt) != 0) ||
+                !runtime->is_key_pressed(key & 0xFF))
+                continue;
+            if (which == glass::hotkey_fix) glass::set_enabled(!enabled);
+            else glass::set_tint(!tint);
+        }
+    }
     static uint64_t next = 0;
     const auto now = GetTickCount64();
     if (now < next) return;
@@ -3851,7 +3881,86 @@ void on_present(api::effect_runtime* runtime) {
 }
 }
 
+namespace {
+// Keys a hotkey can use, by name (virtual-key codes). The punctuation keys are named after the US layout; on other
+// layouts the same physical key prints another character but works the same.
+struct KeyName { const char* name; uint32_t vk; };
+constexpr KeyName key_names[] = {
+    {"Insert", 0x2D}, {"Delete", 0x2E}, {"Home", 0x24}, {"End", 0x23}, {"PageUp", 0x21}, {"PageDown", 0x22},
+    {"Pause", 0x13}, {"ScrollLock", 0x91}, {"Space", 0x20}, {"Tab", 0x09}, {"Backspace", 0x08}, {"Enter", 0x0D},
+    {"Up", 0x26}, {"Down", 0x28}, {"Left", 0x25}, {"Right", 0x27},
+    {"Num*", 0x6A}, {"NumPlus", 0x6B}, {"Num-", 0x6D}, {"Num.", 0x6E}, {"Num/", 0x6F},
+    {";", 0xBA}, {"=", 0xBB}, {",", 0xBC}, {"-", 0xBD}, {".", 0xBE}, {"/", 0xBF}, {"`", 0xC0},
+    {"[", 0xDB}, {"\\", 0xDC}, {"]", 0xDD}, {"'", 0xDE}, {"<>", 0xE2},
+};
+}
+
 namespace glass {
+std::atomic<bool> hotkeys_paused{false};
+std::string hotkey_name(uint32_t key) {
+    if (!key) return "None";
+    std::string text;
+    if (key & key_ctrl) text += "Ctrl+";
+    if (key & key_shift) text += "Shift+";
+    if (key & key_alt) text += "Alt+";
+    const uint32_t vk = key & 0xFF;
+    if (vk >= 0x70 && vk <= 0x87) return text + "F" + std::to_string(vk - 0x70 + 1);
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return text + char(vk);
+    if (vk >= 0x60 && vk <= 0x69) return text + "Num" + std::to_string(vk - 0x60);
+    for (const auto& k : key_names) if (k.vk == vk) return text + k.name;
+    return text + "?";
+}
+uint32_t parse_hotkey(const std::string& text) {
+    uint32_t mods = 0;
+    size_t start = 0;
+    std::string key;
+    for (;;) {
+        const size_t plus = text.find('+', start);
+        std::string part = text.substr(start, plus == std::string::npos ? std::string::npos : plus - start);
+        while (!part.empty() && part.front() == ' ') part.erase(part.begin());
+        while (!part.empty() && part.back() == ' ') part.pop_back();
+        for (auto& c : part) c = char(toupper(static_cast<unsigned char>(c)));
+        if (plus == std::string::npos) { key = part; break; }
+        if (part == "CTRL" || part == "CONTROL") mods |= key_ctrl;
+        else if (part == "SHIFT") mods |= key_shift;
+        else if (part == "ALT") mods |= key_alt;
+        else return 0;
+        start = plus + 1;
+    }
+    if (key.size() == 1 && ((key[0] >= 'A' && key[0] <= 'Z') || (key[0] >= '0' && key[0] <= '9'))) return mods | uint32_t(key[0]);
+    if (key.size() >= 2 && key[0] == 'F' && key.find_first_not_of("0123456789", 1) == std::string::npos) {
+        const int n = std::stoi(key.substr(1));
+        if (n >= 1 && n <= 24) return mods | uint32_t(0x70 + n - 1);
+    }
+    if (key.size() == 4 && key.rfind("NUM", 0) == 0 && key[3] >= '0' && key[3] <= '9') return mods | uint32_t(0x60 + key[3] - '0');
+    for (const auto& k : key_names) {
+        std::string name = k.name;
+        for (auto& c : name) c = char(toupper(static_cast<unsigned char>(c)));
+        if (name == key) return mods | k.vk;
+    }
+    return 0;
+}
+const char* hotkey_problem(uint32_t key) {
+    const uint32_t vk = key & 0xFF, mods = key & (key_ctrl | key_shift | key_alt);
+    if (!vk) return "not a key";
+    if (mods == key_alt && vk == 0x73) return "Alt+F4 closes the sim";
+    if (mods == key_alt && (vk == 0x09 || vk == 0x20 || vk == 0x0D)) return "Windows uses Alt+Tab, Alt+Space and Alt+Enter";
+    const bool alone_ok = (vk >= 0x7C && vk <= 0x87) || vk == 0x13 || vk == 0x91; // F13-F24, Pause, Scroll Lock
+    if (!mods && !alone_ok) return "add Ctrl, Shift or Alt, so it doesn't fire while you type or fly";
+    return nullptr;
+}
+const char* hotkey_action(Hotkey which) { return which == hotkey_fix ? "fix on/off" : which == hotkey_tint ? "green tint" : "?"; }
+std::string set_hotkey(Hotkey which, uint32_t key) {
+    if (which < 0 || which >= hotkey_count) return "not a hotkey";
+    const std::string name = hotkey_name(key);
+    if (const char* why = key ? hotkey_problem(key) : nullptr) return name + " can't be used: " + why + ".";
+    for (int other = 0; other < hotkey_count; ++other)
+        if (other != which && key && hotkeys[other].load() == key) return name + " is already the " + hotkey_action(Hotkey(other)) + " hotkey.";
+    hotkeys[which] = key;
+    save_settings();
+    log("setting %ls hotkey=%s", hotkey_settings[which], name.c_str());
+    return {};
+}
 Status status() {
     Status s;
     {
@@ -3859,6 +3968,7 @@ Status status() {
         s.gpu = gpu_name; s.driver = gpu_driver; s.dlss_version = dlss_version; s.fsr_version = fsr_version;
     }
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
+    for (int which = 0; which < hotkey_count; ++which) s.hotkeys[size_t(which)] = hotkeys[which];
     s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing, stable_edges, int(mip0_only.load()), calm_glass, edge_trim_percent, occlusion_check, painted_screens}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
@@ -3960,7 +4070,7 @@ extern "C" __declspec(dllexport) const char* NAME = GLASS_NAME;
 extern "C" __declspec(dllexport) const char* AUTHOR = GLASS_AUTHOR;
 extern "C" __declspec(dllexport) const char* WEBSITE = GLASS_WEBSITE;
 extern "C" __declspec(dllexport) const char* ISSUES = GLASS_ISSUES;
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghosting from MSFS 2024 glass cockpit displays. Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint.";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Removes DLSS ghosting from MSFS 2024 glass cockpit displays. Ctrl+Shift+F9 on/off, Ctrl+Shift+F11 green tint (changeable in its tab).";
 
 #define OVERLAY_EVENTS(X) \
     X(init_device, on_init_device) X(destroy_device, on_destroy_device) X(init_pipeline_layout, on_init_layout) \
@@ -4044,7 +4154,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     log("addon path=%ls fixture=%d enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d",
         module, fixture, enabled.load(), jitter_positive.load(), smoothing_percent.load(), int(extra_smoothing.load()), glass_percent.load(), detail_clamp_percent.load(),
         edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), dark_screen_fix.load(), seam_fix.load(), int(mip0_only.load()), stable_edges.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
-    log("hotkeys: Ctrl+Shift+F9 overlay on/off, Ctrl+Shift+F11 green tint");
+    log("hotkeys: %s overlay on/off, %s green tint", glass::hotkey_name(hotkeys[glass::hotkey_fix]).c_str(), glass::hotkey_name(hotkeys[glass::hotkey_tint]).c_str());
     scan_modules();
     std::thread(worker).detach();
 #define REGISTER(event, callback) reshade::register_event<reshade::addon_event::event>(callback);

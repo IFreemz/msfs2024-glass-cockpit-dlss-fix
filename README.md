@@ -74,6 +74,7 @@ All settings are in the add-on's tab in the ReShade menu (**Home**) and are reme
 | Fix enabled (Ctrl+Shift+F9) | Fix on/off, for comparison |
 | Line smoothing (0-50 %, default 35 %) | Smooths stair steps on thin slanted lines in the screens, like the upscaler did. 0 = sharpest, 50 = softest. Ctrl+click to type a value. Tick **Extra** next to it to go up to 100 % (blurs the whole screen; for screens with very jagged lines) |
 | Green tint (Ctrl+Shift+F11) | Tints every screen the fix covers (for checking, not remembered) |
+| Hotkeys | The fix on/off (Ctrl+Shift+F9) and the green tint (Ctrl+Shift+F11). Click one under **Hotkeys** and press the new keys: a key with any of Ctrl, Shift and Alt. Esc cancels, and Backspace leaves it without a hotkey. A combination that is already the other hotkey, or one of ReShade's, is not taken. Saved as `fix_on_off` and `green_tint` under `[hotkeys]` in the `.ini` (`None` for no hotkey) |
 
 Under **Troubleshooting → Advanced** (collapsed; only change these if asked to in a bug report, "Reset to defaults"
 puts them back):
