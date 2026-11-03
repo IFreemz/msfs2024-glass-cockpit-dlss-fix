@@ -1110,6 +1110,10 @@ bool set_separate_matches(ID3D12Resource* resource) {
     LOG_ONCE("%llu screen textures with separate matches, no more", uint64_t(separate_textures.size()));
     return false;
 }
+// A destroyed texture: its place is free again, and a new texture made at its address starts with one match.
+void forget_separate_matches(ID3D12Resource* resource) {
+    for (auto& texture : separate_textures) { auto expected = resource; texture.compare_exchange_strong(expected, nullptr); }
+}
 // A mesh: where its indices start in the game's buffers (each readout is a node of its own).
 template <class Draw> uint64_t mesh_key(const Draw& draw) {
     return (uint64_t(draw.first) * 0x9E3779B97F4A7C15ull ^ uint64_t(int64_t(draw.base_vertex)) * 0xC2B2AE3D27D4EB4Full ^
@@ -1124,13 +1128,19 @@ int slot_of(ID3D12Resource* resource, DXGI_FORMAT format, uint64_t mesh = 0, boo
     std::lock_guard lock(slots_mutex);
     if (mesh) {
         // Painted meshes never take more than a quarter of the slots, so the cockpit screens always find theirs. Meshes with
-        // separate matches can go to three eighths; past that they share their texture's slot as before.
-        const unsigned max_painted_slots = separate ? slot_count * 3 / 8 : slot_count / 4;
-        unsigned used = 0;
-        for (unsigned i = 0; i < slot_count; ++i) used += slot_resources[i].load() && slot_meshes[i].load() && now <= slot_last_used[i] + 120;
-        if (used >= max_painted_slots) {
-            if (separate) LOG_ONCE("separate matches: %u meshes in use, more share their texture's match", max_painted_slots);
-            else LOG_ONCE("painted screens: %u meshes in use, more are left to the upscaler", max_painted_slots);
+        // separate matches can go to three eighths, painted ones included; past that they share their texture's slot as
+        // before. They don't count against the painted ones: a painted screen has no other match to fall back on (the A2A
+        // Legacy's radio meshes had taken all eight).
+        unsigned used = 0, painted = 0;
+        for (unsigned i = 0; i < slot_count; ++i) {
+            const auto other = slot_resources[i].load();
+            if (!other || !slot_meshes[i].load() || now > slot_last_used[i] + 120) continue;
+            ++used;
+            painted += !separate_matches(other);
+        }
+        if (separate ? used >= slot_count * 3 / 8 : painted >= slot_count / 4) {
+            if (separate) LOG_ONCE("separate matches: %u meshes in use, more share their texture's match", slot_count * 3 / 8);
+            else LOG_ONCE("painted screens: %u meshes in use, more are left to the upscaler", slot_count / 4);
             return -1;
         }
     }
@@ -1224,6 +1234,7 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     uint64_t diag_ready = UINT64_MAX, diag_next = 300;
     int diag_dumps = 0;
     std::atomic<uint64_t> readback_calls{0}, readback_next{120}, readback_ready{UINT64_MAX}; // in upscaler calls
+    std::array<std::pair<ID3D12Resource*, uint64_t>, slot_count> readback_slots{}; // each slot's texture and mesh when it was copied
     uint64_t frame = 0;
     ComPtr<ID3D12QueryHeap> timestamps; // cost diagnostics: start and end of the passes of each upscaler call
     ComPtr<ID3D12Resource> timestamps_readback;
@@ -1454,6 +1465,7 @@ void texture_destroyed(ID3D12Resource* native) {
     if (track_descriptors.load(std::memory_order_relaxed)) forget_texture_ids(native);
     forget_painted_views(native);
     forget_painting_copy(native);
+    forget_separate_matches(native);
     for (auto& slot : slot_resources) { auto expected = native; slot.compare_exchange_strong(expected, nullptr); }
 }
 struct __declspec(uuid("5C0E6A2D-3B1F-4E8A-9D47-0F2B8C61A3E9")) ReleaseNotifier final : IUnknown {
@@ -2541,8 +2553,11 @@ void log_brightness(DeviceState& d) {
     for (unsigned slot = 0; slot < slot_count; ++slot) {
         const float* a = data + slot * params_per_slot * 4;
         const float* levels = a + 16;
-        slot_matched[slot] = a[3] > 0;
         const auto resource = slot_resources[slot].load();
+        // The slot took another texture or mesh since the copy (the iniBuilds A380 swaps its screens' textures every few
+        // seconds): what was read is the old one's.
+        if (d.readback_slots[slot] != std::pair{resource, slot_meshes[slot].load()}) continue;
+        slot_matched[slot] = a[3] > 0;
         if (resource && !slot_meshes[slot].load() && levels[3] >= 8 && set_separate_matches(resource)) {
             log("separate matches for the meshes of screen texture %p (slot=%u): brightest %.4g, dimmest %.4g, and their brightness doesn't explain the picture",
                 resource, slot, levels[1], levels[2]);
@@ -3435,6 +3450,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
             transition(native, d.params.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             native->CopyBufferRegion(d.params_readback.Get(), 0, d.params.Get(), 0, slot_count * params_per_slot * 16);
             transition(native, d.params.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            for (unsigned i = 0; i < slot_count; ++i) d.readback_slots[i] = {slot_resources[i].load(), slot_meshes[i].load()};
             d.readback_ready = now + 30;
         }
     }
