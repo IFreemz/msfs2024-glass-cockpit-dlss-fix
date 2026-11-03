@@ -17,6 +17,12 @@ try {
     if ($LASTEXITCODE) { throw "Offline add-on reload test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --vr --screen-t0
     if ($LASTEXITCODE) { throw "Offline VR screen-in-t0 variant test failed ($LASTEXITCODE)" }
+    # Something in front of the screen (a hand, the yoke), in VR at its own spot in each eye, with the depth as the sim gives
+    # it there (one of the two calls gets both eyes' depth in one texture): the fix must leave it to the upscaler in each eye.
+    & .\FlightSimulator2024.exe --occluder
+    if ($LASTEXITCODE) { throw "Offline occlusion test failed ($LASTEXITCODE)" }
+    & .\FlightSimulator2024.exe --vr --occluder
+    if ($LASTEXITCODE) { throw "Offline VR occlusion test failed ($LASTEXITCODE)" }
     # Screen textures identified by descriptor tracking only (how AMD/Intel GPUs run).
     & .\FlightSimulator2024.exe --track
     if ($LASTEXITCODE) { throw "Offline descriptor tracking test failed ($LASTEXITCODE)" }

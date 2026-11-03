@@ -43,7 +43,9 @@ cbuffer Constants : register(b0)
 Texture2DArray<float4> map : register(t0);       // xy = display uv, z = depth, w = slot + 1 (0 = not a display)
 Texture2D<float4> scene : register(t1);     // DLSS input colour (render resolution, pre-exposed linear)
 Texture2D<float4> displays[32] : register(t2);
-Texture2D<float> scene_depth : register(t34); // the upscaler's depth input (render resolution; occlusion check)
+// The upscaler's depth input (render resolution; occlusion check). An array view starting at the layer this call's upscaler
+// reads: in VR one of the sim's two calls per frame gets both eyes' depth in one texture.
+Texture2DArray<float> scene_depth : register(t34);
 RWTexture2D<float4> output : register(u0);  // DLSS output, R11G11B10_FLOAT
 RWTexture2D<uint> tiles : register(u1);     // per 8x8 map tile: display slot + 1 this frame (0 = none)
 RWStructuredBuffer<float4> params : register(u2); // per slot: [5s] = a.rgb, valid; [5s+1] = b.rgb, samples; [5s+2] = mean screen.rgb, fit quality; [5s+3] = detail quality, last good gain.rgb; [5s+4] = brightness reference, brightest, dimmest mesh, frames their brightness didn't explain the picture
@@ -84,6 +86,9 @@ static const float bounds_scale = 16777215.0;
 static const uint brightness_base = diag_base + 256;
 static const uint brightness_fitted = brightness_base + 128, brightness_next = brightness_base + 256;
 static const uint brightness_dimmest = brightness_base + 384; // 1 / the dimmest mesh seen this frame (0: none seen)
+// Diagnostics: per upscaler call (64 counters, like the call counters at diag_base), screen pixels the occlusion check
+// found something in front of.
+static const uint occluded_base = brightness_base + 512;
 static const float brightness_floor = 1.0 / 1048576; // below: a mesh drawn black
 
 float map_level(float4 m) { return exp2((m.w - round(m.w)) * 64); }
@@ -241,7 +246,7 @@ void accumulate(uint slot, float3 x, float3 y, float3 detail)
 // a screen's cover glass or a decal on it sits only millimetres in front.
 bool occluded(int2 p, float screen_depth)
 {
-    float depth = scene_depth.Load(int3(p, 0));
+    float depth = scene_depth.Load(int4(p, 0, 0));
     bool reversed = (flags & 32768) != 0;
     float scene_near = reversed ? depth : 1 - depth, screen_near = reversed ? screen_depth : 1 - screen_depth;
     return scene_near > screen_near * 1.015 + 1e-6;
@@ -317,7 +322,12 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     int2 p = int2(id.xy);
     float4 m = load_map(p);
     uint slot = map_slot(m);
-    if (slot < slot_count) InterlockedMin(tile_slot, slot);
+    // The tile is flagged for what the map holds, also where something is in front of the screen (z = -1): the clear pass
+    // empties flagged tiles only. A screen left in the map under a hand or the yoke counted as screen once they moved apart:
+    // drawn for a frame where it no longer was, and matched against what the sim showed there, which put the screen's
+    // brightness off for several frames.
+    const uint held = m.z < 0 ? map_slot(map.Load(int4(p, layer, 0))) : slot;
+    if (held < slot_count) InterlockedMin(tile_slot, held);
 
     bool active = slot < slot_count;
     bool outline = false;
@@ -380,6 +390,8 @@ void fit(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : 
     // Diagnostics: screen pixels in the map at this call (the GPU's view: were this frame's screens drawn before it?).
     uint screen_pixels = WaveActiveCountBits(slot < slot_count && all(p < int2(map_size)));
     if (WaveIsFirstLane() && screen_pixels) { uint unused; edge_bounds.InterlockedAdd(diag_base + (diag_index & 63) * 4, screen_pixels, unused); }
+    uint occluded_pixels = WaveActiveCountBits(m.z < 0 && all(p < int2(map_size))); // see load_map
+    if (WaveIsFirstLane() && occluded_pixels) { uint unused; edge_bounds.InterlockedAdd(occluded_base + (diag_index & 63) * 4, occluded_pixels, unused); }
 
     // Stable screen edges: widen the bounds of the texture cell this render pixel sampled (one set of atomics per cell
     // and wave). With the camera jitter the samples move every frame, so the bounds close in on the screen's real edge.
@@ -1305,7 +1317,7 @@ void clear(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID)
         if (reset) edge_bounds.Store4((1 - next) * bounds_bytes + index * 16, uint4(0xffffffff, 0xffffffff, 0, 0));
     }
     if (all(id.xy < map_size) && all(group.xy < (map_size + 7) / 8) && tiles[group.xy]) map_rw[uint3(id.xy, layer)] = 0;
-    if (all(id.xy == 0)) edge_bounds.Store(diag_base + ((diag_index + 1) & 63) * 4, 0);
+    if (all(id.xy == 0)) { edge_bounds.Store(diag_base + ((diag_index + 1) & 63) * 4, 0); edge_bounds.Store(occluded_base + ((diag_index + 1) & 63) * 4, 0); }
     // Brightness references: the brightest mesh of this frame becomes the next frame's (kept if the slot wasn't seen).
     if (id.y == 0 && id.x < slot_count)
     {

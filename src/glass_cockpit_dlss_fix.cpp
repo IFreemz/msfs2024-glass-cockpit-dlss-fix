@@ -2226,14 +2226,15 @@ bool create_composite(DeviceState& d) {
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.sums)))) return false;
     buffer.Width = slot_count * params_per_slot * 16;
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.params)))) return false;
-    buffer.Width = 2 * slot_count * bounds_cells * bounds_cells * 16 + 256 + 512; // two halves of learnt edges, call counters,
-                                                                                   // per-slot brightness references
+    buffer.Width = 2 * slot_count * bounds_cells * bounds_cells * 16 + 256 + 512 + 256; // two halves of learnt edges, call
+                                                                                         // counters, per-slot brightness
+                                                                                         // references, occluded pixels per call
     if (FAILED(d.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&d.edge_bounds)))) return false;
     D3D12_HEAP_PROPERTIES readback{D3D12_HEAP_TYPE_READBACK};
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
     if (FAILED(d.native->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&d.params_readback))))
         d.params_readback = nullptr; // diagnostics only
-    buffer.Width = 256;
+    buffer.Width = 1024; // from the call counters on: brightness references, occluded pixels per call
     if (FAILED(d.native->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&d.diag_readback))))
         d.diag_readback = nullptr;
     D3D12_QUERY_HEAP_DESC queries{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, max_timed_calls * 2, 0};
@@ -3033,7 +3034,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     history_view.Format = DXGI_FORMAT_R16G16_UNORM;
     d.native->CreateUnorderedAccessView(temporal ? map->history_uv.Get() : nullptr, nullptr, &history_view, at(uav_base + 6));
     D3D12_UNORDERED_ACCESS_VIEW_DESC raw{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
-    raw.Buffer = {0, 2 * slot_count * bounds_cells * bounds_cells * 4 + 64 + 128, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+    raw.Buffer = {0, 2 * slot_count * bounds_cells * bounds_cells * 4 + 64 + 128 + 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
     d.native->CreateUnorderedAccessView(d.edge_bounds.Get(), nullptr, &raw, at(uav_base + 7));
     D3D12_UNORDERED_ACCESS_VIEW_DESC glass_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
     glass_view.Texture2DArray = {0, 0, map->layers, 0};
@@ -3041,17 +3042,19 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     glass_view.Format = DXGI_FORMAT_R16G16_UNORM;
     d.native->CreateUnorderedAccessView(map->glass_history_uv.Get(), nullptr, &glass_view, at(uav_base + 9));
     // The upscaler's depth input for the occlusion check (a null view when the check is off or the input unusable: not at
-    // render size, multisampled, an array, or a depth direction the display shader doesn't tell). In VR the sim calls the
-    // upscaler once per eye with that eye's depth, which matches the map layer of this call.
+    // render size, multisampled, or a depth direction the display shader doesn't tell). In VR the sim calls the upscaler
+    // once per eye with that eye's depth, which matches the map layer of this call: in one of the two calls both eyes'
+    // depth in one texture, of which the upscaler reads the first layer, as it writes the first layer of that call's
+    // output (see the output's view above).
     ID3D12Resource* depth = nullptr;
-    D3D12_SHADER_RESOURCE_VIEW_DESC depth_view{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
-    depth_view.Texture2D.MipLevels = 1;
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth_view{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    depth_view.Texture2DArray = {0, 1, 0, 1, 0, 0};
     const int direction = depth_direction.load(std::memory_order_relaxed);
     if (occlusion_check.load(std::memory_order_relaxed) && u.depth) {
         const auto z = u.depth->GetDesc();
         const DXGI_FORMAT format = depth_srv_format(z.Format);
         const bool usable = direction && format != DXGI_FORMAT_UNKNOWN && z.Width == render_w && z.Height == render_h &&
-            z.DepthOrArraySize == 1 && z.SampleDesc.Count == 1;
+            z.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && z.SampleDesc.Count == 1;
         if (usable) { depth = u.depth; depth_view.Format = format; }
         static std::atomic<int> logged[2]{};
         if (logged[map->layers > 1]++ < 4) log("occlusion_check %s depth input %p %llux%u format=%u layers=%u samples=%u state=0x%x usable=%d direction=%d vr=%d", u.name, u.depth,
@@ -3189,10 +3192,12 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         const uint64_t now = present_count.load(std::memory_order_relaxed);
         if (d.diag_ready != UINT64_MAX && now >= d.diag_ready) {
             const uint32_t* counts = nullptr;
-            const D3D12_RANGE range{0, 256};
+            const D3D12_RANGE range{0, 1024};
             if (SUCCEEDED(d.diag_readback->Map(0, &range, reinterpret_cast<void**>(const_cast<uint32_t**>(&counts))))) {
                 // One line per copy: the 32 calls before it, oldest first: screen pixels in the map on the GPU (0 = the fix
-                // had nothing to draw), presents since the screens were recorded, views pending, output (a/b...).
+                // had nothing to draw), presents since the screens were recorded, views pending, output (a/b...), and the
+                // screen pixels the occlusion check found something in front of (in VR: one count per eye's call).
+                const uint32_t* occluded = counts + (256 + 512) / 4;
                 std::string line;
                 std::vector<const void*> outputs;
                 for (uint32_t k = 31; k >= 1; --k) {
@@ -3200,20 +3205,21 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
                     const auto& c = d.diag_snapshot[i];
                     size_t o = std::find(outputs.begin(), outputs.end(), c.output) - outputs.begin();
                     if (o == outputs.size()) outputs.push_back(c.output);
-                    char item[64];
+                    char item[80];
                     std::snprintf(item, sizeof(item), " %u/%lld/%u%c", counts[i], (long long)(c.present - c.recorded), c.pending, char('a' + std::min<size_t>(o, 25)));
+                    if (occluded[i]) std::snprintf(item + std::strlen(item), sizeof(item) - std::strlen(item), "-%u", occluded[i]);
                     line += item;
                 }
                 const D3D12_RANGE none{};
                 d.diag_readback->Unmap(0, &none);
-                log("diag calls (pixels/presents since recorded/pending/output):%s", line.c_str());
+                log("diag calls (pixels/presents since recorded/pending/output-occluded pixels):%s", line.c_str());
             }
             d.diag_ready = UINT64_MAX;
         }
         if (d.diag_ready == UINT64_MAX && now >= d.diag_next && d.diag_dumps < 400) {
             // The copy runs after this call's passes: counters of the last 63 calls (the next one was just zeroed).
             transition(native, d.edge_bounds.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            native->CopyBufferRegion(d.diag_readback.Get(), 0, d.edge_bounds.Get(), 2 * UINT64(slot_count) * bounds_cells * bounds_cells * 16, 256);
+            native->CopyBufferRegion(d.diag_readback.Get(), 0, d.edge_bounds.Get(), 2 * UINT64(slot_count) * bounds_cells * bounds_cells * 16, 1024);
             transition(native, d.edge_bounds.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             d.diag_snapshot = d.diag_calls;
             d.diag_copied_at = d.diag_index + 1; // the copy holds calls up to diag_index
