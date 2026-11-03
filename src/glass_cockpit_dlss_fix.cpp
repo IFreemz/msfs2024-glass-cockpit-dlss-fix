@@ -644,10 +644,11 @@ std::string hex(const Signature& s) {
     for (size_t i = 0; i < 32; ++i) snprintf(text + i * 2, 3, "%02x", s.bytes[i]);
     return text;
 }
-std::array<DXGI_FORMAT, slot_count> slot_formats{};
+// Each slot's texture size (width << 32 | height), for the log: after the slot took it, the texture itself is only read
+// through the slot's view (see DeviceState::slot_views).
+std::array<std::atomic<uint64_t>, slot_count> slot_sizes{};
 // Mip levels of the game's own view of each screen texture (first level, count; UINT(-1) = all from first). The fix
 // samples exactly those: a sim that never fills a texture's smaller mips (iFly 737 CDUs and radios) only views level 0.
-std::array<UINT, slot_count> slot_first_mip{}, slot_mip_count{};
 std::mutex view_mips_mutex;
 std::unordered_map<ID3D12Resource*, std::pair<UINT, UINT>> view_mips;
 // Full-size sampling (experimental section, on by default): screen textures are read at full
@@ -978,8 +979,9 @@ template <class Draw> uint64_t mesh_key(const Draw& draw) {
         (uint64_t(draw.count) << 1) ^ (draw.indexed ? 1u : 0u)) | 1;
 }
 
+void write_slot_views(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format, std::pair<UINT, UINT> mips);
 // mesh: 0 for a display texture (one slot per texture); a painted screen's mesh gets a slot of its own (see "Painted screens"),
-// and so does a mesh of a texture with separate matches (separate: true).
+// and so does a mesh of a texture with separate matches (separate: true). Called while the sim draws with the texture.
 int slot_of(ID3D12Resource* resource, DXGI_FORMAT format, uint64_t mesh = 0, bool separate = false) {
     const auto now = present_count.load(std::memory_order_relaxed);
     for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() == resource && slot_meshes[i].load() == mesh) { slot_last_used[i] = now; return int(i); }
@@ -1011,17 +1013,17 @@ int slot_of(ID3D12Resource* resource, DXGI_FORMAT format, uint64_t mesh = 0, boo
             if (now > slot_last_used[i] + 120 && slot_last_used[i] < oldest) { oldest = slot_last_used[i]; chosen = int(i); }
     }
     if (chosen < 0) return -1;
-    slot_formats[chosen] = format;
     slot_last_used[chosen] = now;
     std::pair<UINT, UINT> mips{0, UINT(-1)};
     bool known = false;
     { std::lock_guard view_lock(view_mips_mutex); if (const auto found = view_mips.find(resource); found != view_mips.end()) { mips = found->second; known = true; } }
-    slot_first_mip[chosen] = mips.first; slot_mip_count[chosen] = mips.second;
+    const auto d = resource->GetDesc();
+    slot_sizes[chosen] = (uint64_t(d.Width) << 32) | d.Height;
+    write_slot_views(unsigned(chosen), resource, format, mips); // before the slot shows the texture
     slot_meshes[chosen] = mesh;
     slot_matched[chosen] = true;
     slot_resources[chosen] = resource;
     bounds_reset.fetch_or(1u << chosen);
-    const auto d = resource->GetDesc();
     log("%s slot=%d resource=%p w=%llu h=%u mips=%u format=%u game_view_mips=%u+%d%s", separate ? "mesh_slot" : mesh ? "painted_slot" : "display_slot", chosen, resource, d.Width, d.Height,
         d.MipLevels, unsigned(format), mips.first, int(mips.second), known ? "" : " (view not seen)");
     return chosen;
@@ -1060,6 +1062,12 @@ struct Map {
 
 struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     ID3D12Device* native = nullptr;
+    // Each screen slot's view for the composite, made when the slot takes its texture (the sim is drawing with it then) and
+    // copied into every upscaler call's descriptors. The composite never reads the texture itself, which another thread may
+    // be destroying at that moment, nor a slot half rewritten. Two sets per slot: the one not in use is rewritten, then
+    // switched to. Each set has the plain view and the alpha-as-grey one (painting copies, see PaintingCopy). CPU-only.
+    ComPtr<ID3D12DescriptorHeap> slot_views; // [set][alpha][slot]
+    std::array<std::atomic<uint32_t>, slot_count> slot_view_set{};
     // Screen capture: each screen texture's colour at the moment the sim drew it (render size, kept as a render target).
     std::mutex draw_colour_mutex;
     ComPtr<ID3D12Resource> draw_colour;
@@ -1159,6 +1167,24 @@ void uav_barrier(ID3D12GraphicsCommandList* list) {
     list->ResourceBarrier(1, &b);
 }
 
+// A slot's views (DeviceState::slot_views), as the sim views the texture (format, mip levels). Under slots_mutex, while
+// the sim draws with the texture.
+void write_slot_views(unsigned slot, ID3D12Resource* resource, DXGI_FORMAT format, std::pair<UINT, UINT> mips) {
+    const auto state = main_state;
+    if (!state || !state->slot_views) return;
+    const uint32_t set = 1 - state->slot_view_set[slot].load(std::memory_order_relaxed);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    srv.Texture2D.MostDetailedMip = mips.first;
+    srv.Texture2D.MipLevels = mips.second;
+    for (uint32_t alpha = 0; alpha < 2; ++alpha) {
+        auto view = state->slot_views->GetCPUDescriptorHandleForHeapStart();
+        view.ptr += SIZE_T((set * 2 + alpha) * slot_count + slot) * descriptor_size;
+        if (alpha) srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 3, 3, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
+        state->native->CreateShaderResourceView(resource, &srv, view);
+    }
+    state->slot_view_set[slot].store(set, std::memory_order_release);
+}
+
 void install_ngx();
 void install_ngx_proxies();
 void install_ffx();
@@ -1225,6 +1251,14 @@ void on_init_device(api::device* device) {
     main_state = state;
     D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     state->native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&state->scratch));
+    h.NumDescriptors = 4 * slot_count;
+    if (FAILED(state->native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&state->slot_views)))) log("ERROR no descriptor heap for the screens' views: screens can't be fixed");
+    else { // empty views until a slot takes a texture
+        D3D12_SHADER_RESOURCE_VIEW_DESC empty{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        empty.Texture2D.MipLevels = 1;
+        auto view = state->slot_views->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < h.NumDescriptors; ++i, view.ptr += size) state->native->CreateShaderResourceView(nullptr, &empty, view);
+    }
     const auto table = *reinterpret_cast<void***>(state->native);
     bool hooked = hook(table[graphics_pipeline_slot()], reinterpret_cast<void*>(&graphics_hook), original_graphics);
     ComPtr<ID3D12Device2> device2;
@@ -2281,9 +2315,9 @@ void log_brightness(DeviceState& d) {
             const float* q = a + 8;
             const auto resource = slot_resources[slot].load();
             if (a[3] == 0 || !resource) continue;
-            const auto desc = resource->GetDesc();
+            const uint64_t size = slot_sizes[slot].load(); // not the texture's own: it may be being destroyed on another thread
             log("brightness slot=%u screen=%llux%u gain=%.3f,%.3f,%.3f offset=%.4f,%.4f,%.4f mean=%.4f,%.4f,%.4f quality=%.3f detail=%.3f samples=%.0f levels=%.4g,%.4g,%.4g%s", slot,
-                uint64_t(desc.Width), desc.Height, a[0], a[1], a[2], b[0], b[1], b[2], q[0], q[1], q[2], q[3], a[12], b[3], a[16], a[17], a[18],
+                size >> 32, unsigned(size & 0xffffffff), a[0], a[1], a[2], b[0], b[1], b[2], q[0], q[1], q[2], q[3], a[12], b[3], a[16], a[17], a[18],
                 a[3] < 0 ? " skipped (screen doesn't match the sim's picture)" : q[3] <= 0.25f && (a[13] > 0 || a[14] > 0 || a[15] > 0) ? " held" : "");
         }
     }
@@ -2967,22 +3001,23 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         d.native->CreateShaderResourceView(colour, &first_layer, at(1));
     } else d.native->CreateShaderResourceView(colour, &srv, at(1));
     uint32_t inverted_slots = 0, painted_slots = 0;
+    // The screens: each slot's view as made when it took its texture (DeviceState::slot_views), with the game's own mip range
+    // (the fit pass samples like the sim; full-size sampling reads level 0 in the shader). The texture itself is not read
+    // here: another thread may be destroying it right now. Slots belong to the sim's device.
+    const bool slot_views = &d == main_state && d.slot_views;
+    D3D12_SHADER_RESOURCE_VIEW_DESC empty{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    empty.Texture2D.MipLevels = 1;
     for (unsigned i = 0; i < slot_count; ++i) {
-        auto resource = slot_resources[i].load();
-        srv.Format = resource ? slot_formats[i] : DXGI_FORMAT_R8G8B8A8_UNORM;
-        // The game's own mip range (the fit pass samples like the sim); full-size sampling reads level 0 in the shader.
-        srv.Texture2D.MostDetailedMip = resource ? slot_first_mip[i] : 0;
-        srv.Texture2D.MipLevels = !resource ? 1 : slot_mip_count[i];
+        const auto resource = slot_views ? slot_resources[i].load() : nullptr;
         // A painting with its picture in alpha only: that alpha as a grey picture, read inverted (see PaintingCopy).
         const bool alpha_only = resource && alpha_only_copy(resource);
         if (alpha_only) inverted_slots |= 1u << i;
         if (resource && slot_meshes[i].load() && !separate_matches(resource)) painted_slots |= 1u << i; // read like the sim's material does (see sample_painted)
-        srv.Shader4ComponentMapping = alpha_only ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 3, 3,
-            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        d.native->CreateShaderResourceView(resource, &srv, at(2 + i));
-        srv.Texture2D.MostDetailedMip = 0;
+        if (!resource) { d.native->CreateShaderResourceView(nullptr, &empty, at(2 + i)); continue; }
+        auto view = d.slot_views->GetCPUDescriptorHandleForHeapStart();
+        view.ptr += SIZE_T((d.slot_view_set[i].load(std::memory_order_acquire) * 2 + (alpha_only ? 1 : 0)) * slot_count + i) * descriptor_size;
+        d.native->CopyDescriptorsSimple(1, at(2 + i), view, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{out_format, D3D12_UAV_DIMENSION_TEXTURE2D};
     if (out.DepthOrArraySize > 1) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC first_layer{out_format, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
