@@ -84,7 +84,7 @@ puts them back):
 | Glass layer (0-100 %, default 100 %) | How much of the sim's glass effects (dirt, glare, reflections, shadows) is kept on fixed screens. Lower values can help if quickly changing numbers leave a milky trail |
 
 Under **Troubleshooting → Experimental fixes** (collapsed, **all off by default except UV seam fix, Full-size sampling,
-Stable screen edges and Occlusion check**; for problems that only some aircraft have, "Reset experimental fixes" puts them all back to
+Stable screen edges, Occlusion check and Painted screens**; for problems that only some aircraft have, "Reset experimental fixes" puts them all back to
 default):
 
 | Setting | What it does |
@@ -92,6 +92,7 @@ default):
 | Full-size sampling (on) | Reads the screens only from their full-size picture, with more samples where a screen is small on your monitor. Off: also from the smaller copies the GPU keeps for distant screens, which can shimmer when you zoom out |
 | Stable screen edges (on) | Keeps the pixels along each screen's edge from shimmering: where a screen ends is learnt over a few frames instead of judged anew every frame. Untick it if a screen's edge looks cut off or too wide |
 | Occlusion check (on) | Leaves the sim's own picture wherever something sits in front of a screen (a sidestick, a hand, the yoke), using the sim's depth buffer. Off: a screen can be drawn over things in front of it, e.g. the A380 EFB over the sidestick |
+| Painted screens (on) | Also fixes readouts the sim shows through a virtual painting (`[VPainting]` in the aircraft's `panel.cfg`) drawn by a see-through material, e.g. the Fenix A320's FCU with **FCU readouts: New** in its EFB. Each such readout gets its own brightness match. Turn it off if something painted on the aircraft looks wrong |
 | Calm glass at symbols (off) | Right next to symbols and digits, draws the glass effects (dirt, glare, reflections) without their finest detail, which can shimmer there. On some screens it can add shimmer instead, so it's off by default |
 | Dark screen fix (off) | Keeps very dark screens fixed in strong sunlight (e.g. the F/A-18E Super Hornet). Off by default since 0.8.3, because it can also let the fix draw over a screen whose picture it can't redraw |
 | UV seam fix (on) | Removes thin dashed lines where a screen's picture meets a part of the same screen that uses another area of its image (FSS E-Jets: the line between the picture and its bezel band), and keeps those edges smooth on low DLSS modes. If a screen edge looks worse with it on, untick it and please report the aircraft |
