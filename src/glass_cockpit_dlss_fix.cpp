@@ -1660,26 +1660,37 @@ Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 || desc.MipLevels > 16 ||
             desc.Width > max_painting_copy_size || desc.Height > max_painting_copy_size) return painting;
         desc.Alignment = 0; desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-        std::lock_guard lock(painting_copies_mutex);
-        find();
-        if (!entry) {
-            // A free entry whose copy has the same size and format (the aircraft loaded again), else a new one.
+        // A free entry whose copy has the same size and format (the aircraft loaded again), else a new one.
+        const auto free_entry = [&]() -> PaintingCopy* {
             const int n = painting_copy_count.load(std::memory_order_acquire);
-            for (int c = 0; c < n && !entry; ++c) {
+            for (int c = 0; c < n; ++c) {
                 const auto& d = painting_copies[c].desc;
                 if (!painting_copies[c].painting.load() && d.Width == desc.Width && d.Height == desc.Height && d.MipLevels == desc.MipLevels && d.Format == desc.Format)
-                    entry = &painting_copies[c];
+                    return &painting_copies[c];
             }
-            if (!entry) {
-                if (n >= max_painting_copies) { LOG_ONCE("painted screens: %d paintings copied, more are read as they are", max_painting_copies); return painting; }
-                ComPtr<ID3D12Resource> made;
-                const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-                {
-                    if (FAILED(state.device->native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, map_resting, nullptr, IID_PPV_ARGS(&made)))) {
-                        LOG_ONCE("painted screens: no copy made of painting %p (%llux%u mips=%u)", painting.resource, uint64_t(desc.Width), desc.Height, unsigned(desc.MipLevels));
-                        return painting;
-                    }
-                }
+            return nullptr;
+        };
+        std::unique_lock lock(painting_copies_mutex);
+        find();
+        ComPtr<ID3D12Resource> made;
+        if (!entry && !free_entry() && painting_copy_count.load(std::memory_order_acquire) < max_painting_copies) {
+            // The copy is made without the lock: a texture destroyed inside the runtime takes it (forget_painting_copy), so it is
+            // never held across a D3D12 call. If another thread copied the painting or freed a fitting entry meanwhile, this copy goes.
+            lock.unlock();
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            if (FAILED(state.device->native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, map_resting, nullptr, IID_PPV_ARGS(&made)))) {
+                LOG_ONCE("painted screens: no copy made of painting %p (%llux%u mips=%u)", painting.resource, uint64_t(desc.Width), desc.Height, unsigned(desc.MipLevels));
+                return painting;
+            }
+            lock.lock();
+            find();
+        }
+        if (!entry) {
+            entry = free_entry();
+            const int n = painting_copy_count.load(std::memory_order_acquire);
+            const bool added = !entry;
+            if (added) {
+                if (n >= max_painting_copies || !made) { LOG_ONCE("painted screens: %d paintings copied, more are read as they are", max_painting_copies); return painting; }
                 entry = &painting_copies[n];
                 entry->copy = made;
                 entry->desc = desc;
@@ -1694,7 +1705,7 @@ Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
                 if (const auto found = view_mips.find(painting.resource); found != view_mips.end()) view_mips[entry->copy.Get()] = found->second;
             }
             entry->painting.store(painting.resource, std::memory_order_release);
-            if (entry == &painting_copies[n]) painting_copy_count.store(n + 1, std::memory_order_release);
+            if (added) painting_copy_count.store(n + 1, std::memory_order_release);
             log("painted screens: painting %p (%llux%u mips=%u) gets a copy of its own %p", painting.resource, uint64_t(desc.Width), desc.Height, unsigned(desc.MipLevels),
                 entry->copy.Get());
         }
