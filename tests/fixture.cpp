@@ -1146,6 +1146,19 @@ int main(int argc, char** argv) {
                 {"still-glass-swap-level-upscaler", 35, 0, 0, 0, 1, 100, 0, 1, false, false, 0, false, 1, false, false, true},
                 // Swapping a texture shared by meshes at different brightness.
                 {"still-glass-swap-dim", 35, 0, 0, 0, 1, 100, 0, 1, false, false, 0, false, 1, false, true, true, 0, false, 0, false, false, true},
+                // The same in the sun, one screen on one mesh at one brightness (the Fenix A320's displays, whose textures it
+                // swaps several times a minute). The glare lowers the fit score, and a matched screen whose swap frame scored
+                // 0.5 or less was left to the upscaler for that frame. "-upscaler": the fake DLSS output is magenta, so such a
+                // frame shows. "mild", "medium", "harsh": a wider, brighter glare spot (the harsh one scores about 0.14, so
+                // the screen is left to the upscaler nearly all the time: a swap must not bring it back without its glare).
+                {"still-sun-swap-upscaler", 35, 0, 0, 0, 1, 100, 0, 1, false, true, 1, false, 1, false, false, true},
+                {"still-mild-sun-swap-upscaler", 35, 0, 0, 0, 1, 100, 0, 1, false, true, 1, false, 1, false, false, true},
+                {"still-medium-sun-swap-upscaler", 35, 0, 0, 0, 1, 100, 0, 1, false, true, 1, false, 1, false, false, true},
+                {"still-harsh-sun-swap-upscaler", 35, 0, 0, 0, 1, 100, 0, 1, false, true, 1, false, 1, false, false, true},
+                // The same two with the upscaler's own (slightly shifted) picture: a swap frame the fix draws must look like the
+                // frames around it, not only beat a magenta upscaler output.
+                {"still-mild-sun-swap", 35, 0, 0, 0, 1, 100, 0, 1, false, true, 1, false, 1, false, false, true},
+                {"still-medium-sun-swap", 35, 0, 0, 0, 1, 100, 0, 1, false, true, 1, false, 1, false, false, true},
                 // Edge trim: the fake DLSS output is magenta, so the trimmed band shows. "trim" = flicker of the pixels near the
                 // screen's edge (the band must not crawl with the jitter) and the share of them left to the upscaler.
                 {"still-trim-0", 35, 0, 0, 0, 1, 0, 0, 1, false, false, 0, false, 1, false, false, false, 0},
@@ -1214,6 +1227,10 @@ int main(int argc, char** argv) {
                 occluder = {};
                 double occluder_error = 0, ring_trimmed = 0, blank_dropped = 0; uint64_t occluder_n = 0, ring_n = 0, blank_n = 0;
                 dlss_magenta = std::strstr(m.name, "trim") != nullptr || std::strstr(m.name, "upscaler") != nullptr || m.blank || m.windows;
+                // Sun modes: the glare spot (centre uv, radius, intensity), wider and brighter in the sun swap modes.
+                const std::array<float, 4> sun_glare = std::strstr(m.name, "harsh") ? std::array<float, 4>{0.3f, 0.35f, 0.45f, 2.5f}
+                    : std::strstr(m.name, "medium") ? std::array<float, 4>{0.3f, 0.35f, 0.35f, 1.6f}
+                    : std::strstr(m.name, "mild") ? std::array<float, 4>{0.3f, 0.35f, 0.3f, 1.2f} : std::array<float, 4>{0.25f, 0.3f, 0.15f, 0.8f};
                 set_full_size(m.full_size);
                 set_temporal(0);
                 join = m.join; band = m.band; cursor = m.band; inset = m.inset; atlas = m.atlas; windows = m.windows; dim = m.dim; mixed = std::strstr(m.name, "mixed") != nullptr;
@@ -1262,7 +1279,7 @@ int main(int argc, char** argv) {
                     upload(globals[0].Get(), c.global.data(), sizeof(c.global));
                     // Sun modes: the ideal picture with the steady sun (what DLSS shows), the sim's frame with this frame's.
                     if (m.sun) {
-                        material[4] = {0.25f, 0.3f, 0.15f, 0.8f}; material[5] = {0, 0, 0.06f, 0.55f};
+                        material[4] = sun_glare; material[5] = {0, 0, 0.06f, 0.55f};
                         upload(materials[0].Get(), material.data(), sizeof(material));
                     }
                     auto ideal = truth();
@@ -1280,11 +1297,11 @@ int main(int argc, char** argv) {
                                 ideal[size_t(y) * output_w + x] = {occluder_colour[0], occluder_colour[1], occluder_colour[2], 0};
                     }
                     if (m.sun) {
-                        material[4] = {0.25f + 0.004f * std::sin(t * 2.1f), 0.3f, 0.15f, 0.8f * (1 + 0.08f * std::sin(t * 2.9f))};
+                        material[4] = {sun_glare[0] + 0.004f * std::sin(t * 2.1f), sun_glare[1], sun_glare[2], sun_glare[3] * (1 + 0.08f * std::sin(t * 2.9f))};
                         material[5] = {0, 0, 0.06f, 0.55f + 0.0015f * std::sin(t * 1.7f)};
                         upload(materials[0].Get(), material.data(), sizeof(material));
                     }
-                    dlss_shift[0] = m.sun ? 0.3f * std::sin(t * 1.3f) : 0.0f; dlss_shift[1] = m.sun ? 0.3f * std::cos(t * 1.9f) : 0.0f;
+                    dlss_shift[0] = m.sun && !dlss_magenta ? 0.3f * std::sin(t * 1.3f) : 0.0f; dlss_shift[1] = m.sun && !dlss_magenta ? 0.3f * std::cos(t * 1.9f) : 0.0f;
                     const auto out = run(ideal, jitters[t % 8][0], jitters[t % 8][1]);
                     // The join's two ends on the monitor (output pixels).
                     float ends[2][2]{};

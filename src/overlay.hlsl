@@ -535,6 +535,7 @@ void solve(uint3 id : SV_DispatchThreadID)
     bool swapped = bounds_reset & (1u << slot);
     float seen = asfloat(edge_bounds.Load(brightness_next + slot * 4));
     bool fresh = swapped && seen > 0;
+    bool matched_pre_swap = previous_a.w > 0; // before the swap (its glass layer is there to keep, see the composite)
     // The slot's meshes this frame (read back for the log), and how often their brightness didn't explain the picture (below).
     float dimmest_inverse = asfloat(edge_bounds.Load(brightness_dimmest + slot * 4));
     float4 levels = float4(reference, seen, dimmest_inverse > 0 ? 1 / dimmest_inverse : 0, swapped ? 0 : params[slot * params_per_slot + 4].w);
@@ -608,7 +609,16 @@ void solve(uint3 id : SV_DispatchThreadID)
     double detail_xx = v[16], detail_yy = v[17] * 1024, detail_xy = v[18] - v[19];
     double detail_quality = pooled_variance > 3e-6 && detail_xx > 0 && detail_yy > 0 && detail_xy > 0
         ? detail_xy * detail_xy / (detail_xx * detail_yy) : 0.0;
-    if (fresh && quality <= 0.5)
+    // A swap frame's fit reads brightness_next while the fit pass is still filling it (see brightness_ratio): with meshes at
+    // several brightnesses that can put the fit off, so it is only used if it matches well. With one brightness (a screen on
+    // one mesh, like the Fenix A320's displays) every pixel reads the same ratio either way, so the fit is as sound as any, and
+    // for a screen matched before the swap the usual threshold applies: the Fenix swaps its displays' textures several times
+    // a minute, and in the sun they score 0.2 to 0.5, so each such swap was left to the upscaler for a frame. The composite
+    // still leaves it any pixel without last frame's glass layer. Painted screens keep the stricter test: their light comes
+    // from this frame's remainder, which a swap frame doesn't have.
+    bool one_level = dimmest_inverse > 0 && seen * dimmest_inverse < 1.01;
+    bool painted_slot = ((painted_slots >> slot) & 1) != 0;
+    if (fresh && quality <= (one_level && matched_pre_swap && !painted_slot ? 0.15 : 0.5))
     {
         params[slot * params_per_slot] = 0;
         edge_bounds.Store(brightness_fitted + slot * 4, 0);
@@ -1286,6 +1296,10 @@ void composite(uint3 id : SV_DispatchThreadID)
         float3 spread = 0.25 * abs(glass) + 0.002;
         if ((flags & 4) && !(flags & 2048)) glass = clamp(output[id.xy].rgb - content, glass - spread, glass + spread);
     }
+    // A swap frame matched below 0.5 (see solve) with no glass layer here to keep: drawn on that fit alone, a screen in the
+    // sun would come back without its glare for a frame. The upscaler's, as before.
+    else if ((bounds_reset & (1u << slot)) && params[slot * params_per_slot + 2].w <= 0.5)
+        return;
     float3 colour = content + glass;
     // Detail clamp: the redrawn screen may not be brighter or darker than what the sim itself drew in the 5x5 render
     // pixels around this one this frame. Content the sim shows survives; texture detail too thin for the sim to show
