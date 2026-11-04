@@ -581,6 +581,15 @@ void solve(uint3 id : SV_DispatchThreadID)
     // the view): nothing to learn the brightness from. A screen already matched keeps its match; one never matched stays
     // with the upscaler (see below).
     if (pooled_variance <= 3e-6 && previous_a.w > 0) { params[slot * params_per_slot] = previous_a; return; }
+    // A painted screen in that case has no score (-1): its painting read in colour while the sim holds it in alpha only
+    // (until the readbacks tell), or a readout still blank. Its first picture starts its score afresh (see q below).
+    bool painted_slot = ((painted_slots >> slot) & 1) != 0;
+    if (pooled_variance <= 3e-6 && painted_slot)
+    {
+        params[slot * params_per_slot] = float4(previous_a.rgb, -1);
+        params[slot * params_per_slot + 2] = float4(previous_q.xyz, -1);
+        return;
+    }
     float3 a, b;
     float fitted_gain = 0;
     [unroll] for (uint c = 0; c < 3; ++c)
@@ -617,7 +626,6 @@ void solve(uint3 id : SV_DispatchThreadID)
     // still leaves it any pixel without last frame's glass layer. Painted screens keep the stricter test: their light comes
     // from this frame's remainder, which a swap frame doesn't have.
     bool one_level = dimmest_inverse > 0 && seen * dimmest_inverse < 1.01;
-    bool painted_slot = ((painted_slots >> slot) & 1) != 0;
     if (fresh && quality <= (one_level && matched_pre_swap && !painted_slot ? 0.15 : 0.5))
     {
         params[slot * params_per_slot] = 0;
@@ -625,6 +633,18 @@ void solve(uint3 id : SV_DispatchThreadID)
         return;
     }
     if (flags & 16) quality = max(quality, detail_quality);
+    // Painted screens are scored per channel. Their material tints their picture (grey in all three channels when it is
+    // held in alpha only), and one gain for all channels explains at most (sum g)^2 / (3 sum g^2) of even a perfect match:
+    // about 0.55 for the Fenix A320's amber readouts, which sat at the thresholds below in any light. This is the share of
+    // the scene's variation the three channels' own fits explain (the fit drawn is per channel too).
+    if (painted_slot)
+    {
+        double explained = 0;
+        [unroll] for (uint c = 0; c < 3; ++c)
+            if (variance[c] > 1e-6 && covariance[c] > 0) explained += covariance[c] * covariance[c] / variance[c];
+        double per_channel = pooled_variance > 3e-6 && pooled_scene_variance > 1e-9 ? min(explained / pooled_scene_variance, 1.0) : 0.0;
+        quality = (flags & 16) ? max(per_channel, detail_quality) : per_channel;
+    }
     // Meshes of one texture far apart in brightness and no match: their brightness doesn't explain the picture (A400M: the
     // pedestal readouts share the glareshield's texture but not its knob, and when they come into view the glareshield and
     // radio pixels are read far too dark). Counted here; from a few frames on, each mesh gets a match of its own (see
@@ -635,7 +655,7 @@ void solve(uint3 id : SV_DispatchThreadID)
         params[slot * params_per_slot + 4] = levels;
     }
     float w = previous_a.w > 0 ? smoothing : 1;
-    float q = previous_a.w != 0 ? lerp(previous_q.w, float(quality), smoothing) : float(quality);
+    float q = previous_a.w != 0 && previous_q.w >= 0 ? lerp(previous_q.w, float(quality), smoothing) : float(quality);
     float dq = previous_a.w != 0 ? lerp(previous_detail.x, float(detail_quality), smoothing) : float(detail_quality);
     // A screen that matched well and now scores low is held: dark panels and things the texture doesn't hold (A2A Legacy
     // radios, A400M glareshield, a lit LED) are mostly glow, and a fit to that gives a wrong gain, so the last good gain
@@ -649,7 +669,7 @@ void solve(uint3 id : SV_DispatchThreadID)
     // limit there switched between the two gains every few frames, which showed as flicker.
     float3 good_gain = previous_a.w != 0 ? previous_detail.yzw : 0;
     bool matched_before = any(good_gain > 0);
-    bool holding = (previous_a.w > 0 || (previous_a.w < 0 && q > 0.15)) && q < 0.35 && matched_before;
+    bool holding = !painted_slot && (previous_a.w > 0 || (previous_a.w < 0 && q > 0.15)) && q < 0.35 && matched_before;
     bool hold = holding && q <= 0.25;
     // The gain held follows the match slowly, in steps too small for one bad frame to matter: a knob can dim a screen without
     // changing its texture or its mesh's brightness (A2A Legacy radios), and a gain frozen from another knob position showed
@@ -670,7 +690,14 @@ void solve(uint3 id : SV_DispatchThreadID)
         }
     double held_variance = 0;
     [unroll] for (uint c = 0; c < 3; ++c) held_variance += good_gain[c] * good_gain[c] * variance[c];
-    bool matches = previous_a.w < 0 ? q > (matched_before ? 0.15 : 0.2) : q > 0.15 || (hold && (q > 0.08 || held_variance < 0.1 * pooled_scene_variance));
+    // Painted screens are not held: their light is the sun's as much as their own (the Fenix A320's FCU and clock), and a
+    // gain kept from other light drew the digits far too dim or bright (in the sun the clock's gain went between about 1, 20
+    // and 800 from one log line to the next: a shimmer), while a weak match there drew them dim with flickering edges. They
+    // are drawn while they match well, from 0.55 until below 0.45 (the margin keeps a readout in changing light from
+    // switching back and forth), and otherwise left to the upscaler: the sim's own picture. Out of the sun they score 0.8 to
+    // 1, in it 0.15 to 0.7.
+    bool matches = painted_slot ? q > (previous_a.w > 0 ? 0.45 : 0.55)
+        : previous_a.w < 0 ? q > (matched_before ? 0.15 : 0.2) : q > 0.15 || (hold && (q > 0.08 || held_variance < 0.1 * pooled_scene_variance));
     float low_calls = matches || previous_a.w <= 1 ? (matches ? 0 : 1) : previous_a.w;
     bool keep = matches || (hold && low_calls < 120);
     float3 gain = lerp(previous_a.rgb, a, w);
@@ -1210,6 +1237,10 @@ void composite(uint3 id : SV_DispatchThreadID)
             float3 ratio = (smy / sw - offset.rgb * mean_m + prior) / (smm / sw + prior);
             light = clamp((covariance + prior * ratio) / (variance + prior), 0.1, 10);
         }
+        // None of this readout's remainder around: it wasn't drawn last frame (see matches in the solve), so there is no
+        // light or glass layer to draw it with, and on its brightness match alone it came back far off for a frame (lit
+        // across, or in the sun). The upscaler's until the next frame.
+        else return;
         content *= light;
     }
 

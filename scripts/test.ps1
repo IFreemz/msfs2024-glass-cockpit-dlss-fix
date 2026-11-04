@@ -48,6 +48,14 @@ try {
     # minute: the fix must read the new one in alpha only at once, not leave it to the upscaler until it finds that out again.
     & .\FlightSimulator2024.exe --painted --rov --source --alpha --recreate
     if ($LASTEXITCODE) { throw "Offline painted decal made anew test failed ($LASTEXITCODE)" }
+    # The same tinted amber by its material, as the Fenix's readouts are: one gain for all channels can't explain that
+    # picture well, so the fix must score it per channel or leave a good match to the upscaler.
+    & .\FlightSimulator2024.exe --painted --rov --source --alpha --amber
+    if ($LASTEXITCODE) { throw "Offline amber painted decal test failed ($LASTEXITCODE)" }
+    # Strong sun on the matched readout, the panel under it sunlit across a shadow edge (the Fenix's FCU and clock in the
+    # sun): every frame the fix draws must be as good as the upscaler's picture and not flicker, else it is left to it.
+    & .\FlightSimulator2024.exe --painted --rov --source --alpha --sun
+    if ($LASTEXITCODE) { throw "Offline painted decal in strong sun test failed ($LASTEXITCODE)" }
     & .\FlightSimulator2024.exe --fsr --vr --track
     if ($LASTEXITCODE) { throw "Offline FSR VR descriptor tracking test failed ($LASTEXITCODE)" }
     # Another mod (the RTX 40 MFG unlock) has redirected DLSS evaluate in a way that can't be hooked directly.
