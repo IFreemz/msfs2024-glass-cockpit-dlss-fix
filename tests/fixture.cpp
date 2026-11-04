@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
         bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false,
-            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false, recreate = false, occluder_test = false;
+            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false, recreate = false, strong_sun = false, amber = false, occluder_test = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
@@ -261,6 +261,8 @@ int main(int argc, char** argv) {
             gauge_source |= !std::strcmp(argv[i], "--source");
             alpha_only |= !std::strcmp(argv[i], "--alpha");
             recreate |= !std::strcmp(argv[i], "--recreate");
+            strong_sun |= !std::strcmp(argv[i], "--sun");
+            amber |= !std::strcmp(argv[i], "--amber");
             occluder_test |= !std::strcmp(argv[i], "--occluder");
         }
         if (hotpatch) redirect_evaluate_like_mfg_unlock();
@@ -289,6 +291,17 @@ int main(int argc, char** argv) {
         // came before the fix knew it), so only the frames after are checked.
         require(!recreate || alpha_only, "--recreate is for --painted --rov --source --alpha");
         if (recreate) std::printf("display: the painting made anew near the end\n");
+        // --sun (with --alpha): the sun comes out on the readout after it was matched in the shade and stays (the Fenix
+        // A320's FCU and clock in the sun): the panel under it sunlit beyond a soft shadow edge, brighter than the lit digits
+        // in the shade, the digits there whiter and brighter, and a glint that wobbles from frame to frame. The upscaler's
+        // picture is the ideal one, so a frame the fix leaves to it is right: any frame it draws must be about as good, and
+        // it must not keep switching between drawing the readout and leaving it to the upscaler.
+        require(!strong_sun || (alpha_only && !recreate), "--sun is for --painted --rov --source --alpha");
+        if (strong_sun) std::printf("display: strong sun on the readout\n");
+        // --amber (with --alpha): the readout's material tints its grey picture amber, as the Fenix A320's does (its gains
+        // were about 1.85, 0.70 and 0.04): one gain for all channels explains at most about 0.55 of that picture.
+        require(!amber || alpha_only, "--amber is for --painted --rov --source --alpha");
+        if (amber) std::printf("display: the readout tinted amber\n");
         // --occluder: something in front of the screen (a hand, the yoke), drawn into colour and depth after it; in VR at
         // another spot in each eye (the eyes see it from a few centimetres apart). The fix must leave it to the upscaler in
         // every eye. DLSS gets the depth as the sim gives it in VR: the first call of a frame both eyes' depth in one
@@ -880,6 +893,7 @@ int main(int argc, char** argv) {
             UINT scroll; float dirt, shadow_u; bool glare;
             enum Prefill { magenta, perfect, previous } prefill; // what the fake DLSS leaves in the output
             enum Check { info, quality, untouched } check;
+            float sun = 0; // --sun: how strong the sun is on the readout (0: none)
         };
         std::vector<Frame> frames{
             {"warmup", 0, true, true, 0.25f, -0.17f, 0, 0.06f, 0.6f, false, Frame::perfect, Frame::info},
@@ -904,9 +918,26 @@ int main(int argc, char** argv) {
             frames.push_back({"recreated_2", 0, true, true, -0.1f, 0.35f, 48, 0.06f, 0.6f, true, Frame::previous, Frame::quality});
             frames.push_back({"recreated_3", 0, true, true, 0.2f, -0.3f, 56, 0.06f, 0.6f, true, Frame::previous, Frame::quality});
         }
+        // --sun: 24 frames in the sun, the content still (scrolled as in the last frames), the sun's strength wobbling by
+        // about a tenth from frame to frame (the sim's glare does), the jitter going round its 8 positions.
+        static const char* const sun_names[24]{"sun_1", "sun_2", "sun_3", "sun_4", "sun_5", "sun_6", "sun_7", "sun_8", "sun_9", "sun_10", "sun_11", "sun_12",
+            "sun_13", "sun_14", "sun_15", "sun_16", "sun_17", "sun_18", "sun_19", "sun_20", "sun_21", "sun_22", "sun_23", "sun_24"};
+        static const float sun_jitters[8][2]{{0.0f, -0.1667f}, {-0.25f, 0.1667f}, {0.25f, -0.3889f}, {-0.375f, -0.0556f},
+            {0.125f, 0.2778f}, {-0.125f, -0.2778f}, {0.375f, 0.0556f}, {-0.4375f, 0.3889f}};
+        // Strength 3: the sunlit panel under the readout over three times as bright as the lit digits in the shade, the match
+        // falling to under 0.3 (in the sun the Fenix's FCU scored 0.01 to 0.25, its clock 0.4 to 0.6).
+        const float sun_level = 3;
+        if (strong_sun)
+            for (int k = 0; k < 24; ++k)
+                frames.push_back({sun_names[k], 0, true, true, sun_jitters[k % 8][0], sun_jitters[k % 8][1], 40, 0.06f, 0.6f, true, Frame::perfect,
+                    k < 4 ? Frame::info : Frame::quality, sun_level * (1 + 0.1f * std::sin(k * 2.9f))});
         auto set_material = [&](const Frame& f) {
             material[4] = f.glare ? std::array<float, 4>{0.25f, 0.3f, 0.15f, 0.8f} : std::array<float, 4>{};
             material[5] = {0, 0, f.dirt, f.shadow_u};
+            // --sun: the sunlit panel under the readout (rgb) and how much whiter and brighter the digits are there (w), and
+            // the glint: brighter and on the sunlit side.
+            material[6] = f.sun > 0 ? std::array<float, 4>{0.9f * f.sun, 0.85f * f.sun, 0.8f * f.sun, f.sun} : std::array<float, 4>{};
+            if (f.sun > 0) material[4] = {0.45f, 0.25f, 0.1f, 2.0f * f.sun};
             upload(materials[0].Get(), material.data(), sizeof(material));
         };
         auto render_reference = [&](int camera, UINT eye) {
@@ -947,6 +978,7 @@ int main(int argc, char** argv) {
         auto out_rb = readback(device.Get(), output.Get());
         auto prefill_upload = buffer(device.Get(), out_rb.bytes, D3D12_HEAP_TYPE_UPLOAD);
         std::array<std::vector<std::array<float, 4>>, 2> previous_refs;
+        std::array<std::vector<std::array<float, 3>>, 2> previous_outs, previous_prefills; // --sun: last frame's, for the flicker
         std::vector<uint32_t> prefill(size_t(output_w) * output_h);
         bool all_passed = true;
         if (motion) {
@@ -1476,6 +1508,7 @@ int main(int argc, char** argv) {
             set_temporal(0); set_smooth(0);
             return 0;
         }
+        if (amber) material[2] = {1.85f, 0.70f, 0.04f, 0};
         for (const auto& f : frames) {
             set_jitter(f.jitter_positive);
             if (!std::strcmp(f.name, "warmup2")) Sleep(1500); // let the background PSO compile finish
@@ -1624,7 +1657,12 @@ int main(int argc, char** argv) {
             // Compare with the current reference; "ghost" = what the fake DLSS output alone would show.
             void* mapped = nullptr; check(out_rb.buffer->Map(0, nullptr, &mapped));
             uint64_t covered = 0, replaced = 0, stray = 0, interior = 0, occluder_n = 0, occluder_changed = 0;
-            double error = 0, ghost = 0, max_error = 0;
+            double error = 0, ghost = 0, max_error = 0, flicker = 0, dlss_flicker = 0;
+            uint64_t flicker_n = 0, inner_replaced = 0;
+            auto& previous_out = previous_outs[eye];
+            auto& previous_prefill = previous_prefills[eye];
+            const bool sun_flicker = f.sun > 0 && previous_out.size() == size_t(output_w) * output_h && !previous_ref.empty();
+            std::vector<std::array<float, 3>> outs(size_t(output_w) * output_h), prefills(size_t(output_w) * output_h);
             std::vector<BYTE> png(size_t(output_w) * output_h * 4);
             for (UINT y = 0; y < output_h; ++y) for (UINT x = 0; x < output_w; ++x) {
                 const size_t i = size_t(y) * output_w + x;
@@ -1649,7 +1687,17 @@ int main(int argc, char** argv) {
                     double e = 0, g = 0;
                     for (int k = 0; k < 3; ++k) { e += std::abs(double(c[k]) - ref[i][k]); g += std::abs(double(before[k]) - ref[i][k]); }
                     error += e / 3; ghost += g / 3; max_error = std::max(max_error, e / 3);
+                    inner_replaced += changed;
+                    if (sun_flicker) { // beyond what the ideal picture changes (the sun wobbles)
+                        double k = 0, kd = 0;
+                        for (int ch = 0; ch < 3; ++ch) {
+                            k += std::max(0.0, std::abs(double(c[ch]) - previous_out[i][ch]) - std::abs(double(ref[i][ch]) - previous_ref[i][ch]));
+                            kd += std::max(0.0, std::abs(double(before[ch]) - previous_prefill[i][ch]) - std::abs(double(ref[i][ch]) - previous_ref[i][ch]));
+                        }
+                        flicker += k / 3; dlss_flicker += kd / 3; ++flicker_n;
+                    }
                 }
+                outs[i] = {c[0], c[1], c[2]}; prefills[i] = {before[0], before[1], before[2]};
                 auto p = png.data() + i * 4;
                 for (int k = 0; k < 3; ++k) p[k] = BYTE(std::clamp(c[k], 0.0f, 1.0f) * 255);
                 p[3] = 255;
@@ -1665,8 +1713,18 @@ int main(int argc, char** argv) {
             char occluder_text[48] = "";
             if (occluder_test && f.draw) std::snprintf(occluder_text, sizeof(occluder_text), " occluder_changed=%.3f", double(occluder_changed) / std::max<uint64_t>(occluder_n, 1));
             if (f.check == Frame::untouched) pass = replaced == 0;
-            std::printf("%-12s covered=%llu replaced=%llu stray=%llu error=%.4f (dlss_alone=%.4f) max=%.3f%s %s\n", name.c_str(), covered, replaced, stray,
-                mean, ghost_mean, max_error, occluder_text, f.check == Frame::info ? "(info)" : pass ? "PASS" : "FAIL");
+            // --sun: a frame the fix draws must be about as good as the upscaler's (ideal) picture, and not flicker.
+            // The upscaler's own error and flicker there come from its output format (11 and 10 bit floats), large on a
+            // readout this bright.
+            const double drawn_share = interior ? double(inner_replaced) / interior : 0, flicker_mean = flicker_n ? flicker / flicker_n : 0,
+                dlss_flicker_mean = flicker_n ? dlss_flicker / flicker_n : 0;
+            if (f.sun > 0 && f.check == Frame::quality)
+                pass = interior > 10000 && stray < covered / 50 && mean <= std::max(0.02, 2 * ghost_mean) && flicker_mean <= dlss_flicker_mean + 0.005;
+            char sun_text[80] = "";
+            if (f.sun > 0) std::snprintf(sun_text, sizeof(sun_text), " drawn=%.2f flicker=%.4f (dlss_alone=%.4f)", drawn_share, flicker_mean, dlss_flicker_mean);
+            previous_out = std::move(outs); previous_prefill = std::move(prefills);
+            std::printf("%-12s covered=%llu replaced=%llu stray=%llu error=%.4f (dlss_alone=%.4f) max=%.3f%s%s %s\n", name.c_str(), covered, replaced, stray,
+                mean, ghost_mean, max_error, occluder_text, sun_text, f.check == Frame::info ? "(info)" : pass ? "PASS" : "FAIL");
             all_passed &= pass;
             previous_ref = ref;
           }

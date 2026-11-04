@@ -34,6 +34,12 @@ $cases = @(
     # The same with the painting made anew near the end, as the Fenix makes its readouts painting anew every few seconds to a
     # minute: the fix must read the new one in alpha only at once, not leave it to the upscaler until it finds that out again.
     @{ Args = @('--painted', '--rov', '--source', '--alpha', '--recreate'); Name = 'Offline painted decal made anew test' }
+    # The same tinted amber by its material, as the Fenix's readouts are: one gain for all channels can't explain that
+    # picture well, so the fix must score it per channel or leave a good match to the upscaler.
+    @{ Args = @('--painted', '--rov', '--source', '--alpha', '--amber'); Name = 'Offline amber painted decal test' }
+    # Strong sun on the matched readout, the panel under it sunlit across a shadow edge (the Fenix's FCU and clock in the
+    # sun): every frame the fix draws must be as good as the upscaler's picture and not flicker, else it is left to it.
+    @{ Args = @('--painted', '--rov', '--source', '--alpha', '--sun'); Name = 'Offline painted decal in strong sun test' }
     @{ Args = @('--fsr', '--vr', '--track'); Name = 'Offline FSR VR descriptor tracking test' }
     # Another mod (the RTX 40 MFG unlock) has redirected DLSS evaluate in a way that can't be hooked directly.
     @{ Args = @('--hotpatch'); Name = 'Offline redirected DLSS test' }
