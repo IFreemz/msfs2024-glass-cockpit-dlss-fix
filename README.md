@@ -201,7 +201,7 @@ If a screen is never fixed at all (no green tint), settings won't help: see [Wha
 
 | Aircraft | Status |
 |---|---|
-| Fenix A320 family | Tested (the FCU with **FCU readouts: New** in its EFB from 1.0.5) |
+| Fenix A320 family | Tested (the FCU with **FCU readouts: New** in its EFB from 1.1.0) |
 | FSLabs A321neo | Tested (1.0.1 or newer: 1.0.0 crashed the sim while loading it) |
 | iFly 737 MAX 8 | Tested (every screen: CDUs, radio panels, transponder, ADF, MCP digits and both EFB tablets) |
 | iniBuilds A220 | Tested |
@@ -211,14 +211,14 @@ If a screen is never fixed at all (no green tint), settings won't help: see [Wha
 | iniBuilds A380 | Tested |
 | PMDG 737 | Tested by the community (also in VR) |
 | PMDG 777 | Tested by the community (also in VR) |
-| FlightFX C750 | Tested by the community (in VR from 1.0.5) |
+| FlightFX C750 | Tested by the community (in VR from 1.1.0) |
 | Default DA62 | Tested |
 | Default Cessna 152 (BendixKing radios) | Tested |
 | A2A Comanche 250 (radio displays) | Tested |
-| A2A Legacy (radio displays) | Tested by the community (1.0.5 or newer) |
+| A2A Legacy (radio displays) | Tested by the community (1.1.0 or newer) |
 | Default Cessna Longitude | Tested by the community (in VR) |
 | FSS E-Jets (ERJ-170/175/190/195) | Tested |
-| Default A400M | Tested by the community (1.0.5 or newer) |
+| Default A400M | Tested by the community (1.1.0 or newer) |
 | Default F/A-18E Super Hornet | Tested (if its dark screens drop out of the fix in strong sun, turn on Dark screen fix, see [Settings](#settings)) |
 
 Other glass cockpits should work too. If some screens of an aircraft don't turn green with Ctrl+Shift+F11, please
@@ -345,12 +345,12 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | FPS drops sharply for 20-30 seconds when opening the GSX menu with Ctrl+Shift+F12 | Update to 1.0.3 or newer (older versions used Ctrl+Shift+F12 for a debug tool) |
 | Standalone stays at "Waiting for a glass cockpit" on Windows 11 26H1 (the add-on works) | Update to 1.0.4 or newer |
 | Sim crashes at about 68% loading with NeuralHub (DLSS on AMD) | Update to 1.0.4 or newer |
-| Screens stop being fixed after about an hour of flying (AMD and Intel GPUs) until the sim is restarted | Update to 1.0.5 or newer |
-| Dim screens drop out of the fix depending on the camera position or their brightness (seen on the default A400M and the A2A Legacy) | Update to 1.0.5 or newer. At their very lowest brightness a screen can still drop out for a few seconds |
-| A screen flashes for a frame now and then (iniBuilds A380) | Update to 1.0.5 or newer |
-| The Fenix A320's FCU isn't fixed with **FCU readouts: New** in its EFB | Update to 1.0.5 or newer, with Painted screens on (the default) |
-| FlightFX C750 in VR: only the backup engine display is fixed | Update to 1.0.5 or newer |
-| Standalone: the log shows only the integrated GPU on a PC that also has a graphics card | Update to 1.0.5 or newer |
+| Screens stop being fixed after about an hour of flying (AMD and Intel GPUs) until the sim is restarted | Update to 1.1.0 or newer |
+| Dim screens drop out of the fix depending on the camera position or their brightness (seen on the default A400M and the A2A Legacy) | Update to 1.1.0 or newer. At their very lowest brightness a screen can still drop out for a few seconds |
+| A screen flashes for a frame now and then (iniBuilds A380) | Update to 1.1.0 or newer |
+| The Fenix A320's FCU isn't fixed with **FCU readouts: New** in its EFB | Update to 1.1.0 or newer, with Painted screens on (the default) |
+| FlightFX C750 in VR: only the backup engine display is fixed | Update to 1.1.0 or newer |
+| Standalone: the log shows only the integrated GPU on a PC that also has a graphics card | Update to 1.1.0 or newer |
 | Sim freezes when a Fenix aircraft loads, with RenoDX's DLSS add-on installed | Remove `renodx-dlss.addon64`; see [Other mods](#other-mods) |
 | "Only DLSS Frame Generation is running" | Frame Generation is on but Anti-Aliasing isn't DLSS or FSR (e.g. TAA). Set Anti-Aliasing to DLSS (any mode, DLAA too) or FSR; Frame Generation can stay on |
 | Some screens of an aircraft stay normal | Look at those screens in the cockpit, press **Screen probe** under Bug reports (writes a short diagnostic to the log), then send both logs and the aircraft name |
