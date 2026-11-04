@@ -730,7 +730,7 @@ struct PaintingCopy {
     std::atomic<uint32_t> state_changes{0}; // how often a level's read state changed: the barrier below needs the real one
     std::atomic<uint64_t> copied_recording{UINT64_MAX}; // the list recording it was last copied in (see ListState::recording)
     std::atomic<bool> copied_once{false}, waiting_logged{false};
-    std::atomic<int> alpha_only{-1}; // the picture is in alpha only: 1, in colour: 0, not known yet (or all black): -1
+    std::atomic<int> alpha_only{-1}; // the picture is in alpha only: 1, in colour: 0, not known yet (or all black): -1; a new painting starts with the last one's of its size (see painting_copy)
     std::atomic<int> seen{-1}; // a readback that disagreed with alpha_only (waits for the next one to agree), else -1
     // The copy's level 0 read back (see painting_readbacks): often until it shows where the picture is, then every ten
     // seconds. Only 8-bit RGBA/BGRA paintings (alpha in the top byte); others are read as they are, in colour.
@@ -1747,7 +1747,19 @@ Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
             for (auto& s : entry->states) s.store(0, std::memory_order_relaxed);
             entry->state_changes = 0;
             entry->copied_recording = UINT64_MAX; entry->copied_once = false; entry->waiting_logged = false;
-            entry->readback_present = 0; entry->next_readback = 0; entry->readback_wait = 0; entry->alpha_only = -1; entry->seen = -1;
+            entry->readback_present = 0; entry->next_readback = 0; entry->readback_wait = 0; entry->seen = -1;
+            // Read from the start as the last painting of this size and format held its picture, if that was found out (the
+            // readbacks then check this one, see painting_readbacks): the Fenix A320 makes its readouts and clock paintings
+            // anew every few seconds to a minute, each like the last, and each new one read in colour until found out again
+            // was left to the upscaler for about two seconds (the FCU's digits lost the fix that long). A reused entry's own
+            // verdict is its last painting's; a new entry takes another one's.
+            int like = added ? -1 : entry->alpha_only.load();
+            for (int c = 0; c < n && like < 0; ++c) {
+                const auto& other = painting_copies[c];
+                if (&other != entry && other.desc.Width == desc.Width && other.desc.Height == desc.Height && other.desc.MipLevels == desc.MipLevels &&
+                    other.desc.Format == desc.Format) like = other.alpha_only.load();
+            }
+            entry->alpha_only = like;
             // The composite reads the copy over the mip levels the game's views of the painting cover.
             {
                 std::lock_guard view_lock(view_mips_mutex);
@@ -1755,8 +1767,8 @@ Texture painting_copy(ListState& state, const Texture& painting) noexcept try {
             }
             entry->painting.store(painting.resource, std::memory_order_release);
             if (added) painting_copy_count.store(n + 1, std::memory_order_release);
-            log("painted screens: painting %p (%llux%u mips=%u) gets a copy of its own %p", painting.resource, uint64_t(desc.Width), desc.Height, unsigned(desc.MipLevels),
-                entry->copy.Get());
+            log("painted screens: painting %p (%llux%u mips=%u) gets a copy of its own %p%s", painting.resource, uint64_t(desc.Width), desc.Height, unsigned(desc.MipLevels),
+                entry->copy.Get(), like == 1 ? ", read in alpha only like the last painting of its size" : like == 0 ? ", read in colour like the last painting of its size" : "");
         }
     }
     // The barriers were recorded on any thread, in any order, so they only tell the state here if it is always the same one.
