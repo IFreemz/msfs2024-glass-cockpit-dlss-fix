@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
         bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false,
-            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false, occluder_test = false;
+            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false, recreate = false, occluder_test = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
@@ -260,6 +260,7 @@ int main(int argc, char** argv) {
             rov |= !std::strcmp(argv[i], "--rov");
             gauge_source |= !std::strcmp(argv[i], "--source");
             alpha_only |= !std::strcmp(argv[i], "--alpha");
+            recreate |= !std::strcmp(argv[i], "--recreate");
             occluder_test |= !std::strcmp(argv[i], "--occluder");
         }
         if (hotpatch) redirect_evaluate_like_mfg_unlock();
@@ -282,6 +283,12 @@ int main(int argc, char** argv) {
         // fix must not take that for good.
         require(!alpha_only || gauge_source, "--alpha is for --painted --rov --source");
         if (alpha_only) std::printf("display: the painting's picture in alpha only\n");
+        // --recreate (with --alpha): the sim makes the painting anew near the end, its views too (the Fenix A320 does so with
+        // its readouts every few seconds to a minute): the fix must read the new one as it read the last, at once. On the
+        // first frame of the new painting the fix's copy still holds the old one's picture (the barrier that tells its state
+        // came before the fix knew it), so only the frames after are checked.
+        require(!recreate || alpha_only, "--recreate is for --painted --rov --source --alpha");
+        if (recreate) std::printf("display: the painting made anew near the end\n");
         // --occluder: something in front of the screen (a hand, the yoke), drawn into colour and depth after it; in VR at
         // another spot in each eye (the eyes see it from a few centimetres apart). The fix must leave it to the upscaler in
         // every eye. DLSS gets the depth as the sim gives it in VR: the first call of a frame both eyes' depth in one
@@ -746,6 +753,20 @@ int main(int argc, char** argv) {
             }
             transition(list.Get(), painting.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         };
+        // --recreate: the painting destroyed and made anew, with its views (the GPU is done with it: each frame waits).
+        auto recreate_painting = [&] {
+            painting.Reset();
+            painting = texture(device.Get(), 768, 768, 10, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            device->CreateShaderResourceView(painting.Get(), nullptr, cpu0);
+            device->CopyDescriptorsSimple(2, gpu_slot, cpu0, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            for (UINT m = 0; m < 10; ++m) {
+                D3D12_RENDER_TARGET_VIEW_DESC v{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D};
+                v.Texture2D.MipSlice = m;
+                auto at = painting_rtvs->GetCPUDescriptorHandleForHeapStart(); at.ptr += m * rinc_painting;
+                device->CreateRenderTargetView(painting.Get(), &v, at);
+            }
+            std::printf("painting made anew\n");
+        };
         if (bench) {
             // The sim makes millions of descriptor copies per second from several threads; with descriptor tracking
             // (--track) each goes through the add-on. Time them: 4 threads, 1M single-descriptor copies each, from a
@@ -860,7 +881,7 @@ int main(int argc, char** argv) {
             enum Prefill { magenta, perfect, previous } prefill; // what the fake DLSS leaves in the output
             enum Check { info, quality, untouched } check;
         };
-        const Frame frames[]{
+        std::vector<Frame> frames{
             {"warmup", 0, true, true, 0.25f, -0.17f, 0, 0.06f, 0.6f, false, Frame::perfect, Frame::info},
             {"warmup2", 0, true, true, -0.33f, 0.41f, 0, 0.06f, 0.6f, false, Frame::perfect, Frame::info},
             {"static_a", 0, true, true, 0.25f, -0.17f, 0, 0.06f, 0.6f, false, Frame::perfect, Frame::quality},
@@ -876,6 +897,13 @@ int main(int argc, char** argv) {
             {"scroll_5", 0, true, true, 0.05f, 0.45f, 40, 0.06f, 0.6f, true, Frame::previous, Frame::quality},
             {"moved", 1, true, true, -0.2f, -0.4f, 40, 0.06f, 0.6f, true, Frame::previous, Frame::quality},
         };
+        // --recreate: three frames more, the painting made anew before the first (the same content as the frame before, so
+        // the copy the fix still holds then is right), the screen back where it was and scrolling on.
+        if (recreate) {
+            frames.push_back({"recreated", 0, true, true, 0.3f, 0.2f, 40, 0.06f, 0.6f, true, Frame::previous, Frame::info});
+            frames.push_back({"recreated_2", 0, true, true, -0.1f, 0.35f, 48, 0.06f, 0.6f, true, Frame::previous, Frame::quality});
+            frames.push_back({"recreated_3", 0, true, true, 0.2f, -0.3f, 56, 0.06f, 0.6f, true, Frame::previous, Frame::quality});
+        }
         auto set_material = [&](const Frame& f) {
             material[4] = f.glare ? std::array<float, 4>{0.25f, 0.3f, 0.15f, 0.8f} : std::array<float, 4>{};
             material[5] = {0, 0, f.dirt, f.shadow_u};
@@ -1435,6 +1463,7 @@ int main(int argc, char** argv) {
             set_jitter(f.jitter_positive);
             if (!std::strcmp(f.name, "warmup2")) Sleep(1500); // let the background PSO compile finish
             if (gauge_source) painting_readbacks(); // the copies of the frames before (the GPU is done with them: no presents here)
+            if (recreate && !std::strcmp(f.name, "recreated")) recreate_painting();
             set_material(f);
             static UINT current_scroll = 0;
             if (f.scroll != current_scroll) { upload_display(f.scroll); current_scroll = f.scroll; }

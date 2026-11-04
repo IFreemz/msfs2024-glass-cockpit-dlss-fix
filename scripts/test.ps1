@@ -31,6 +31,9 @@ $cases = @(
     # the digits are where it is low (how the Fenix's readouts painting holds it). In colour on the first frame, which
     # the fix must not take for good; lit across by a shadow edge, as the sun lights the Fenix's FCU.
     @{ Args = @('--painted', '--rov', '--source', '--alpha'); Name = 'Offline painted decal in alpha only test' }
+    # The same with the painting made anew near the end, as the Fenix makes its readouts painting anew every few seconds to a
+    # minute: the fix must read the new one in alpha only at once, not leave it to the upscaler until it finds that out again.
+    @{ Args = @('--painted', '--rov', '--source', '--alpha', '--recreate'); Name = 'Offline painted decal made anew test' }
     @{ Args = @('--fsr', '--vr', '--track'); Name = 'Offline FSR VR descriptor tracking test' }
     # Another mod (the RTX 40 MFG unlock) has redirected DLSS evaluate in a way that can't be hooked directly.
     @{ Args = @('--hotpatch'); Name = 'Offline redirected DLSS test' }
