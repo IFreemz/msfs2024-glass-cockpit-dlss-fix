@@ -349,6 +349,7 @@ problems in plain words, e.g. no upscaler selected, or a sim update that changed
 | Dim screens drop out of the fix depending on the camera position or their brightness (seen on the default A400M and the A2A Legacy) | Update to 1.1.0 or newer. At their very lowest brightness a screen can still drop out for a few seconds |
 | A screen flashes for a frame now and then (iniBuilds A380) | Update to 1.1.0 or newer |
 | The Fenix A320's FCU isn't fixed with **FCU readouts: New** in its EFB | Update to 1.1.0 or newer, with Painted screens on (the default) |
+| The Fenix A320's FCU or clock isn't green-tinted in strong sun | Expected: where the sun makes the sim's picture of a readout too different to match, the fix leaves that readout to the sim's own picture until the light changes |
 | FlightFX C750 in VR: only the backup engine display is fixed | Update to 1.1.0 or newer |
 | Standalone: the log shows only the integrated GPU on a PC that also has a graphics card | Update to 1.1.0 or newer |
 | Sim freezes when a Fenix aircraft loads, with RenoDX's DLSS add-on installed | Remove `renodx-dlss.addon64`; see [Other mods](#other-mods) |
