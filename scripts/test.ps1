@@ -37,8 +37,8 @@ $cases = @(
     # The same tinted amber by its material, as the Fenix's readouts are: one gain for all channels can't explain that
     # picture well, so the fix must score it per channel or leave a good match to the upscaler.
     @{ Args = @('--painted', '--rov', '--source', '--alpha', '--amber'); Name = 'Offline amber painted decal test' }
-    # Strong sun on the matched readout, the panel under it sunlit across a shadow edge (the Fenix's FCU and clock in the
-    # sun): every frame the fix draws must be as good as the upscaler's picture and not flicker, else it is left to it.
+    # Strong sun on the readout, the panel under it sunlit across a shadow edge (the Fenix's FCU and clock in the sun), the
+    # readout scrolling on while the upscaler trails it: the fix must keep drawing it and be far better than the trail.
     @{ Args = @('--painted', '--rov', '--source', '--alpha', '--sun'); Name = 'Offline painted decal in strong sun test' }
     # The same in milder sun, amber: the readout still matches well enough to be drawn (the Fenix's FCU and clock in part
     # sun), and it must not flicker more than a little beyond the upscaler's picture (its shadows shimmered when its glass

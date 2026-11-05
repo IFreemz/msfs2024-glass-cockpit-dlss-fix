@@ -387,7 +387,8 @@ int main(int argc, char** argv) {
         // Painted readouts drawn in every frame (debug bit 21), unless --gated.
         const auto set_debug_flags = reinterpret_cast<void (*)(uint32_t)>(GetProcAddress(addon, "GlassFixDebugFlags"));
         require(set_debug_flags != nullptr, "exports missing");
-        const uint32_t painted_debug = painted && !gated ? 1u << 21 : 0;
+        // --sun (strong) is gated too: the readout scrolls in the sun, drawn where it changed.
+        const uint32_t painted_debug = painted && !gated && !(strong_sun && !mild_sun) ? 1u << 21 : 0;
         set_debug_flags(painted_debug);
         // The reference is the game's own sharp sampling; smooth lines deliberately differ from it.
         const auto set_smooth = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixLineSmoothing"));
@@ -947,8 +948,10 @@ int main(int argc, char** argv) {
         if (strong_sun && sun_level != (mild_sun ? 0.5f : 3.0f)) std::printf("display: sun strength %.2f\n", sun_level);
         if (strong_sun)
             for (int k = 0; k < 24; ++k)
-                frames.push_back({sun_names[k], 0, true, true, sun_jitters[k % 8][0], sun_jitters[k % 8][1], 40, 0.06f, 0.6f, true, Frame::perfect,
-                    k < 4 ? Frame::info : Frame::quality, sun_level * (1 + 0.1f * std::sin(k * 2.9f))});
+                // --sun (strong): the tape scrolls on in the sun and the fake upscaler trails it (the previous frame); --mild-sun:
+                // it stands still and the upscaler's picture is the ideal one.
+                frames.push_back({sun_names[k], 0, true, true, sun_jitters[k % 8][0], sun_jitters[k % 8][1], mild_sun ? 40u : UINT(48 + 8 * k), 0.06f, 0.6f, true,
+                    mild_sun ? Frame::perfect : Frame::previous, k < 4 ? Frame::info : Frame::quality, sun_level * (1 + 0.1f * std::sin(k * 2.9f))});
         auto set_material = [&](const Frame& f) {
             material[4] = f.glare ? std::array<float, 4>{0.25f, 0.3f, 0.15f, 0.8f} : std::array<float, 4>{};
             material[5] = {0, 0, f.dirt, f.shadow_u};
@@ -1530,11 +1533,13 @@ int main(int argc, char** argv) {
         // --gated: the still frames before the tape scrolls are the upscaler's (nothing changed); the scrolling frames are
         // drawn; "moved" is left out (the fake upscaler doesn't follow the camera, the real one does); then the tape stands
         // still: drawn for the hold (24 frames), faded out over the next 24, the upscaler's from then.
-        if (gated) {
+        // The same for --sun (strong), which is gated too.
+        if (gated || (strong_sun && !mild_sun))
             for (auto& f : frames) {
                 if (!std::strcmp(f.name, "static_a") || !std::strcmp(f.name, "static_b")) f.check = Frame::untouched;
                 if (!std::strcmp(f.name, "moved")) f.check = Frame::info;
             }
+        if (gated) {
             static std::vector<std::string> still_names;
             for (int k = 1; k <= 56; ++k) still_names.push_back("still_" + std::to_string(k));
             for (int k = 1; k <= 56; ++k)
@@ -1765,8 +1770,9 @@ int main(int argc, char** argv) {
             const double drawn_share = interior ? double(inner_replaced) / interior : 0, flicker_mean = flicker_n ? flicker / flicker_n : 0,
                 dlss_flicker_mean = flicker_n ? dlss_flicker / flicker_n : 0;
             if (f.sun > 0 && f.check == Frame::quality)
-                pass = interior > 10000 && stray < covered / 50 && mean <= std::max(0.02, 2 * ghost_mean)
-                    && flicker_mean <= (mild_sun ? 2.5 * dlss_flicker_mean + 0.0005 : dlss_flicker_mean + 0.005);
+                pass = interior > 10000 && stray < covered / 50 && (mild_sun
+                    ? mean <= std::max(0.02, 2 * ghost_mean) && flicker_mean <= 2.5 * dlss_flicker_mean + 0.0005
+                    : replaced > 10000 && mean <= 0.3 * ghost_mean); // strong: far better than the upscaler's trail
             char sun_text[80] = "";
             if (f.sun > 0) std::snprintf(sun_text, sizeof(sun_text), " drawn=%.2f flicker=%.4f (dlss_alone=%.4f)", drawn_share, flicker_mean, dlss_flicker_mean);
             previous_out = std::move(outs); previous_prefill = std::move(prefills);

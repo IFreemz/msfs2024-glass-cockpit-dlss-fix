@@ -776,10 +776,11 @@ void solve(uint3 id : SV_DispatchThreadID)
     // Painted screens are not held: their light is the sun's as much as their own (the Fenix A320's FCU and clock), and a
     // gain kept from other light drew the digits far too dim or bright (in the sun the clock's gain went between about 1, 20
     // and 800 from one log line to the next: a shimmer), while a weak match there drew them dim with flickering edges. They
-    // are drawn while they match well, from 0.55 until below 0.45 (the margin keeps a readout in changing light from
-    // switching back and forth), and otherwise left to the upscaler: the sim's own picture. Out of the sun they score 0.8 to
-    // 1, in it 0.15 to 0.7.
-    bool matches = painted_slot ? q > (previous_a.w > 0 ? 0.45 : 0.55)
+    // are drawn while they match, with a margin (it keeps a readout in changing light from
+    // switching back and forth). Out of the sun they score 0.8 to 1, in it 0.01 to 0.7. Drawn only around a change of their
+    // content (see painted_hold), and even in strong sun far better than the upscaler's trail of the old content, they match
+    // from 0.05 until below 0.02: a painting that explains nothing of the sim's picture is left to the upscaler.
+    bool matches = painted_slot ? q > (previous_a.w > 0 ? 0.02 : 0.05)
         : previous_a.w < 0 ? q > (matched_before ? 0.15 : 0.2) : q > 0.15 || (hold && (q > 0.08 || held_variance < 0.1 * pooled_scene_variance));
     float low_calls = matches || previous_a.w <= 1 ? (matches ? 0 : 1) : previous_a.w;
     bool keep = matches || (hold && low_calls < 120);
