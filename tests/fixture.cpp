@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
         bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false,
-            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false, recreate = false, strong_sun = false, mild_sun = false, amber = false, occluder_test = false;
+            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false, recreate = false, strong_sun = false, mild_sun = false, amber = false, gated = false, occluder_test = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
@@ -263,6 +263,7 @@ int main(int argc, char** argv) {
             recreate |= !std::strcmp(argv[i], "--recreate");
             strong_sun |= !std::strcmp(argv[i], "--sun");
             mild_sun |= !std::strcmp(argv[i], "--mild-sun");
+            gated |= !std::strcmp(argv[i], "--gated");
             amber |= !std::strcmp(argv[i], "--amber");
             occluder_test |= !std::strcmp(argv[i], "--occluder");
         }
@@ -301,6 +302,10 @@ int main(int argc, char** argv) {
         // Fenix's FCU and clock in part sun, matched at 0.55 to 0.75, their shadows shimmering when its glass was taken
         // afresh every frame): a frame the fix draws may flicker at most a little more than the upscaler's picture.
         strong_sun |= mild_sun;
+        // --gated: the fix draws a painted readout only where its content changed lately and leaves it to the upscaler once
+        // that has caught up (the other painted runs draw it in every frame, to test how it is drawn).
+        require(!gated || (alpha_only && !recreate && !strong_sun), "--gated is for --painted --rov --source --alpha");
+        if (gated) std::printf("display: drawn only where its content changed lately\n");
         require(!strong_sun || (alpha_only && !recreate), "--sun is for --painted --rov --source --alpha");
         if (strong_sun) std::printf(mild_sun ? "display: mild sun on the readout\n" : "display: strong sun on the readout\n");
         // --amber (with --alpha): the readout's material tints its grey picture amber, as the Fenix A320's does (its gains
@@ -379,6 +384,11 @@ int main(int argc, char** argv) {
         const auto set_jitter = reinterpret_cast<void (*)(bool)>(GetProcAddress(addon, "GlassFixJitterPositive"));
         const auto evaluate = reinterpret_cast<NgxEvaluate>(GetProcAddress(GetModuleHandleW(L"_nvngx.dll"), "NVSDK_NGX_D3D12_EvaluateFeature"));
         require(set_jitter && evaluate, "exports missing");
+        // Painted readouts drawn in every frame (debug bit 21), unless --gated.
+        const auto set_debug_flags = reinterpret_cast<void (*)(uint32_t)>(GetProcAddress(addon, "GlassFixDebugFlags"));
+        require(set_debug_flags != nullptr, "exports missing");
+        const uint32_t painted_debug = painted && !gated ? 1u << 21 : 0;
+        set_debug_flags(painted_debug);
         // The reference is the game's own sharp sampling; smooth lines deliberately differ from it.
         const auto set_smooth = reinterpret_cast<void (*)(int)>(GetProcAddress(addon, "GlassFixLineSmoothing"));
         require(set_smooth != nullptr, "exports missing");
@@ -1260,7 +1270,7 @@ int main(int argc, char** argv) {
                 // Glass modes: dirt on the screen and the glass layer on (the fake DLSS output still the ideal picture).
                 set_material({"motion", 0, true, true, 0, 0, 0, m.glass || m.sun ? 0.06f : 0.0f, m.sun ? 0.55f : 0.0f, m.sun, Frame::perfect, Frame::info});
                 set_glass(m.glass);
-                set_debug(m.debug);
+                set_debug(m.debug | painted_debug);
                 set_calm(m.calm);
                 set_trim(m.trim);
                 set_occlusion(m.occlusion || occlusion_everywhere);
@@ -1517,6 +1527,20 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (amber) material[2] = {1.85f, 0.70f, 0.04f, 0};
+        // --gated: the still frames before the tape scrolls are the upscaler's (nothing changed); the scrolling frames are
+        // drawn; "moved" is left out (the fake upscaler doesn't follow the camera, the real one does); then the tape stands
+        // still: drawn for the hold (24 frames), faded out over the next 24, the upscaler's from then.
+        if (gated) {
+            for (auto& f : frames) {
+                if (!std::strcmp(f.name, "static_a") || !std::strcmp(f.name, "static_b")) f.check = Frame::untouched;
+                if (!std::strcmp(f.name, "moved")) f.check = Frame::info;
+            }
+            static std::vector<std::string> still_names;
+            for (int k = 1; k <= 56; ++k) still_names.push_back("still_" + std::to_string(k));
+            for (int k = 1; k <= 56; ++k)
+                frames.push_back({still_names[k - 1].c_str(), 0, true, true, (k % 2 ? 0.2f : -0.3f), (k % 3 ? -0.25f : 0.35f), 40, 0.06f, 0.6f, true,
+                    Frame::perfect, k <= 20 ? Frame::quality : k >= 52 ? Frame::untouched : Frame::info});
+        }
         for (const auto& f : frames) {
             set_jitter(f.jitter_positive);
             if (!std::strcmp(f.name, "warmup2")) Sleep(1500); // let the background PSO compile finish
@@ -1733,6 +1757,8 @@ int main(int argc, char** argv) {
             char occluder_text[48] = "";
             if (occluder_test && f.draw) std::snprintf(occluder_text, sizeof(occluder_text), " occluder_changed=%.3f", double(occluder_changed) / std::max<uint64_t>(occluder_n, 1));
             if (f.check == Frame::untouched) pass = replaced == 0;
+            // --gated: in the hold after the tape stopped, the fix must still draw it (the upscaler may not have caught up).
+            if (gated && f.check == Frame::quality && !std::strncmp(f.name, "still_", 6)) pass = pass && replaced > 10000;
             // --sun: a frame the fix draws must be about as good as the upscaler's (ideal) picture, and not flicker.
             // The upscaler's own error and flicker there come from its output format (11 and 10 bit floats), large on a
             // readout this bright.

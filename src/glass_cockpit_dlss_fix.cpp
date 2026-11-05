@@ -123,7 +123,7 @@ uint64_t shader_hash(const void* bytes, size_t size) { // FNV-1a over the byteco
 // ring_size: descriptor sets in flight, one per upscaler call. With DLSS Frame Generation the sim calls the upscaler up to
 // three times per frame, and the GPU can be several frames behind the CPU (more so with the game in the background): a set
 // must not be rewritten while the GPU may still read it.
-constexpr unsigned slot_count = 32, ring_size = 32, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 12; // + depth (t34), capture (u11)
+constexpr unsigned slot_count = 32, ring_size = 32, uav_base = 2 + slot_count, descriptors_per_frame = uav_base + 13; // + depth (t34), capture (u11), painted history (u12)
 constexpr unsigned params_per_slot = 5; // float4s per slot in the brightness match buffer (params in overlay.hlsl)
 constexpr unsigned bounds_cells = 64; // stable screen edges: cells per side of each screen texture's grid
 std::filesystem::path addon_directory; // the folder this DLL is in (the sim's): log, settings, captures
@@ -1175,6 +1175,7 @@ int slot_of(ID3D12Resource* resource, DXGI_FORMAT format, uint64_t mesh = 0, boo
 struct Map {
     UINT width = 0, height = 0, layers = 1; // one layer per view (VR: 2 eyes, or 4 views with foveated rendering)
     ComPtr<ID3D12Resource> texture, tiles, residual, glass_history, glass_history_uv; // glass_history(_uv): per render pixel and view
+    ComPtr<ID3D12Resource> painted_history; // per render pixel and view: where a painted readout's content last changed
     ComPtr<ID3D12DescriptorHeap> rtv;
     bool initialised = false;
     std::atomic<uint32_t> views{0}; // layers drawn this frame and not yet composited (upscaler calls come in view order)
@@ -1287,6 +1288,8 @@ Map* map_for(DeviceState& device, UINT width, UINT height, UINT layers) {
     if (FAILED(device.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&map->glass_history)))) return nullptr;
     desc.Format = DXGI_FORMAT_R16G16_UNORM;
     if (FAILED(device.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&map->glass_history_uv)))) return nullptr;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+    if (FAILED(device.native->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&map->painted_history)))) return nullptr;
     D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(device.native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&map->rtv)))) return nullptr;
     D3D12_RENDER_TARGET_VIEW_DESC rtv{glass::map_format, D3D12_RTV_DIMENSION_TEXTURE2DARRAY};
@@ -2533,17 +2536,18 @@ bool draw_recorded(ID3D12GraphicsCommandList* list, const glass::Draw& draw) {
 // ---------------------------------------------------------------------------------------------------------------
 // Composite after DLSS.
 bool create_composite(DeviceState& d) {
-    D3D12_DESCRIPTOR_RANGE ranges[5]{
+    D3D12_DESCRIPTOR_RANGE ranges[6]{
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, uav_base, 0, 0, 0},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, uav_base},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 6, 5, 0, uav_base + 4}, // u4 is the root UAV (fit sums)
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, uav_base, 0, uav_base + 10}, // t34: the upscaler's depth input
-        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 11, 0, uav_base + 11}}; // u11: screen capture (what the brightness match reads)
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 11, 0, uav_base + 11}, // u11: screen capture (what the brightness match reads)
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 12, 0, uav_base + 12}}; // u12: where painted readouts' content last changed
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = {0, 0, 24};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable = {5, ranges};
+    params[1].DescriptorTable = {6, ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[2].Descriptor = {4, 0};
     D3D12_STATIC_SAMPLER_DESC sampler{D3D12_FILTER_ANISOTROPIC, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -3167,7 +3171,10 @@ void capture_flush(uint64_t now) {
         for (auto& image : frame.images) {
             CapturedPixels pixels{image.name, image.format, image.footprint.Footprint.Width, image.footprint.Footprint.Height, image.footprint.Footprint.RowPitch, {}};
             void* data = nullptr;
-            const D3D12_RANGE range{0, SIZE_T(image.footprint.Footprint.RowPitch) * image.rows};
+            // The buffer's own size: its last row isn't padded to the row pitch, so pitch x rows is past its end wherever a row
+            // doesn't fill the pitch (a render width that isn't a multiple of 64 pixels), and Map refused it: captures lost
+            // the sim's frame, the map and the fit and draw inputs.
+            const D3D12_RANGE range{0, SIZE_T(image.buffer->GetDesc().Width)};
             if (SUCCEEDED(image.buffer->Map(0, &range, &data))) {
                 pixels.bytes.assign(static_cast<uint8_t*>(data), static_cast<uint8_t*>(data) + range.End);
                 const D3D12_RANGE none{0, 0};
@@ -3387,6 +3394,8 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     d.native->CreateUnorderedAccessView(map->glass_history.Get(), nullptr, &glass_view, at(uav_base + 8));
     glass_view.Format = DXGI_FORMAT_R16G16_UNORM;
     d.native->CreateUnorderedAccessView(map->glass_history_uv.Get(), nullptr, &glass_view, at(uav_base + 9));
+    glass_view.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+    d.native->CreateUnorderedAccessView(map->painted_history.Get(), nullptr, &glass_view, at(uav_base + 12));
     // The upscaler's depth input for the occlusion check (a null view when the check is off or the input unusable: not at
     // render size, multisampled, or a depth direction the display shader doesn't tell). In VR the sim calls the upscaler
     // once per eye with that eye's depth, which matches the map layer of this call: in one of the two calls both eyes'
@@ -3474,6 +3483,9 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         native->CopyResource(map->texture.Get(), map->repeat_map.Get());
         transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, map_resting);
         if (stats.repeated_calls++ == 0) log("milestone repeated %s call for the same frame (frame generation): the fix is drawn again on it", u.name);
+        // Bit 22: the same frame again, so painted readouts' change ages (see painted_history) don't count it twice.
+        constants.flags |= 1u << 22;
+        native->SetComputeRoot32BitConstants(0, 24, &constants, 0);
     }
     // The map as this call uses it (a repeated call's screens are only back after the copy above).
     if (capturing) capture_copy(d.native, native, map->texture.Get(), layer /* one mip: subresource = layer */, map_resting, glass::map_format, "map", capture);

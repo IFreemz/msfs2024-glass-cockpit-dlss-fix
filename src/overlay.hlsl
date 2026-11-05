@@ -66,6 +66,9 @@ RWTexture2DArray<float4> glass_history : register(u9);
 RWTexture2DArray<float2> glass_history_uv : register(u10); // where on its screen texture that render pixel was then
 // Screen capture only: per render pixel the screen texture as the brightness match reads it (rgb), w = slot + 1.
 RWTexture2D<float4> fit_input : register(u11);
+// Painted readouts, per render pixel and view: where on its painting the pixel was (xy, jitter undone), the painting's
+// value there (z) and w = frames since that spot of the painting last changed (up to 255) + 256 * (slot + 1), unorm16.
+RWTexture2DArray<float4> painted_history : register(u12);
 SamplerState display_sampler : register(s0);
 
 static const uint slot_count = 32;
@@ -525,11 +528,40 @@ bool glass_around(float2 location, uint painted_tag, float3 light, out float3 gl
 // quarter of the glass itself (the frame-to-frame wobble of the sim's glare); beyond that, the light really changed (or
 // the view moved) and the average follows at once, so there are no trails.
 static const float glass_blend = 0.2;
+// Painted readouts: drawn for painted_hold frames after their content changed at a spot, then faded to the upscaler's
+// picture over painted_fade frames (the upscaler has caught up by then: no trail of the old content).
+static const float painted_hold = 24, painted_fade = 24;
+float painted_value(uint slot, float2 uv, float2 gx, float2 gy)
+{
+    return dot(displays[NonUniformResourceIndex(slot)].SampleGrad(display_sampler, uv, gx, gy), 0.25);
+}
+// The painting at this render pixel's spot now against what was there last frame (at that spot: the same comparison
+// when the view moves). A spot seen for the first time counts as unchanged: the sim's own picture until it changes.
+void update_painted_history(uint2 p, uint3 h)
+{
+    if (flags & (1u << 22)) return; // a repeated upscaler call for the same frame (frame generation): aged already
+    const uint own = uint(residual[p].w + 0.5) & 63;
+    if (own == 0 || !((painted_slots >> (own - 1)) & 1)) { painted_history[h] = 0; return; }
+    const uint slot = own - 1;
+    // The footprint from the neighbours on either side (at the readout's edge, the one on it), so that it doesn't change
+    // from frame to frame as the jitter moves the edge: a different mip there would read as a change.
+    float4 m = load_map(int2(p)), r = load_map(int2(p) + int2(1, 0)), l = load_map(int2(p) - int2(1, 0));
+    float4 d = load_map(int2(p) + int2(0, 1)), u = load_map(int2(p) - int2(0, 1));
+    const uint ms = map_slot(m);
+    float2 gx = map_slot(r) == ms ? r.xy - m.xy : map_slot(l) == ms ? m.xy - l.xy : 0;
+    float2 gy = map_slot(d) == ms ? d.xy - m.xy : map_slot(u) == ms ? m.xy - u.xy : 0;
+    float2 here = saturate(m.xy + jitter.x * gx + jitter.y * gy);
+    float4 old = painted_history[h];
+    uint packed = uint(old.w * 65535 + 0.5), age = 255;
+    if ((packed >> 8) == own) age = abs(painted_value(slot, old.xy, gx, gy) - old.z) > 0.02 ? 0 : min((packed & 255) + 1, 255);
+    painted_history[h] = float4(here, painted_value(slot, here, gx, gy), float(age + 256 * own) / 65535);
+}
 [numthreads(8, 8, 1)]
 void glass_filter(uint3 id : SV_DispatchThreadID)
 {
     if (any(id.xy >= map_size)) return;
     uint3 h = uint3(id.xy, layer);
+    update_painted_history(id.xy, h);
     float3 now, spread;
     float outline_share;
     if (uint(residual[id.xy].w + 0.5) & 128) return; // the slot just took another texture: the average stays
@@ -1258,6 +1290,27 @@ void composite(uint3 id : SV_DispatchThreadID)
     // Painted screens: lit, not only emissive (see painted_light).
     const bool painted = ((painted_slots >> slot) & 1) != 0;
     float3 light = 1;
+    float painted_keep = 1;
+    if (painted && !(flags & (1u << 21))) // bit 21 (offline tests): painted readouts drawn whether they changed or not
+    {
+        // Drawn only where the readout's content changed lately (see painted_hold): the most recent change at the 4 render
+        // pixels around. Elsewhere the upscaler's picture, the sim's own: a painted readout is a lit material (ambient
+        // light, reflections, the sun and the shadows across it) that the brightness match can only approximate.
+        float age = 255;
+        [unroll] for (uint k = 0; k < 4; ++k)
+        {
+            int2 q = cell + int2(k & 1, k >> 1);
+            if (any(q < 0) || any(q >= int2(map_size))) continue;
+            uint packed = uint(painted_history[uint3(q, layer)].w * 65535 + 0.5);
+            if ((packed >> 8) == slot + 1) age = min(age, float(packed & 255));
+        }
+        painted_keep = saturate((painted_hold + painted_fade - age) / painted_fade);
+        if (painted_keep <= 0)
+        {
+            if (flags & 2) output[id.xy] = float4(output[id.xy].rgb * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0), 1);
+            return;
+        }
+    }
     if (painted)
     {
         bool around;
@@ -1368,9 +1421,11 @@ void composite(uint3 id : SV_DispatchThreadID)
     }
     if (glass_strength < 1) colour -= (1 - glass_strength) * (glass - offset.rgb);
     if (flags & 2) colour = colour * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0);
-    float keep = (blend < 1 ? blend * blend * (3 - 2 * blend) : 1) * coverage * trim_keep;
+    float keep = (blend < 1 ? blend * blend * (3 - 2 * blend) : 1) * coverage * trim_keep * painted_keep;
     if (band_share > 0 && (flags & 4)) keep *= 1 - band_share;
-    if (keep < 1) colour = lerp(output[id.xy].rgb, colour, keep);
+    float3 under = output[id.xy].rgb;
+    if (painted && (flags & 2)) under = under * float3(0.4, 1.0, 0.4) + float3(0, 0.02, 0); // fading: tinted throughout
+    if (keep < 1) colour = lerp(under, colour, keep);
     if (all(isfinite(colour))) output[id.xy] = float4(max(colour, 0), 1);
 }
 

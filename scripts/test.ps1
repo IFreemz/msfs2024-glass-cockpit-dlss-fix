@@ -44,6 +44,10 @@ $cases = @(
     # sun), and it must not flicker more than a little beyond the upscaler's picture (its shadows shimmered when its glass
     # layer was taken afresh every frame).
     @{ Args = @('--painted', '--rov', '--source', '--alpha', '--amber', '--mild-sun'); Name = 'Offline amber painted decal in mild sun test' }
+    # A painted readout drawn only where its content changed lately (it is a lit material the brightness match can only
+    # approximate; still, the upscaler's picture of it is right): the upscaler's while still, drawn while it changes and for
+    # the hold after, then faded back. The other painted runs draw it in every frame, to test how it is drawn.
+    @{ Args = @('--painted', '--rov', '--source', '--alpha', '--gated'); Name = 'Offline painted decal drawn where it changed test' }
     @{ Args = @('--fsr', '--vr', '--track'); Name = 'Offline FSR VR descriptor tracking test' }
     # Another mod (the RTX 40 MFG unlock) has redirected DLSS evaluate in a way that can't be hooked directly.
     @{ Args = @('--hotpatch'); Name = 'Offline redirected DLSS test' }
