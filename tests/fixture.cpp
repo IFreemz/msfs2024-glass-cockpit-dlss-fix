@@ -244,7 +244,7 @@ int main(int argc, char** argv) {
         const auto here = std::filesystem::path(argv[0]).parent_path();
         require(LoadLibraryW((here / L"_nvngx.dll").c_str()) != nullptr, "fake _nvngx.dll missing");
         bool fsr = false, vr = false, screen_t0 = false, reload = false, hotpatch = false, bench = false, nested = false, optiscaler_fsr = false,
-            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false, recreate = false, strong_sun = false, amber = false, occluder_test = false;
+            ngx_proxy = false, extra_pass = false, motion = false, fg_repeat = false, painted = false, depthless = false, rov = false, gauge_source = false, alpha_only = false, recreate = false, strong_sun = false, mild_sun = false, amber = false, occluder_test = false;
         for (int i = 1; i < argc; ++i) {
             fsr |= !std::strcmp(argv[i], "--fsr"); vr |= !std::strcmp(argv[i], "--vr"); screen_t0 |= !std::strcmp(argv[i], "--screen-t0");
             reload |= !std::strcmp(argv[i], "--reload"); hotpatch |= !std::strcmp(argv[i], "--hotpatch"); bench |= !std::strcmp(argv[i], "--bench");
@@ -261,6 +261,7 @@ int main(int argc, char** argv) {
             alpha_only |= !std::strcmp(argv[i], "--alpha");
             recreate |= !std::strcmp(argv[i], "--recreate");
             strong_sun |= !std::strcmp(argv[i], "--sun");
+            mild_sun |= !std::strcmp(argv[i], "--mild-sun");
             amber |= !std::strcmp(argv[i], "--amber");
             occluder_test |= !std::strcmp(argv[i], "--occluder");
         }
@@ -295,8 +296,12 @@ int main(int argc, char** argv) {
         // in the shade, the digits there whiter and brighter, and a glint that wobbles from frame to frame. The upscaler's
         // picture is the ideal one, so a frame the fix leaves to it is right: any frame it draws must be about as good, and
         // it must not keep switching between drawing the readout and leaving it to the upscaler.
+        // --mild-sun: the same at a sixth of the strength, where the readout still matches well enough to be drawn (the
+        // Fenix's FCU and clock in part sun, matched at 0.55 to 0.75, their shadows shimmering when its glass was taken
+        // afresh every frame): a frame the fix draws may flicker at most a little more than the upscaler's picture.
+        strong_sun |= mild_sun;
         require(!strong_sun || (alpha_only && !recreate), "--sun is for --painted --rov --source --alpha");
-        if (strong_sun) std::printf("display: strong sun on the readout\n");
+        if (strong_sun) std::printf(mild_sun ? "display: mild sun on the readout\n" : "display: strong sun on the readout\n");
         // --amber (with --alpha): the readout's material tints its grey picture amber, as the Fenix A320's does (its gains
         // were about 1.85, 0.70 and 0.04): one gain for all channels explains at most about 0.55 of that picture.
         require(!amber || alpha_only, "--amber is for --painted --rov --source --alpha");
@@ -913,7 +918,10 @@ int main(int argc, char** argv) {
             {0.125f, 0.2778f}, {-0.125f, -0.2778f}, {0.375f, 0.0556f}, {-0.4375f, 0.3889f}};
         // Strength 3: the sunlit panel under the readout over three times as bright as the lit digits in the shade, the match
         // falling to under 0.3 (in the sun the Fenix's FCU scored 0.01 to 0.25, its clock 0.4 to 0.6).
-        const float sun_level = 3;
+        // GLASS_FIXTURE_SUN_LEVEL: another strength, to look at milder sun (where the match stays around 0.5 to 0.8).
+        char sun_level_text[32] = "";
+        const float sun_level = GetEnvironmentVariableA("GLASS_FIXTURE_SUN_LEVEL", sun_level_text, sizeof(sun_level_text)) ? float(std::atof(sun_level_text)) : mild_sun ? 0.5f : 3.0f;
+        if (strong_sun && sun_level != (mild_sun ? 0.5f : 3.0f)) std::printf("display: sun strength %.2f\n", sun_level);
         if (strong_sun)
             for (int k = 0; k < 24; ++k)
                 frames.push_back({sun_names[k], 0, true, true, sun_jitters[k % 8][0], sun_jitters[k % 8][1], 40, 0.06f, 0.6f, true, Frame::perfect,
@@ -1651,6 +1659,9 @@ int main(int argc, char** argv) {
             const bool sun_flicker = f.sun > 0 && previous_out.size() == size_t(output_w) * output_h && !previous_ref.empty();
             std::vector<std::array<float, 3>> outs(size_t(output_w) * output_h), prefills(size_t(output_w) * output_h);
             std::vector<BYTE> png(size_t(output_w) * output_h * 4);
+            char dump_text[8] = "";
+            const bool dump_sun = GetEnvironmentVariableA("GLASS_FIXTURE_DUMP", dump_text, sizeof(dump_text)) > 0;
+            std::vector<BYTE> png_ref(dump_sun ? png.size() : 0), png_err(dump_sun ? png.size() : 0);
             for (UINT y = 0; y < output_h; ++y) for (UINT x = 0; x < output_w; ++x) {
                 const size_t i = size_t(y) * output_w + x;
                 const uint32_t bits = *reinterpret_cast<const uint32_t*>(static_cast<uint8_t*>(mapped) + out_rb.footprint.Offset + size_t(y) * out_rb.footprint.Footprint.RowPitch + x * 4);
@@ -1688,10 +1699,19 @@ int main(int argc, char** argv) {
                 auto p = png.data() + i * 4;
                 for (int k = 0; k < 3; ++k) p[k] = BYTE(std::clamp(c[k], 0.0f, 1.0f) * 255);
                 p[3] = 255;
+                if (dump_sun && f.sun > 0) { // GLASS_FIXTURE_DUMP: the ideal picture and the error x30 (signed: grey 128 = none)
+                    auto r = png_ref.data() + i * 4, e = png_err.data() + i * 4;
+                    for (int k = 0; k < 3; ++k) { r[k] = BYTE(std::clamp(ref[i][k], 0.0f, 1.0f) * 255); e[k] = BYTE(std::clamp(128 + 30 * 255 * (c[k] - ref[i][k]), 0.0f, 255.0f)); }
+                    r[3] = e[3] = 255;
+                }
             }
             out_rb.buffer->Unmap(0, nullptr);
             const std::string name = vr ? std::string(f.name) + "/eye" + std::to_string(eye) : f.name;
             save_png(here / ("overlay-" + (vr ? std::string(f.name) + "-eye" + std::to_string(eye) : name) + ".png"), output_w, output_h, output_w * 4, png.data());
+            if (dump_sun && f.sun > 0 && !vr) {
+                save_png(here / ("ref-" + name + ".png"), output_w, output_h, output_w * 4, png_ref.data());
+                save_png(here / ("err-" + name + ".png"), output_w, output_h, output_w * 4, png_err.data());
+            }
             const double mean = interior ? error / interior : 0, ghost_mean = interior ? ghost / interior : 0;
             bool pass = true;
             if (f.check == Frame::quality) pass = interior > 10000 && mean < 0.02 && stray < covered / 50;
@@ -1706,7 +1726,8 @@ int main(int argc, char** argv) {
             const double drawn_share = interior ? double(inner_replaced) / interior : 0, flicker_mean = flicker_n ? flicker / flicker_n : 0,
                 dlss_flicker_mean = flicker_n ? dlss_flicker / flicker_n : 0;
             if (f.sun > 0 && f.check == Frame::quality)
-                pass = interior > 10000 && stray < covered / 50 && mean <= std::max(0.02, 2 * ghost_mean) && flicker_mean <= dlss_flicker_mean + 0.005;
+                pass = interior > 10000 && stray < covered / 50 && mean <= std::max(0.02, 2 * ghost_mean)
+                    && flicker_mean <= (mild_sun ? 2.5 * dlss_flicker_mean + 0.0005 : dlss_flicker_mean + 0.005);
             char sun_text[80] = "";
             if (f.sun > 0) std::snprintf(sun_text, sizeof(sun_text), " drawn=%.2f flicker=%.4f (dlss_alone=%.4f)", drawn_share, flicker_mean, dlss_flicker_mean);
             previous_out = std::move(outs); previous_prefill = std::move(prefills);

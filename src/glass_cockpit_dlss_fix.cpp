@@ -3192,6 +3192,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     uav_barrier(native);
     native->SetPipelineState(d.passes[2].Get());
     native->Dispatch(1, 1, 1);
+    uav_barrier(native); // the glass filter reads this frame's brightness match (painted readouts' light)
     native->SetPipelineState(d.passes[5].Get());
     native->Dispatch((render_w + 7) / 8, (render_h + 7) / 8, 1);
     uav_barrier(native);
