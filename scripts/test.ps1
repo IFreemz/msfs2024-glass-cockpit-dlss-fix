@@ -52,8 +52,8 @@ try {
     # picture well, so the fix must score it per channel or leave a good match to the upscaler.
     & .\FlightSimulator2024.exe --painted --rov --source --alpha --amber
     if ($LASTEXITCODE) { throw "Offline amber painted decal test failed ($LASTEXITCODE)" }
-    # Strong sun on the matched readout, the panel under it sunlit across a shadow edge (the Fenix's FCU and clock in the
-    # sun): every frame the fix draws must be as good as the upscaler's picture and not flicker, else it is left to it.
+    # Strong sun on the readout, the panel under it sunlit across a shadow edge (the Fenix's FCU and clock in the sun), the
+    # readout scrolling on while the upscaler trails it: the fix must keep drawing it and be far better than the trail.
     & .\FlightSimulator2024.exe --painted --rov --source --alpha --sun
     if ($LASTEXITCODE) { throw "Offline painted decal in strong sun test failed ($LASTEXITCODE)" }
     # The same in milder sun, amber: the readout still matches well enough to be drawn (the Fenix's FCU and clock in part
