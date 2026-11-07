@@ -211,6 +211,8 @@ If a screen is never fixed at all (no green tint), settings won't help: see [Wha
 | iniBuilds A380 | Tested |
 | PMDG 737 | Tested by the community (also in VR) |
 | PMDG 777 | Tested by the community (also in VR) |
+| TFDi MD-11F | Tested by the community |
+| Bluebird 757-200 | Tested by the community |
 | FlightFX C750 | Tested by the community (in VR from 1.1.0) |
 | Default DA62 | Tested |
 | Default Cessna 152 (BendixKing radios) | Tested |
