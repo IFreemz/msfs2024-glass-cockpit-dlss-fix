@@ -209,6 +209,8 @@ direction) are described in the [Settings](#settings) tables above.
 | iniBuilds A380 | Tested (1.0.0 or newer: the EFB stays fixed when only part of it is in view, and screens are no longer drawn over the sidestick) |
 | PMDG 737 | Tested by the community (also in VR) |
 | PMDG 777 | Tested by the community (also in VR) |
+| TFDi MD-11F | Tested by the community |
+| Bluebird 757-200 | Tested by the community |
 | FlightFX C750 | Tested by the community (0.7.6 or newer) |
 | Default DA62 | Tested |
 | Default Cessna Longitude | Tested by the community (in VR) |
