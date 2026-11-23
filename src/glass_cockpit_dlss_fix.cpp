@@ -1180,6 +1180,7 @@ struct Map {
     bool initialised = false;
     std::atomic<uint32_t> views{0}; // layers drawn this frame and not yet composited (upscaler calls come in view order)
     std::atomic<uint64_t> recorded_present{0}; // present count when screens were last recorded into the map
+    std::atomic<uint64_t> used_present{0}; // present count when a screen draw or an upscaler call last looked the map up
     // Diagnostics (VR): upscaler calls since the last present, to tell each call's view apart without the views count.
     std::atomic<uint64_t> call_present{UINT64_MAX};
     std::atomic<uint32_t> calls_this_present{0};
@@ -1221,6 +1222,9 @@ struct __declspec(uuid("2B8D0E51-7C1A-4F43-9A07-8E4C51D2F6A3")) DeviceState {
     ComPtr<ID3D12Resource> probe_readback;
     std::mutex maps_mutex;
     std::vector<std::unique_ptr<Map>> maps;
+    // Maps taken out of use to make room for a new render size, with the present count then: kept until the GPU and any
+    // command list recorded before are long done with them (see map_for).
+    std::vector<std::pair<std::unique_ptr<Map>, uint64_t>> retired_maps;
     std::shared_mutex layouts_mutex;
     std::unordered_map<uint64_t, std::array<std::pair<uint32_t, uint32_t>, 2>> display_bindings; // layout -> root index, table offset of t0 and t1
     // layout -> root index, table offset of the pixel shader's t0-t15 (space 0; root index UINT32_MAX: not in a table). Painted screens.
@@ -1269,12 +1273,39 @@ struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
 };
 std::atomic<uint64_t> list_recordings{0};
 
+// At most max_maps maps (one per render size and view count) at a time. Every change of render size makes a new one:
+// a DLSS mode, render scale or window size changed in the sim, or switching between the monitor and VR. Without a
+// limit on their lifetime, six such changes in one session used them all up, and from then on no screen at a new
+// render size was fixed (logged as "map_allocation"). A map not looked up for map_idle_presents is retired to make
+// room, and freed map_idle_presents later, when nothing can still be using it.
+constexpr size_t max_maps = 6;
+constexpr uint64_t map_idle_presents = 600;
+
 Map* map_for(DeviceState& device, UINT width, UINT height, UINT layers) {
     std::lock_guard lock(device.maps_mutex);
-    for (auto& map : device.maps) if (map->width == width && map->height == height && map->layers == layers) return map.get();
-    if (device.maps.size() >= 6 || !width || !height || width > 8192 || height > 8192 || !layers || layers > 8) return nullptr;
+    const uint64_t now = present_count.load(std::memory_order_relaxed);
+    for (auto& map : device.maps) if (map->width == width && map->height == height && map->layers == layers) {
+        map->used_present.store(now, std::memory_order_relaxed);
+        return map.get();
+    }
+    if (!width || !height || width > 8192 || height > 8192 || !layers || layers > 8) return nullptr;
+    std::erase_if(device.retired_maps, [&](const auto& retired) { return now - retired.second > map_idle_presents; });
+    if (device.maps.size() >= max_maps) {
+        // The map unused the longest, if it has been idle long enough and has no views waiting for their upscaler call.
+        auto oldest = device.maps.end();
+        for (auto it = device.maps.begin(); it != device.maps.end(); ++it)
+            if (now - (*it)->used_present.load(std::memory_order_relaxed) > map_idle_presents && !(*it)->views.load() &&
+                (oldest == device.maps.end() || (*it)->used_present.load(std::memory_order_relaxed) < (*oldest)->used_present.load(std::memory_order_relaxed)))
+                oldest = it;
+        if (oldest == device.maps.end()) return nullptr;
+        log("map_retired w=%u h=%u layers=%u (unused for %llu presents, making room for %ux%u layers=%u)", (*oldest)->width, (*oldest)->height,
+            (*oldest)->layers, now - (*oldest)->used_present.load(std::memory_order_relaxed), width, height, layers);
+        device.retired_maps.emplace_back(std::move(*oldest), now);
+        device.maps.erase(oldest);
+    }
     auto map = std::make_unique<Map>();
     map->width = width; map->height = height; map->layers = layers;
+    map->used_present = now;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, UINT16(layers), 1, glass::map_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
@@ -3210,6 +3241,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     {
         std::lock_guard lock(d.maps_mutex);
         for (auto& m : d.maps) if (m->width == render_w && m->height == render_h) map = m.get();
+        if (map) map->used_present.store(present_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
     if (!map) {
         // Normal for views without a cockpit; suspicious if screens were drawn at another size.
